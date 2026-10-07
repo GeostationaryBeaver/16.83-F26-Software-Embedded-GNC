@@ -1,5 +1,5 @@
 import serial
-
+#First start the python script, then press reset to run the arduino code
 ser = serial.Serial('COM3', 9600) #Change Baud rate and COM port as needed
 trial_time = 10000 #time in seconds for the trial
 file_name = 'load_cell_data1' #omit .csv

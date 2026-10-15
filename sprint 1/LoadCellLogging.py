@@ -1,7 +1,7 @@
 import serial
 #First start the python script, then press reset to run the arduino code
-ser = serial.Serial('COM3', 9600) #Change Baud rate and COM port as needed
-trial_time = 10000 #time in seconds for the trial
+ser = serial.Serial('COM4', 115200) #Change Baud rate and COM port as needed
+trial_time = 10000 #time in milliseconds for the trial
 file_name = 'load_cell_data1' #omit .csv
 
 finished = False
@@ -16,7 +16,7 @@ with open(file_name + '.csv', 'w') as f: #remember to change the file name for d
         if started:
             if prev_line != line:
                 print(line)
-                time, load_cell_value = tuple(line.split(','))
+                time = tuple(line.split(','))[0]
                 if not start_time:
                     start_time = int(time) # the first value in the line is the timestamp
                 if int(time) - start_time > int(trial_time):

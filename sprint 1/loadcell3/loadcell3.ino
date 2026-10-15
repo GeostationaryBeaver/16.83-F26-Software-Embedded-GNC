@@ -1,10 +1,11 @@
 
 #include <HX711.h>
 #include <stdlib.h>
+// #include "data_accum.h"
 
 // HX711 connected to Arduino Mega
-const int DT_PIN  = A3;
-const int CLK_PIN = A2;
+const int DT_PIN  = 3;
+const int CLK_PIN = 2;
 
 HX711 scale;
 
@@ -164,8 +165,8 @@ void setup() {
   Serial.println("# t = tare");
   Serial.println("# c 500 = calibrate with 500 g");
   Serial.println("# millis,raw,counts,force_N");
-
   Serial.println("millis,raw,counts,force_N");
+  Serial.println("Starting Load Cell Readings:");
 }
 
 
@@ -181,7 +182,7 @@ void loop() {
     return;
   }
 
-  long raw = scale.read_average();
+  long raw = scale.read();
 
   // Reverse sign and subtract zero offset
   long netCounts = offset - raw;

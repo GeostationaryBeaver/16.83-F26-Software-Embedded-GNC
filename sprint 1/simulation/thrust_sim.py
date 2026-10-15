@@ -2,10 +2,11 @@
 """
 Cold gas thruster simulation with PWM (pulse-width modulated) throttling.
 
-15 s demo:
-    0 -  5 s : valve held CLOSED        -> no thrust
-    5 - 10 s : valve PWM'd (duty cycle) -> throttled thrust
-   10 - 15 s : valve held OPEN          -> full thrust
+Three equal-length phases (each PHASE_DURATION_S, derived from the measured
+full-thrust duration in telemetry_export.csv -- see TELEMETRY OVERLAY below):
+    phase 1 : valve held CLOSED        -> no thrust
+    phase 2 : valve PWM'd (duty cycle) -> throttled thrust
+    phase 3 : valve held OPEN          -> full thrust
 
 Model (lumped parameter):
     tank (constant pressure) --[valve orifice]--> plenum/chamber --[nozzle]--> ambient
@@ -18,6 +19,8 @@ Model (lumped parameter):
 
 Requires: numpy, matplotlib
 """
+
+import csv
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -74,8 +77,63 @@ LOADCELL_SAMPLE_PERIOD_S = HX711_SAMPLES_PER_READING / HX711_ADC_RATE_HZ
 # measurable thrust, and isn't recoverable from the firmware alone.
 LOADCELL_RATED_CAPACITY_N = None       # ASK STRUCTURES - load cell's rated full-scale force (N)
 
+# =============================================================================
+# TELEMETRY OVERLAY (measured data from telemetry_export.csv)
+# The real test stand logged 3 full-open valve pulses (not a single
+# no-thrust -> throttled -> full-thrust sweep). Each pulse is detected as a
+# contiguous run of samples above TELEMETRY_EVENT_THRESHOLD_N; the mean of
+# their durations sets PHASE_DURATION_S below, so the sim's no-thrust and
+# throttled phases are each given the same length as the measured full-thrust
+# phase. Negative telemetry readings are sensor noise around a zero/negative
+# baseline and are clipped to 0 N wherever telemetry is plotted.
+# =============================================================================
+TELEMETRY_CSV_PATH = "telemetry_export.csv"
+TELEMETRY_EVENT_THRESHOLD_N = 1.0      # thrust above this = "in a full-thrust pulse"
+TELEMETRY_EVENT_MERGE_GAP_S = 1.0      # pulses closer than this (edge to edge) are merged
+
+
+def load_telemetry(path):
+    """Read session_time_s / thrust_n columns from the telemetry CSV."""
+    t_list, thrust_list = [], []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            t_list.append(float(row["session_time_s"]))
+            thrust_list.append(float(row["thrust_n"]))
+    return np.array(t_list), np.array(thrust_list)
+
+
+def find_events(t, thrust, threshold, merge_gap):
+    """Return [(t_start, t_end), ...] windows where thrust stays >= threshold."""
+    above = thrust >= threshold
+    events = []
+    i, n = 0, len(t)
+    while i < n:
+        if above[i]:
+            j = i
+            while j < n and above[j]:
+                j += 1
+            events.append((t[i], t[j - 1]))
+            i = j
+        else:
+            i += 1
+
+    merged = []
+    for start, end in events:
+        if merged and start - merged[-1][1] <= merge_gap:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+_telemetry_t, _telemetry_thrust = load_telemetry(TELEMETRY_CSV_PATH)
+TELEMETRY_RUNS = find_events(_telemetry_t, _telemetry_thrust,
+                              TELEMETRY_EVENT_THRESHOLD_N, TELEMETRY_EVENT_MERGE_GAP_S)
+
 # Timeline
-PHASE_DURATION_S = 5.0         # each phase lasts 5 s -> 15 s total
+# Each phase (no-thrust, throttled, full-thrust) is given the same length:
+# the mean duration of the measured full-thrust pulses above.
+PHASE_DURATION_S = float(np.mean([end - start for start, end in TELEMETRY_RUNS]))
 DT = 50e-6                     # integration step (s)
 
 # =============================================================================
@@ -207,9 +265,24 @@ def main():
                     alpha=0.07, color=["gray", "orange", "green"][k])
         ax1.text((k + 0.5) * PHASE_DURATION_S, thrust.max() * 1.05, lbl,
                  ha="center", va="bottom", fontsize=10, weight="bold")
+
+    # Overlay measured telemetry: shift each run so its start lines up with
+    # the simulated full-thrust phase start, clipping negative (noise) to 0.
+    full_thrust_start = 2 * PHASE_DURATION_S
+    telemetry_overlay_lines = []
+    for k, (run_start, run_end) in enumerate(TELEMETRY_RUNS):
+        pad = 1.0
+        mask = (_telemetry_t >= run_start - pad) & (_telemetry_t <= run_end + pad)
+        t_shifted = _telemetry_t[mask] - run_start + full_thrust_start
+        thrust_clipped = np.clip(_telemetry_thrust[mask], 0.0, None)
+        line, = ax1.plot(t_shifted, thrust_clipped, lw=1.0, ls="-", marker=".",
+                          ms=3, alpha=0.8, label=f"Telemetry run {k + 1}")
+        telemetry_overlay_lines.append(line)
+
     ax1.set_ylabel("Thrust (N)")
     ax1.set_xlim(0, 3 * PHASE_DURATION_S)
-    ax1.set_ylim(0, thrust.max() * 1.2)
+    y_max = max(thrust.max(), max(l.get_ydata().max() for l in telemetry_overlay_lines))
+    ax1.set_ylim(0, y_max * 1.2)
     ax1.set_title(f"Cold gas thruster thrust profile  (tank = {TANK_PRESSURE_PSI:.0f} psi, "
                   f"PWM {PWM_FREQUENCY_HZ:.0f} Hz / {PWM_DUTY_CYCLE*100:.0f}% duty)")
     ax1.legend(loc="center left")
@@ -278,4 +351,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

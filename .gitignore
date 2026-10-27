@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs (contain machine-specific paths, e.g. idf.currentSetup)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ESP-IDF / CMake build output
+build/
+managed_components/
+sdkconfig.old
+compile_commands.json
+.cache/
+
+# Arduino
+*.ino.bin
+*.ino.elf
+*.ino.hex
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+*.egg-info/
+
+# Logs / temp
+*.log
+*.tmp
+*.bak

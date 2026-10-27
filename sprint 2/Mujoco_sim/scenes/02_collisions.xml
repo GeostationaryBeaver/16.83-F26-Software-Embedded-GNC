@@ -1,0 +1,171 @@
+<!-- ===================================================================
+     02_collisions.xml  -  how contacts behave
+     ===================================================================
+     Three things happen at once in this scene, so one run shows you
+     all the contact behaviour there is to see:
+
+       LEFT    (x = -1.5)  a stack of 3 boxes, settling into contact
+       MIDDLE  (x =  0)    two spheres, bouncy vs dead, dropped together
+       RIGHT   (x =  1.5)  two boxes on a ramp, slippery vs grippy
+
+     Run it:  uv run python scripts/run.py scenes/02_collisions.xml
+     Watch the contact count in the terminal as things settle.
+     =================================================================== -->
+
+<mujoco model="collisions">
+
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+
+  <!-- Offscreen framebuffer size, used only by headless rendering
+       (scripts/run.py --headless / --video). MuJoCo's default is a small
+       640x480, and asking Renderer for anything larger is a hard error.
+       Raise these if you want bigger stills. -->
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <!-- ===== DEFAULTS ==================================================
+       <default> sets attribute values inherited by every element of
+       that type below it, so you write them once instead of on all
+       nine geoms. A class="..." on an individual geom, or an explicit
+       attribute, overrides the default.
+       ================================================================= -->
+  <default>
+    <!-- condim=3 is MuJoCo's default contact dimensionality:
+           1 = frictionless (slides freely, like ice)
+           3 = + tangential friction  <- normal choice, objects slide
+           4 = + torsional friction   (resists spinning in place)
+           6 = + rolling friction     (balls eventually stop rolling)
+         Higher condim is more realistic but more expensive and can be
+         less stable. Use 3 unless you specifically need rolling to
+         damp out. -->
+    <geom condim="3"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2" width="300" height="300"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 4" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="10 10 0.1" material="grid_mat"/>
+
+    <!-- ===============================================================
+         LEFT: A STACK. Tests whether contacts hold weight.
+         ===============================================================
+         Three boxes, each 0.1 m half-extent (so 0.2 m cubes), stacked
+         with a 0.01 m air gap so they begin out of contact and fall
+         into it. If your timestep is too large or your solver too weak,
+         a stack like this visibly sinks into itself or slowly drifts.
+         It is the best cheap stability test there is.
+
+         NOTE on box size: "0.1 0.1 0.1" are HALF-extents (radii), not
+         full widths. A box with size 0.1 is 0.2 m on a side. Spheres
+         and capsules likewise take a radius. Getting this wrong by 2x
+         is a common first mistake. -->
+    <body name="box_bottom" pos="-1.5 0 0.1">
+      <freejoint/>
+      <geom name="g_box_bottom" type="box" size="0.1 0.1 0.1" rgba="0.8 0.3 0.3 1"/>
+    </body>
+    <body name="box_middle" pos="-1.5 0 0.31">
+      <freejoint/>
+      <geom name="g_box_middle" type="box" size="0.1 0.1 0.1" rgba="0.3 0.8 0.3 1"/>
+    </body>
+    <body name="box_top" pos="-1.5 0 0.52">
+      <freejoint/>
+      <geom name="g_box_top" type="box" size="0.1 0.1 0.1" rgba="0.3 0.3 0.8 1"/>
+    </body>
+
+    <!-- ===============================================================
+         MIDDLE: BOUNCE. solref controls contact springiness.
+         ===============================================================
+         MuJoCo has no "restitution" or "bounciness" attribute. Contacts
+         are soft constraints, and you tune them with solref:
+
+             solref = "timeconst  dampratio"
+
+         timeconst  how fast the contact responds, in seconds. Must be
+                    >= ~2x your timestep or the contact goes unstable.
+         dampratio  1.0 = critically damped = no bounce (energy is
+                    absorbed). BELOW 1.0 = underdamped = BOUNCY.
+                    0.2 is quite lively. 0 would ring forever.
+
+         Both spheres are released from the same height so you can see
+         the difference directly. Red (dampratio 0.2) bounces several
+         times; grey (dampratio 1.0) lands and stays put. -->
+    <body name="ball_bouncy" pos="-0.3 0 1.5">
+      <freejoint/>
+      <geom name="g_ball_bouncy" type="sphere" size="0.12" rgba="0.9 0.4 0.2 1"
+            solref="0.01 0.2"/>
+    </body>
+    <body name="ball_dead" pos="0.3 0 1.5">
+      <freejoint/>
+      <geom name="g_ball_dead" type="sphere" size="0.12" rgba="0.5 0.5 0.55 1"
+            solref="0.01 1.0"/>
+    </body>
+
+    <!-- ===============================================================
+         RIGHT: FRICTION. On a ramp, so gravity does the testing.
+         ===============================================================
+         The ramp is static (no freejoint), tilted 20 degrees about Y.
+         euler is in degrees by default.
+
+             friction = "sliding  torsional  rolling"
+
+         Only the first number matters at condim=3. MuJoCo's default is
+         1.0, which is quite grippy.
+
+         THE RULE THAT CATCHES EVERYONE: the friction used for a contact
+         is the ELEMENTWISE MAXIMUM of the two geoms' values - not the
+         average, and not the minimum. So a pair is only slippery if BOTH
+         geoms are slippery. One icy box on a grippy ramp still grips.
+
+         That is why the ramp is 0.05 here. A box slides when
+         friction < tan(tilt), and tan(20 deg) = 0.364:
+           slippery box  max(0.05, 0.05) = 0.05 < 0.364  -> SLIDES
+           grippy box    max(0.05, 1.00) = 1.00 > 0.364  -> HOLDS
+         Raise the ramp to 0.4 and the "slippery" box stops sliding even
+         though you never touched the box - that is the max rule biting. -->
+    <body name="ramp" pos="1.5 0 0.3" euler="0 20 0">
+      <geom name="g_ramp" type="box" size="0.6 0.4 0.02" rgba="0.6 0.6 0.65 1"
+            friction="0.05 0.005 0.0001"/>
+    </body>
+
+    <!-- Slippery box: friction 0.05. tan(20 deg) = 0.36 > 0.05, so
+         gravity overcomes friction and it slides off. -->
+    <body name="box_slippery" pos="1.25 -0.15 0.52" euler="0 20 0">
+      <freejoint/>
+      <geom name="g_slippery" type="box" size="0.07 0.07 0.07" rgba="0.3 0.7 0.9 1"
+            friction="0.05 0.005 0.0001"/>
+    </body>
+
+    <!-- Grippy box: friction 1.0 > 0.36, so it holds its place. -->
+    <body name="box_grippy" pos="1.25 0.15 0.52" euler="0 20 0">
+      <freejoint/>
+      <geom name="g_grippy" type="box" size="0.07 0.07 0.07" rgba="0.9 0.7 0.2 1"
+            friction="1.0 0.005 0.0001"/>
+    </body>
+
+    <!-- ===============================================================
+         A GHOST. Collision filtering via contype/conaffinity.
+         ===============================================================
+         Two geoms are tested for contact only if
+             (contype_A & conaffinity_B) || (contype_B & conaffinity_A)
+         is non-zero - a bitmask test. Setting both to 0 removes a geom
+         from collision detection entirely while still drawing it.
+
+         This purple sphere has a freejoint and mass, so gravity acts on
+         it, but it has no contacts - it falls straight through the
+         floor and keeps going. Useful for pure visual decoration, and
+         the mechanism you use to stop two specific parts of a linkage
+         from colliding with each other. -->
+    <body name="ghost" pos="0 1.2 1.0">
+      <freejoint/>
+      <geom name="g_ghost" type="sphere" size="0.1" rgba="0.7 0.3 0.9 0.4"
+            contype="0" conaffinity="0"/>
+    </body>
+
+  </worldbody>
+</mujoco>

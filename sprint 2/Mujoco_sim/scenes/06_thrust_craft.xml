@@ -1,0 +1,203 @@
+<!-- ===================================================================
+     06_thrust_craft.xml  -  a craft with steerable thrust vectors
+     ===================================================================
+     An abstract 12 kg test craft with five thrusters. This is the scene
+     the thrust/control material is built around.
+
+     HOW A THRUSTER IS DEFINED. Two elements working together:
+
+       <site>     WHERE the thrust is applied, and the frame it is
+                  applied in. A site is just a named point + orientation
+                  on a body. It has no mass and no collision.
+
+       <general>  the actuator that pushes on that site. Its `gear`
+                  attribute is the force direction IN THE SITE FRAME:
+                      gear = "Fx Fy Fz Tx Ty Tz"
+                  The first three are force, the last three torque.
+
+     The split that matters for control:
+
+       data.ctrl[i]                  -> MAGNITUDE, in Newtons
+       model.actuator_gear[i][:3]    -> DIRECTION, as a unit vector
+
+     Both are writable at runtime, every step. Writing ctrl throttles the
+     thruster; writing gear STEERS it (a gimbal). That is the whole
+     mechanism - see scripts/thrusters.py for the wrapper around it.
+
+     *** THE TRAP ***  gear SCALES the force, it does not merely aim it.
+     gear=[0,0,2] with ctrl=10 gives 20 N, not 10 N. A direction vector
+     must be NORMALIZED. Thruster.set() does this for you; if you write
+     actuator_gear by hand, normalize it yourself.
+
+     FRAMES. gear is in the site frame, which rides the body - so a
+     thruster keeps pointing "down the craft's axis" no matter how the
+     craft tumbles, exactly like a real engine. You do not have to
+     rotate anything by hand.
+
+     CONVENTIONS (matching assignment1/.../base_frame.py and the course
+     material): Z is up, the main thrust axis is at X = Y = 0, and
+     everything here is SI - metres, kilograms, seconds, Newtons,
+     radians. Note the CAD model thrusts in -Z because that test stand
+     fires DOWN into a bench; a flight vehicle thrusts +Z, as here.
+
+     Run it:
+       uv run python scripts/fly.py scenes/06_thrust_craft.xml \
+           --controller example_hover:hover --arrows
+     =================================================================== -->
+
+<mujoco model="thrust_craft">
+
+  <option timestep="0.002" gravity="0 0 -1.62"/>
+  <!--                             ^^^^^ lunar surface gravity, m/s^2.
+       Use -9.81 for Earth. The craft below masses 12 kg, so hovering
+       needs m*g = 19.44 N here but 117.7 N on Earth - more than the
+       main thruster's 60 N limit. Gravity choice and thrust sizing are
+       the same decision. -->
+
+  <!-- Offscreen framebuffer for headless rendering; the 640x480 default
+       is a hard error if you ask Renderer for anything bigger. -->
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2" width="300" height="300"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.1"/>
+  </asset>
+
+  <default>
+    <!-- Sites are visual markers only - no mass, no collision. Drawn
+         small and orange so the nozzles are visible in the viewer. -->
+    <site type="sphere" size="0.025" rgba="1.0 0.55 0.1 1"/>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 6" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="20 20 0.1" material="grid_mat"/>
+
+    <body name="craft" pos="0 0 2.0">
+      <freejoint/>
+
+      <!-- The hull. 12 kg explicit, rather than letting MuJoCo infer it
+           from a density, because thrust sizing is all about m*g and a
+           made-up density would make the numbers meaningless.
+           0.15 x 0.15 x 0.25 half-extents => a 0.3 x 0.3 x 0.5 m body. -->
+      <geom name="hull" type="box" size="0.15 0.15 0.25" mass="12"
+            rgba="0.75 0.78 0.82 1"/>
+
+      <!-- ===========================================================
+           MAIN ENGINE. On the thrust axis (X = Y = 0), at the base.
+           ===========================================================
+           pos is where the nozzle sits; -0.25 is the bottom face.
+           Because X = Y = 0, thrust along +Z passes through the centre
+           of mass and produces NO torque - pure translation. Steer it
+           off-axis with Thruster.set(direction=...) and it starts
+           producing torque too, which is thrust vectoring. -->
+      <site name="noz_main" pos="0 0 -0.25" size="0.04"/>
+
+      <!-- ===========================================================
+           RCS QUAD. Above the centre of mass, firing SIDEWAYS.
+           ===========================================================
+           These exist to make torque. A force applied at a point offset
+           from the centre of mass produces a moment r x F, so an offset
+           site lets you rotate the craft.
+
+           Note the site `euler` values: each nozzle is rotated so that
+           its +Z (the direction `gear="0 0 1"` means) points HORIZONTALLY
+           outward. That matters. An earlier version of this scene had all
+           four firing +Z like the main engine, which meant every attitude
+           correction also shoved the craft upward by 5 N - a parasitic
+           lift that fights the altitude loop. Firing sideways from a
+           point 0.25 m above the CoM gives almost pure torque.
+
+           euler="0 90 0"  rotates nozzle +Z to world +X
+           euler="0 -90 0" rotates nozzle +Z to world -X
+           euler="-90 0 0" rotates nozzle +Z to world +Y
+           euler="90 0 0"  rotates nozzle +Z to world -Y
+
+           Fire an opposing PAIR together and the torques cancel while the
+           side forces add - that is translation. Fire one alone and you
+           get rotation. See example_hover.vectored_translate. -->
+      <site name="noz_rcs_px" pos=" 0.15 0 0.25" size="0.02" euler="0  90 0"/>
+      <site name="noz_rcs_nx" pos="-0.15 0 0.25" size="0.02" euler="0 -90 0"/>
+      <site name="noz_rcs_py" pos="0  0.15 0.25" size="0.02" euler="-90 0 0"/>
+      <site name="noz_rcs_ny" pos="0 -0.15 0.25" size="0.02" euler=" 90 0 0"/>
+
+      <!-- A marker at the centre of mass, for reference when watching
+           torques. Visual only. -->
+      <site name="com" pos="0 0 0" size="0.03" rgba="0.3 0.9 0.4 0.5"/>
+
+      <!-- A chase camera riding the craft, so headless renders frame the
+           vehicle instead of the whole world. The free camera zooms out
+           to fit the scene, which makes the thrust arrows too small to
+           see. Select it with `--camera chase`, or press ']' in the
+           viewer. mode="trackcom" keeps it pointed at the centre of
+           mass while the craft moves. -->
+      <camera name="chase" pos="2.8 -3.2 0.15"
+              xyaxes="0.75 0.66 0 -0.04 0.05 1.0" mode="trackcom"/>
+    </body>
+  </worldbody>
+
+  <!-- ===============================================================
+       ACTUATORS. One <general> per thruster, each bound to its site.
+       ===============================================================
+       gear="0 0 1 0 0 0"  => +Z in the site frame, i.e. the craft
+                              pushes itself "up" along its own axis.
+       ctrlrange="0 60"    => 0 to 60 N. MuJoCo CLAMPS ctrl to this
+                              range automatically (verified: ctrl=999
+                              gives 60 N, ctrl=-5 gives 0 N). The lower
+                              bound is 0 because a rocket cannot pull.
+
+       Names are prefixed thr_ so ThrusterSet can discover them and
+       strip the prefix: thr_main -> thrusters["main"].
+       =============================================================== -->
+  <actuator>
+    <!-- Main engine: 60 N, comfortably above the 19.44 N lunar hover
+         requirement so there is control authority to climb. -->
+    <general name="thr_main" site="noz_main" gear="0 0 1 0 0 0"
+             ctrlrange="0 60"/>
+
+    <!-- RCS: 20 N each. Their job is attitude, not lift, but they still
+         have to OUT-TORQUE the main engine's gimbal disturbance.
+         Sizing, which is a real design calculation and not a guess:
+           main engine 60 N max, nozzle 0.25 m below the CoM, cant
+           limited to ~37 deg  =>  up to 60*sin(37) * 0.25 = 9.0 N*m of
+           disturbance; at the 24 N hover-ish throttle used by
+           vectored_translate it is 3.6 N*m (measured).
+           one RCS at 20 N on a 0.25 m arm = 5.0 N*m.
+         At 5 N each (1.25 N*m) the attitude loop LOSES to the gimbal and
+         the craft tumbles to a stable upside-down hover - position
+         converges while tilt sits at 180 deg. No amount of gain tuning
+         fixes an under-actuated vehicle; the thrusters have to be big
+         enough. This is the lesson, and it is why the number is 20. -->
+    <general name="thr_rcs_px" site="noz_rcs_px" gear="0 0 1 0 0 0"
+             ctrlrange="0 20"/>
+    <general name="thr_rcs_nx" site="noz_rcs_nx" gear="0 0 1 0 0 0"
+             ctrlrange="0 20"/>
+    <general name="thr_rcs_py" site="noz_rcs_py" gear="0 0 1 0 0 0"
+             ctrlrange="0 20"/>
+    <general name="thr_rcs_ny" site="noz_rcs_ny" gear="0 0 1 0 0 0"
+             ctrlrange="0 20"/>
+  </actuator>
+
+  <!-- ===============================================================
+       SENSORS. The "flight computer's" view of the state.
+       ===============================================================
+       These land in data.sensordata as one flat float array, in the
+       order declared here: pos(3) vel(3) quat(4) angvel(3) = 13 floats.
+
+       You do NOT need sensors to write a controller - data.xpos,
+       data.qvel and data.xquat are readable directly, which is what
+       CraftState does. Sensors matter when you want to model what a
+       real vehicle can actually measure: add noise, bias or a slower
+       update rate here and your controller has to cope, exactly as it
+       would on the bench.
+       =============================================================== -->
+  <sensor>
+    <framepos     objtype="body" objname="craft" name="craft_pos"/>
+    <framelinvel  objtype="body" objname="craft" name="craft_vel"/>
+    <framequat    objtype="body" objname="craft" name="craft_quat"/>
+    <frameangvel  objtype="body" objname="craft" name="craft_angvel"/>
+  </sensor>
+</mujoco>

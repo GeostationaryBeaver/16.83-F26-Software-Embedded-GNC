@@ -1,0 +1,136 @@
+<!-- ===================================================================
+     03_shapes.xml  -  the primitive geom types, and how mass works
+     ===================================================================
+     MuJoCo's built-in shapes, side by side, all dropped from the same
+     height. Primitives are exact, fast and stable - always prefer them
+     to a mesh when the shape allows it. A mesh is collided as its
+     CONVEX HULL, whereas these are handled by exact analytic contact
+     routines.
+
+     SIZE IS ALWAYS A RADIUS / HALF-EXTENT, NEVER A FULL WIDTH:
+       sphere     size="r"
+       box        size="hx hy hz"      (half-extents: 0.1 => 0.2 m wide)
+       capsule    size="r halflength"  (a cylinder with hemisphere caps)
+       cylinder   size="r halflength"
+       ellipsoid  size="rx ry rz"
+       plane      size="xdraw ydraw gridspacing"   (infinite collision)
+
+     Run it:  uv run python scripts/run.py scenes/03_shapes.xml
+     Then:    uv run python scripts/inspect_model.py scenes/03_shapes.xml
+              to see the computed mass of each body.
+     =================================================================== -->
+
+<mujoco model="shapes">
+
+  <!-- Smaller timestep than the 0.002 default. The thin cylinder and
+       the small sphere below are the kind of geometry that benefits:
+       a thin or small object can pass measurably far into another
+       object within a single step before the contact is detected.
+       Rule of thumb: if the fastest thing in your scene can move more
+       than about its own smallest dimension in one timestep, shrink
+       the timestep. -->
+  <option timestep="0.001" gravity="0 0 -9.81"/>
+
+  <!-- Offscreen framebuffer size, used only by headless rendering
+       (scripts/run.py --headless / --video). MuJoCo's default is a small
+       640x480, and asking Renderer for anything larger is a hard error.
+       Raise these if you want bigger stills. -->
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2" width="300" height="300"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 4" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="10 10 0.1" material="grid_mat"/>
+
+    <!-- SPHERE. The cheapest and most stable geom. If something can be
+         a sphere, make it a sphere.
+         Mass here is implicit: volume x default density (1000 kg/m^3,
+         i.e. water). (4/3)pi(0.15^3) x 1000 = 14.1 kg -->
+    <body name="sphere" pos="-1.0 0 1.0">
+      <freejoint/>
+      <geom name="g_sphere" type="sphere" size="0.15" rgba="0.9 0.3 0.2 1"/>
+    </body>
+
+    <!-- BOX. size are HALF-extents, so this is a 0.3 m cube.
+         Here mass is set EXPLICITLY to 5 kg, which overrides whatever
+         density would have given (0.3^3 x 1000 = 27 kg). Use explicit
+         mass when you know the real part's weight - far better than
+         back-solving a fake density. -->
+    <body name="box" pos="-0.5 0 1.0">
+      <freejoint/>
+      <geom name="g_box" type="box" size="0.15 0.15 0.15" rgba="0.3 0.8 0.3 1" mass="5"/>
+    </body>
+
+    <!-- CAPSULE. A cylinder with hemispherical end caps, so it has no
+         sharp edges. size="r halflength" where halflength EXCLUDES the
+         caps - total length is 2*(halflength + r) = 0.7 m here.
+         Capsules are the best-behaved non-spherical geom in any physics
+         engine: smooth surface means no edge-contact discontinuities.
+         Prefer a capsule to a cylinder whenever you can. -->
+    <body name="capsule" pos="0 0 1.0" euler="0 90 0">
+      <freejoint/>
+      <geom name="g_capsule" type="capsule" size="0.1 0.25" rgba="0.3 0.5 0.9 1"/>
+    </body>
+
+    <!-- CYLINDER. Flat circular faces, so it can rest stably on its
+         end - but those sharp rim edges are harder on the solver than
+         a capsule's smooth surface. Set density instead of mass here:
+         DENSITY is the other way to specify inertia. 2700 kg/m^3 is
+         aluminium. Volume = pi(0.15^2)(0.1) => ~19.1 kg.
+         Use density when you know the material; use mass when you know
+         the weight. -->
+    <body name="cylinder" pos="0.5 0 1.0">
+      <freejoint/>
+      <geom name="g_cylinder" type="cylinder" size="0.15 0.05" rgba="0.9 0.7 0.2 1" density="2700"/>
+    </body>
+
+    <!-- ELLIPSOID. Three independent radii. Wobbles when it lands,
+         because its inertia differs about each axis. -->
+    <body name="ellipsoid" pos="1.0 0 1.0">
+      <freejoint/>
+      <geom name="g_ellipsoid" type="ellipsoid" size="0.2 0.12 0.08" rgba="0.8 0.4 0.8 1"/>
+    </body>
+
+    <!-- ===============================================================
+         MULTIPLE GEOMS IN ONE BODY = a rigid compound part.
+         ===============================================================
+         A body can hold any number of geoms. They are welded rigidly
+         together, share the single freejoint, and their masses and
+         inertias are summed automatically. They never collide with
+         each other (geoms in the same body are excluded from contact).
+
+         This is THE way to build a non-convex rigid object that still
+         collides correctly: compose it from convex primitives. A mesh
+         of this same T-shape would collide as its convex hull - a
+         filled wedge - whereas this collides exactly as drawn.
+         Remember this when you get to importing real CAD geometry. -->
+    <body name="compound_tee" pos="1.8 0 1.0">
+      <freejoint/>
+      <geom name="g_tee_arm" type="box" size="0.25 0.06 0.06" rgba="0.2 0.8 0.8 1"/>
+      <geom name="g_tee_stem" type="box" size="0.06 0.06 0.2" pos="0 0 -0.2" rgba="0.2 0.6 0.8 1"/>
+    </body>
+
+    <!-- A STATIC OBSTACLE. No freejoint => immovable, regardless of
+         mass or what hits it. This is how you build walls, tables,
+         fixtures and test rigs. -->
+    <body name="pedestal" pos="-1.8 0 0.15">
+      <geom name="g_pedestal" type="cylinder" size="0.2 0.15" rgba="0.5 0.5 0.55 1"/>
+    </body>
+
+    <!-- A small sphere dropped onto that static pedestal, to show that
+         static geometry takes contact forces perfectly well without
+         needing mass. -->
+    <body name="small_ball" pos="-1.8 0.02 1.2">
+      <freejoint/>
+      <geom name="g_small_ball" type="sphere" size="0.05" rgba="1.0 0.5 0.1 1"/>
+    </body>
+
+  </worldbody>
+</mujoco>

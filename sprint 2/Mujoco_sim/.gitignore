@@ -1,0 +1,13 @@
+# uv-managed virtualenv
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Rendered output: regenerate with scripts/run.py
+out/
+
+# Scenario runs: one timestamped directory per flight, regenerate with
+# scripts/scenario.py
+outputs/

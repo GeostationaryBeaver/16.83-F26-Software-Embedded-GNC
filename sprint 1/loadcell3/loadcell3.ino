@@ -1,11 +1,10 @@
 
 #include <HX711.h>
 #include <stdlib.h>
-// #include "data_accum.h"
 
 // HX711 connected to Arduino Mega
-const int DT_PIN  = 3;
-const int CLK_PIN = 2;
+const int DT_PIN  = A3;
+const int CLK_PIN = A2;
 
 HX711 scale;
 
@@ -76,7 +75,7 @@ void calibrateScale(float massGrams) {
   }
 
   // Reverse sign so applied force is positive
-  float netCounts = (float)(offset - average);
+  float netCounts = (float)(-offset + average);
 
   // Convert known mass (grams) to force (N)
   float knownForce = (massGrams / 1000.0) * 9.80665;
@@ -165,8 +164,8 @@ void setup() {
   Serial.println("# t = tare");
   Serial.println("# c 500 = calibrate with 500 g");
   Serial.println("# millis,raw,counts,force_N");
+
   Serial.println("millis,raw,counts,force_N");
-  Serial.println("Starting Load Cell Readings:");
 }
 
 
@@ -185,7 +184,7 @@ void loop() {
   long raw = scale.read();
 
   // Reverse sign and subtract zero offset
-  long netCounts = offset - raw;
+  long netCounts = -offset + raw;
 
   // Convert counts to newtons
   float forceN = 0;

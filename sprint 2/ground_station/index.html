@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hopper Ground Station</title>
+<style>
+  :root {
+    --bg: #0a0b0d;
+    --panel: #111317;
+    --border: #23272e;
+    --border-strong: #2f343c;
+    --text: #d7dbe0;
+    --dim: #7a828d;
+    --faint: #4a515b;
+    --accent: #f2a93b;
+    --ok: #3ecf8e;
+    --bad: #f0524f;
+    --grid: #1b1e23;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; }
+  body { display: grid; grid-template-rows: auto 1fr; }
+
+  .label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  header { display: flex; align-items: stretch; border-bottom: 1px solid var(--border); height: 48px; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 0 16px; border-right: 1px solid var(--border); font-weight: 600; letter-spacing: 0.14em; font-size: 12px; }
+  .brand .mark { width: 10px; height: 10px; border: 1.5px solid var(--accent); transform: rotate(45deg); }
+  .stats { display: flex; flex: 1; }
+  .stat { display: flex; flex-direction: column; justify-content: center; padding: 0 16px; border-right: 1px solid var(--border); min-width: 110px; }
+  .stat .value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 14px; margin-top: 2px; }
+  .conn { display: flex; align-items: center; gap: 12px; padding: 0 16px; border-left: 1px solid var(--border); }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .status.live .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .status.stale .dot { background: var(--accent); }
+
+  button { font: inherit; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text); background: transparent; border: 1px solid var(--border-strong); padding: 7px 12px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--dim); background: #171a1f; }
+  button:disabled { color: var(--faint); cursor: not-allowed; }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+
+  main { display: grid; grid-template-columns: 1fr 280px; min-height: 0; }
+  .plots { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; min-height: 0; }
+  .plot { position: relative; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .plot-head { display: flex; justify-content: space-between; align-items: baseline; padding: 10px 14px 4px; }
+  .plot-head .name { display: flex; align-items: center; gap: 8px; }
+  .swatch { width: 10px; height: 2px; }
+  .plot-head .value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 20px; }
+  .plot canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+
+  aside { display: flex; flex-direction: column; min-height: 0; }
+  section { border-bottom: 1px solid var(--border); padding: 14px 16px; }
+  section h2 { margin: 0 0 12px; font-weight: 500; }
+  .led-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .led-grid button { display: flex; align-items: center; gap: 8px; justify-content: flex-start; }
+  .led-grid .chip { width: 8px; height: 8px; border: 1px solid var(--border-strong); }
+  .log { flex: 1; overflow-y: auto; border-bottom: none; }
+  .log ol { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11px; }
+  .log li { display: grid; grid-template-columns: 64px 1fr; gap: 8px; padding: 3px 0; color: var(--dim); }
+  .log li span:last-child { color: var(--text); }
+  .log li.err span:last-child { color: var(--bad); }
+
+  .notice { padding: 10px 16px; color: var(--bad); border-bottom: 1px solid var(--border); display: none; }
+
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+    .plots { grid-template-columns: 1fr; grid-template-rows: repeat(4, 200px); }
+    .stats .stat:nth-child(n+3) { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><div class="mark"></div>HOPPER GS</div>
+  <div class="stats">
+    <div class="stat"><span class="label">Rx rate</span><span class="value" id="rate">—</span></div>
+    <div class="stat"><span class="label">Last pkt</span><span class="value" id="age">—</span></div>
+    <div class="stat"><span class="label">Seq</span><span class="value" id="seq">—</span></div>
+    <div class="stat"><span class="label">Hopper T+</span><span class="value" id="uptime">—</span></div>
+  </div>
+  <div class="conn">
+    <div class="status" id="status"><div class="dot"></div><span id="status-text">Disconnected</span></div>
+    <button class="primary" id="connect">Connect</button>
+  </div>
+</header>
+<main>
+  <div class="plots" id="plots"></div>
+  <aside>
+    <div class="notice" id="notice">Web Serial is not available. Open this page in Chrome or Edge via http://localhost.</div>
+    <section>
+      <h2 class="label">Command · LED</h2>
+      <div class="led-grid" id="led-buttons"></div>
+    </section>
+    <section class="log">
+      <h2 class="label">Event log</h2>
+      <ol id="log"></ol>
+    </section>
+  </aside>
+</main>
+<script>
+// ---- Protocol: must match firmware/components/protocol/include/protocol.h ----
+const MSG_TELEMETRY = 1;
+const MSG_CMD_SET_LED = 2;
+const TELEMETRY_LEN = 25;  // type u8, seq u32, time_ms u32, placeholder f32[4]
+const CHANNELS = ["placeholder[0]", "placeholder[1]", "placeholder[2]", "placeholder[3]"];
+
+// USB framing (matches firmware/ground/main/main.c):
+//   0xAA 0x55 <len> <packet> <checksum = sum of packet bytes mod 256>
+const SYNC0 = 0xAA, SYNC1 = 0x55;
+
+function decodeTelemetry(p) {
+  const v = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  return {
+    seq: v.getUint32(1, true),
+    timeMs: v.getUint32(5, true),
+    values: [0, 1, 2, 3].map(i => v.getFloat32(9 + 4 * i, true)),
+  };
+}
+
+function encodeSetLed(r, g, b) {
+  return new Uint8Array([MSG_CMD_SET_LED, r, g, b]);
+}
+
+// ---- Framing ----
+function frame(packet) {
+  const out = new Uint8Array(packet.length + 4);
+  out[0] = SYNC0; out[1] = SYNC1; out[2] = packet.length;
+  out.set(packet, 3);
+  out[3 + packet.length] = packet.reduce((s, b) => (s + b) & 0xFF, 0);
+  return out;
+}
+
+const parser = { state: 0, len: 0, buf: null, n: 0 };
+function feed(bytes) {
+  for (const byte of bytes) {
+    switch (parser.state) {
+      case 0: if (byte === SYNC0) parser.state = 1; break;
+      case 1: parser.state = byte === SYNC1 ? 2 : 0; break;
+      case 2:
+        parser.len = byte; parser.n = 0; parser.buf = new Uint8Array(byte);
+        parser.state = byte > 0 ? 3 : 0; break;
+      case 3:
+        parser.buf[parser.n++] = byte;
+        if (parser.n === parser.len) parser.state = 4;
+        break;
+      case 4: {
+        const sum = parser.buf.reduce((s, b) => (s + b) & 0xFF, 0);
+        if (byte === sum) onPacket(parser.buf);
+        parser.state = 0;
+        break;
+      }
+    }
+  }
+}
+
+// ---- Telemetry state ----
+const WINDOW_MS = 10000;
+const COLORS = ["#4cc9f0", "#f2a93b", "#c77dff", "#9ef01a"];
+const series = CHANNELS.map(() => []);  // [{t, v}]
+let latest = null;
+let lastRxWall = 0;
+const rxTimes = [];
+
+function onPacket(p) {
+  if (p[0] !== MSG_TELEMETRY || p.length !== TELEMETRY_LEN) return;
+  const pkt = decodeTelemetry(p);
+  latest = pkt;
+  const now = performance.now();
+  lastRxWall = now;
+  rxTimes.push(now);
+  pkt.values.forEach((v, i) => {
+    const s = series[i];
+    s.push({ t: pkt.timeMs, v });
+    while (s.length && s[0].t < pkt.timeMs - WINDOW_MS) s.shift();
+  });
+}
+
+// ---- Serial ----
+let port = null, writer = null;
+
+async function connect() {
+  try {
+    port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x303A }] });
+    await port.open({ baudRate: 115200 });
+    await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    writer = port.writable.getWriter();
+    setConnected(true);
+    log("Connected to ground ESP");
+    readLoop();
+  } catch (e) {
+    if (e.name !== "NotFoundError") log(e.message, true);
+  }
+}
+
+async function disconnect() {
+  try { writer?.releaseLock(); await port?.readable?.cancel(); await port?.close(); } catch {}
+  port = null; writer = null;
+  setConnected(false);
+  log("Disconnected");
+}
+
+async function readLoop() {
+  const reader = port.readable.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      feed(value);
+    }
+  } catch (e) {
+    log("Serial error: " + e.message, true);
+  } finally {
+    reader.releaseLock();
+  }
+  if (port) disconnect();
+}
+
+async function send(packet, description) {
+  if (!writer) return;
+  await writer.write(frame(packet));
+  log("Sent " + description);
+}
+
+// ---- UI ----
+const $ = id => document.getElementById(id);
+
+function log(msg, isError) {
+  const li = document.createElement("li");
+  if (isError) li.className = "err";
+  const t = new Date().toLocaleTimeString([], { hour12: false });
+  li.innerHTML = `<span>${t}</span><span></span>`;
+  li.lastChild.textContent = msg;
+  $("log").prepend(li);
+}
+
+function setConnected(on) {
+  $("connect").textContent = on ? "Disconnect" : "Connect";
+  $("connect").classList.toggle("primary", !on);
+  document.querySelectorAll(".led-grid button").forEach(b => b.disabled = !on);
+}
+
+$("connect").onclick = () => port ? disconnect() : connect();
+if (!("serial" in navigator)) {
+  $("notice").style.display = "block";
+  $("connect").disabled = true;
+}
+
+const LED_COLORS = [
+  ["Off", 0, 0, 0, "transparent"], ["White", 1, 1, 1, "#ffffff"],
+  ["Red", 1, 0, 0, "#ff3b30"], ["Green", 0, 1, 0, "#34c759"],
+  ["Blue", 0, 0, 1, "#0a84ff"], ["Yellow", 1, 1, 0, "#ffd60a"],
+  ["Cyan", 0, 1, 1, "#64d2ff"], ["Magenta", 1, 0, 1, "#ff375f"],
+];
+for (const [name, r, g, b, css] of LED_COLORS) {
+  const btn = document.createElement("button");
+  btn.innerHTML = `<span class="chip" style="background:${css}"></span>${name}`;
+  btn.disabled = true;
+  btn.onclick = () => send(encodeSetLed(r, g, b), `LED ${name.toUpperCase()}`);
+  $("led-buttons").append(btn);
+}
+
+const plots = CHANNELS.map((name, i) => {
+  const el = document.createElement("div");
+  el.className = "plot";
+  el.innerHTML = `<div class="plot-head">
+      <span class="name label"><span class="swatch" style="background:${COLORS[i]}"></span>${name}</span>
+      <span class="value">—</span></div><canvas></canvas>`;
+  $("plots").append(el);
+  return { canvas: el.querySelector("canvas"), value: el.querySelector(".value") };
+});
+
+function drawPlot(plot, data, color, tEnd) {
+  const c = plot.canvas, dpr = devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const padL = 52, padR = 14, padT = 6, padB = 22;
+  const pw = w - padL - padR, ph = h - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const p of data) { lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }
+  if (!isFinite(lo)) { lo = -1; hi = 1; }
+  if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
+
+  const x = t => padL + pw * (1 - (tEnd - t) / WINDOW_MS);
+  const y = v => padT + ph * (1 - (v - lo) / (hi - lo));
+
+  // Grid + axes labels
+  ctx.font = "10px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#4a515b";
+  ctx.textBaseline = "middle";
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * k / 4, yy = Math.round(y(v)) + 0.5;
+    ctx.strokeStyle = "#1b1e23";
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + pw, yy); ctx.stroke();
+    ctx.textAlign = "right";
+    ctx.fillText(v.toFixed(2).replace(/^-0\.00$/, "0.00"), padL - 8, yy);
+  }
+  ctx.textBaseline = "top";
+  ctx.textAlign = "center";
+  for (let s = 0; s <= 10; s += 2) {
+    const xx = Math.round(padL + pw * (1 - s * 1000 / WINDOW_MS)) + 0.5;
+    ctx.strokeStyle = "#1b1e23";
+    ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, padT + ph); ctx.stroke();
+    ctx.fillText(s === 0 ? "0s" : `-${s}s`, xx, padT + ph + 6);
+  }
+  ctx.strokeStyle = "#2f343c";
+  ctx.strokeRect(padL + 0.5, padT + 0.5, pw, ph);
+
+  // Trace
+  if (data.length > 1) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    data.forEach((p, k) => k ? ctx.lineTo(x(p.t), y(p.v)) : ctx.moveTo(x(p.t), y(p.v)));
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function render() {
+  const now = performance.now();
+  while (rxTimes.length && rxTimes[0] < now - 1000) rxTimes.shift();
+
+  const age = latest ? now - lastRxWall : null;
+  const live = latest && age < 500;
+  $("rate").textContent = latest ? `${rxTimes.length} Hz` : "—";
+  $("age").textContent = latest ? (age < 1000 ? `${age.toFixed(0)} ms` : `${(age / 1000).toFixed(1)} s`) : "—";
+  $("seq").textContent = latest ? latest.seq : "—";
+  $("uptime").textContent = latest ? `${(latest.timeMs / 1000).toFixed(2)} s` : "—";
+
+  $("status").className = "status" + (live ? " live" : port ? " stale" : "");
+  $("status-text").textContent = live ? "Link live" : port ? "No telemetry" : "Disconnected";
+
+  const tEnd = latest ? latest.timeMs : 0;
+  plots.forEach((plot, i) => {
+    plot.value.textContent = latest ? latest.values[i].toFixed(3) : "—";
+    drawPlot(plot, series[i], COLORS[i], tEnd);
+  });
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

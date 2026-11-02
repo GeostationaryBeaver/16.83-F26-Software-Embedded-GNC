@@ -1,7 +1,7 @@
 // MAC Series 35 solenoid valve
 // Arduino Mega 2560
 
-const int MAC_VALVE_PIN = 28;
+const int MAC_VALVE_PIN = 7;
 
 // --------------------------------------------------
 // Valve timing constants, all in milliseconds
@@ -174,6 +174,7 @@ void updateValve()
 
       // Open valve
       digitalWrite(MAC_VALVE_PIN, HIGH);
+      Serial.println("opening valve");
 
       valveOpen = true;
       stateStartTime = currentTime;

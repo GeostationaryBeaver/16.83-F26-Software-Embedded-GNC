@@ -1,0 +1,117 @@
+<!-- ===================================================================
+     01_ball_drop.xml  -  the smallest useful MuJoCo model
+     ===================================================================
+     A single sphere falls under gravity and lands on a ground plane.
+     That is it. Every line below is load-bearing; delete any of them
+     and something visibly breaks.
+
+     Run it:   uv run python scripts/run.py scenes/01_ball_drop.xml
+     Inspect:  uv run python scripts/inspect_model.py scenes/01_ball_drop.xml
+     =================================================================== -->
+
+<!-- Every MJCF file has exactly one <mujoco> root. The model name shows
+     up in the viewer title bar and in error messages. -->
+<mujoco model="ball_drop">
+
+  <!-- ===== SIMULATION-WIDE PHYSICS SETTINGS ==========================
+       <option> is the global physics config. These are the two knobs
+       you will touch most often.
+
+       timestep  Seconds of simulated time per mj_step() call. 0.002 s
+                 (2 ms, 500 Hz) is MuJoCo's default and a good general
+                 value. SMALLER = more accurate and more stable, but
+                 more CPU per second of sim. If objects jitter, sink
+                 into each other, or fly apart, reduce this FIRST.
+
+       gravity   A 3-vector in m/s^2, not a scalar - so you can tilt it
+                 or remove it entirely. Earth is -9.81 on Z.
+                 Try:  "0 0 -1.62"  (Moon)
+                       "0 0 -3.72"  (Mars)
+                       "0 0 0"      (orbit / free drift)
+
+       integrator  How state is advanced each step. "Euler" is the
+                 default and is fine here. "RK4" is more accurate for
+                 smooth dynamics; "implicitfast" is better when you
+                 have strong damping. Only change this if you have a
+                 stability problem that a smaller timestep did not fix.
+       ================================================================= -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="Euler"/>
+
+  <!-- Offscreen framebuffer size, used only by headless rendering
+       (scripts/run.py --headless / --video). MuJoCo's default is a small
+       640x480, and asking Renderer for anything larger is a hard error.
+       Raise these if you want bigger stills. -->
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <!-- ===== VISUAL-ONLY ASSETS ========================================
+       Nothing in <asset> affects physics - it is textures, materials
+       and meshes. The checkered floor texture just makes motion easy
+       to see; without a reference pattern it is hard to tell whether
+       the camera or the object is moving.
+       ================================================================= -->
+  <asset>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2"
+             width="300" height="300"/>
+    <material name="grid_mat" texture="grid" texrepeat="8 8" reflectance="0.1"/>
+  </asset>
+
+  <!-- ===== THE WORLD =================================================
+       <worldbody> is the root of the body tree. It IS the static world:
+       anything you put directly in it, without wrapping it in a <body>
+       that has a joint, is immovable - bolted to the universe.
+       ================================================================= -->
+  <worldbody>
+
+    <!-- A light, so the scene is not flat grey. Purely visual. -->
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+
+    <!-- THE GROUND.
+         A geom placed directly in <worldbody> => static. A "plane" is
+         mathematically infinite, so the ball can never miss it. The
+         size attribute only controls how much of it gets DRAWN
+         (10 m x 10 m here, 0.1 m grid spacing) - not the collision
+         extent, which is unbounded.
+
+         Note there is no <freejoint> here. That is exactly why the
+         floor does not fall: no joint means no degrees of freedom. -->
+    <geom name="floor" type="plane" size="10 10 0.1" material="grid_mat"/>
+
+    <!-- THE BALL.
+         Wrapping the geom in a <body> gives it its own coordinate
+         frame, positioned 2 m up. pos is the body ORIGIN; the geom
+         inside is then placed relative to that frame. -->
+    <body name="ball" pos="0 0 2">
+
+      <!-- ***** THE SINGLE MOST IMPORTANT LINE IN THIS FILE *****
+
+           A <freejoint> gives the body all 6 rigid-body degrees of
+           freedom: 3 translation + 3 rotation. It is what makes the
+           body DYNAMIC - free to be moved by gravity and contacts.
+
+           Comment this line out and re-run. The ball does not fall.
+           It hangs in mid-air, perfectly still, forever. This is the
+           #1 confusion for new MuJoCo users: nothing is wrong with
+           your gravity, your object simply has no DOFs to move along.
+
+           "My object won't move" => check for a missing freejoint. -->
+      <freejoint/>
+
+      <!-- The sphere itself. size="0.15" is the RADIUS in metres
+           (MuJoCo is strictly SI - metres, kilograms, seconds).
+
+           No mass or density given, so MuJoCo computes mass from the
+           volume at its default density of 1000 kg/m^3 (water).
+           A 0.15 m sphere => ~14.1 kg.
+
+           Mass does NOT affect fall speed in a vacuum - MuJoCo has no
+           air drag by default, so a 1 kg and a 100 kg ball land
+           together, exactly as Galileo promised. Mass DOES matter for
+           collisions, since momentum is mass times velocity. -->
+      <geom name="ball_geom" type="sphere" size="0.15" rgba="0.9 0.3 0.2 1"/>
+    </body>
+
+  </worldbody>
+</mujoco>

@@ -1,0 +1,93 @@
+<!-- ===================================================================
+     05_mesh_collision_proxy.xml  -  the RIGHT way to import a CAD part
+     ===================================================================
+     Compare this with 04_mesh_import.xml, which is the naive import.
+
+     THE PROBLEM. A mesh geom collides as its CONVEX HULL. The base frame
+     is only 2.8% of its own hull (mesh 0.0022 m^3 vs hull 0.0775 m^3),
+     so a plain mesh import collides as a SOLID BLOCK: you cannot drop
+     anything between the legs or into the frame.
+
+     THE FIX USED HERE. One body holding two sets of geoms:
+       * the mesh, contype=0 conaffinity=0  -> drawn, never collides
+       * a dozen boxes approximating legs, feet and beams -> collide
+     Geoms in the same body are welded rigidly, share the one freejoint,
+     and never collide with each other, so this is a single rigid part.
+
+     THE NUMBERS come from the CAD source, not from eyeballing the STL:
+     assignment1/lunar-hopper/02-cad/base_frame.py, mm -> m
+       FOOT_PLATE_LEN/WIDTH 90, FOOT_PLATE_THICKNESS 10
+       LEG_SECTION 40, LEG_HEIGHT 300, FRAME_SPAN_X/Y 400
+       BEAM_WIDTH/HEIGHT 50
+     This mesh's origin is at its BASE (z runs 0 -> 0.35), not its
+     centre, so every offset below is measured up from the foot plates.
+
+     The orange ball is the proof: it falls THROUGH the open frame and
+     lands on the floor inside the legs. Against 04_mesh_import.xml it
+     would bounce off a solid lid instead.
+
+     Run it:  uv run python scripts/run.py scenes/05_mesh_collision_proxy.xml
+     =================================================================== -->
+
+<mujoco model="frame_collision_proxy">
+
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2" width="300" height="300"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.1"/>
+
+    <!-- scale converts the STL's millimetres into MuJoCo's metres. -->
+    <mesh name="frame" file="/home/gusbe/16.83/03 - Checks/base_frame.stl"
+          scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 4" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="floor" type="plane" size="10 10 0.1" material="grid_mat"/>
+
+    <body name="frame_body" pos="0 0 0.4">
+      <freejoint/>
+
+      <!-- VISUAL ONLY. contype=0 conaffinity=0 removes it from collision
+           detection entirely, so you see the real geometry while the
+           boxes below do the physics. -->
+      <geom name="g_visual" type="mesh" mesh="frame"
+            contype="0" conaffinity="0" rgba="0.7 0.7 0.75 1"/>
+
+      <!-- FOOT PLATES: 90x90x10 mm, centred on the 400 mm leg span.
+           These are what actually touch the ground. -->
+      <geom name="g_foot_nn" type="box" size="0.045 0.045 0.005" pos="-0.2 -0.2 0.005"/>
+      <geom name="g_foot_pn" type="box" size="0.045 0.045 0.005" pos=" 0.2 -0.2 0.005"/>
+      <geom name="g_foot_np" type="box" size="0.045 0.045 0.005" pos="-0.2  0.2 0.005"/>
+      <geom name="g_foot_pp" type="box" size="0.045 0.045 0.005" pos=" 0.2  0.2 0.005"/>
+
+      <!-- LEGS: 40x40 mm square, from the foot top (z=0.010) up to the
+           beam underside (z=0.300). Half-height = 0.145, centre 0.155. -->
+      <geom name="g_leg_nn" type="box" size="0.02 0.02 0.145" pos="-0.2 -0.2 0.155"/>
+      <geom name="g_leg_pn" type="box" size="0.02 0.02 0.145" pos=" 0.2 -0.2 0.155"/>
+      <geom name="g_leg_np" type="box" size="0.02 0.02 0.145" pos="-0.2  0.2 0.155"/>
+      <geom name="g_leg_pp" type="box" size="0.02 0.02 0.145" pos=" 0.2  0.2 0.155"/>
+
+      <!-- BEAMS: 50x50 mm section spanning z = 0.300..0.350. -->
+      <geom name="g_beam_ny" type="box" size="0.22  0.025 0.025" pos=" 0   -0.2  0.325"/>
+      <geom name="g_beam_py" type="box" size="0.22  0.025 0.025" pos=" 0    0.2  0.325"/>
+      <geom name="g_beam_nx" type="box" size="0.025 0.22  0.025" pos="-0.2  0    0.325"/>
+      <geom name="g_beam_px" type="box" size="0.025 0.22  0.025" pos=" 0.2  0    0.325"/>
+    </body>
+
+    <!-- THE PROOF. Dropped straight down the middle. With this proxy it
+         passes between the beams and lands on the floor inside the legs.
+         Swap in a plain mesh geom and it stops on top instead. -->
+    <body name="probe" pos="0 0 1.2">
+      <freejoint/>
+      <geom name="g_probe" type="sphere" size="0.05" rgba="1.0 0.5 0.1 1"/>
+    </body>
+
+  </worldbody>
+</mujoco>

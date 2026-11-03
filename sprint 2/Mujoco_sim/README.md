@@ -26,7 +26,8 @@ uv run python scripts/run.py scenes/01_ball_drop.xml
 9. [Troubleshooting](#9-troubleshooting)
 10. [Forces and thrust](#10-forces-and-thrust)
 11. [A standardized test scenario](#11-a-standardized-test-scenario)
-12. [Where to go next](#12-where-to-go-next)
+12. [Variable mass](#12-variable-mass)
+13. [Where to go next](#13-where-to-go-next)
 
 ---
 
@@ -133,6 +134,7 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── fly.py                   run a scene under closed-loop control (§10)
 │   ├── example_hover.py         three example control laws
 │   ├── scenario.py              one fixed profile, any controller (§11)
+│   ├── propellant.py            variable mass as propellant burns (§12)
 │   └── selftest_thrust.py       50 numeric checks on the thrust physics
 ├── out/                         renders land here (gitignored)
 └── outputs/                     one dir per scenario run (gitignored)
@@ -1197,7 +1199,95 @@ starts already resting there, since letting the craft drop would inject a
 
 ---
 
-## 12. Where to go next
+## 12. Variable mass
+
+Propellant is mass, and burning it makes the vehicle lighter. That breaks the
+one assumption every control law here leans on: `state.weight_n()` is only the
+right feedforward for the mass the craft has *right now*.
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover
+uv run python scripts/scenario.py --controller example_hover:hover --fixed-mass
+uv run python scripts/scenario.py --controller example_hover:hover \
+    --dry-mass 11.873 --propellant 0.127     # the real tank
+```
+
+### Two traps, both silent
+
+**1. Writing `model.body_mass` is not enough.** It updates the gravity bias but
+leaves the **mass matrix** stale, so the craft weighs less while still resisting
+acceleration like the heavy one. Measured on `07_thrust_1D` at `ctrl=30 N`:
+
+| step | `body_mass` | `M[0,0]` | `qacc` |
+|---|---|---|---|
+| baseline | 12.0 | 12.0 | 0.88 |
+| write `body_mass = 6` only | 6.0 | **12.0 stale** | **1.69** |
+| then `mj_setConst` | 6.0 | 6.0 | **3.38** |
+
+1.69 is not 2×0.88. In zero-g it is starker: writing `body_mass` alone leaves
+`qacc` **exactly unchanged**. So `mujoco.mj_setConst(model, data)` is mandatory
+after every write — with it, F=ma holds to 1e-9 across an 8× mass range.
+
+**2. `mj_setConst` resets `qpos` to the model defaults.** A craft at
+`qpos=1.234` comes back at `0.0`, teleported to its spawn, every tick. `qvel`
+survives, so the symptom is a craft frozen in place while its velocity climbs —
+which is exactly how this surfaced: `pos_z` pinned at 0.5000 with `vz` at +1.23.
+`PropellantTank.update` saves and restores `qpos` around the call. Note a zero-g
+rocket-equation check does *not* catch this, since it only reads velocity.
+
+Both are pinned by `scenario.py --selftest` so a regression fails loudly.
+
+**`mj_setConst` also does not rescale `body_inertia`** — verified unchanged
+before and after. The tank scales it explicitly, from the wet reference so
+repeated ticks cannot compound. On the 6-DOF scene it matters: one RCS jet at
+half mass gives angular `qacc` 14.706 (frozen at the wet value) without scaling
+and 29.412 with it. On the 1-DOF rig there is no rotational freedom to get wrong.
+
+### Changing how mass varies
+
+Everything lives in `scripts/propellant.py`. The parameter block is at the top:
+
+```python
+DRY_MASS_KG   = 8.0       # kg, vehicle with empty tanks
+PROPELLANT_KG = 4.0       # kg, usable propellant at t = 0
+ISP_S         = 57.80     # s, sets mdot = F / (ISP_S * g0)
+```
+
+The law itself is one function, `mass_flow(thrust_n)`, returning kg/s. Default is
+constant specific impulse, `mdot = F / (Isp·g0)` — thrust-proportional, so a
+hovering craft sips and a hard burn gulps. Its docstring spells out the drop-in
+replacements: fixed mass flow, Isp falling with tank state, or stepping the real
+blowdown model at `sprint 2/thrust_sim/thrust_sim.py` alongside the sim.
+
+### Real numbers vs visible numbers
+
+The Isp above **is** the real one, from the structures subteam's "6.06N Nozzle
+Calculations": Isp 57.80 s, mdot 10.688 g/s, v_e 570.8 m/s, F 6.058 N at 200
+psig. The tank in `thrust_sim.py` is 2 L at 1000 psig, which works out to **127 g
+usable** and a **12.2 s burn** — inside the brief's stated 10–20 s window.
+
+The masses are deliberately *not* real. At 127 g against a 12 kg craft the mass
+change is **1.06%** and buys **3.7 s** of lunar hover; run it and the craft
+climbs to 1.43 m, runs dry and falls back, timing out `ASCEND`. Physically
+honest, but nothing you can see. The defaults keep the real Isp and give a 33%
+propellant fraction, which produces a visible 12.00 → 11.00 kg decay and hover
+thrust sagging 19.37 → 17.83 N over one profile. Set
+`--dry-mass 11.873 --propellant 0.127` for the real article.
+
+### When the tank runs dry
+
+Thrust goes to zero, whatever the controller asks for — `enforce_cutoff` runs
+*after* the law has written `data.ctrl`, so the law keeps commanding and simply
+does not get it, which is what a real empty tank does to a controller that has
+not noticed. Mass floors at exactly `DRY_MASS_KG` and propellant never goes
+negative.
+
+`--fixed-mass` disables all of it and reproduces the constant-mass numbers
+bit-for-bit, which is the honest way to measure what the mass model changed.
+
+---
+
+## 13. Where to go next
 
 This project deliberately covers only gravity and collisions. The natural next
 steps, and where each attaches:
@@ -1210,13 +1300,14 @@ steps, and where each attaches:
   pressure *falls* over a 10-20 s burn, and the mission brief calls modelling
   that "the part your model has to get right". Thrust is currently constant for a
   given command; make `max_thrust_n` fall with tank state and the control problem
-  gets considerably more interesting.
+  gets considerably more interesting. §12's `mass_flow()` is the seam where
+  `sprint 2/thrust_sim/thrust_sim.py` would attach.
 - **Solenoid bang-bang** — the real valve is open/closed with ~6 ms enable and
   ~2 ms disable transients, commanded as a 0-1 duty cycle, not a continuous
   force. `Thruster.set_throttle()` already takes that 0-1 convention, which is
   where a duty-cycle model would attach.
-- **Fuel depletion** — propellant mass leaving the vehicle changes `body_mass`
-  and the inertia tensor mid-flight.
+- ~~**Fuel depletion**~~ — done, see §12. `scripts/propellant.py` varies
+  `body_mass` and scales the inertia tensor as propellant burns.
 - **Joints other than free** — `<joint type="hinge"/>`, `slide`, `ball`, with
   `range`, `stiffness` and `damping`. Chain bodies to build a linkage.
 - **Sensors** — `<sensor>` with `accelerometer`, `gyro`, `force`, `framepos`.
@@ -1270,4 +1361,12 @@ steps, and where each attaches:
 | **ramp lag** | −0.1218 m measured vs −KD·r/KP = −0.1222 m predicted ✓ |
 | **returns to start** | within 0.35 mm of the measured resting height ✓ |
 | **timeout path** | a too-weak law times out, still writes outputs ✓ |
-| **selftest suites** | thrust 50/50 and scenario 19/19 pass ✓ |
+| **F=ma under mass change** | exact to 1e-9 from 12.0 down to 1.5 kg ✓ |
+| **`mj_setConst` required** | omitting it leaves `qacc` unchanged — pinned ✓ |
+| **`qpos` preserved** | `mj_setConst` resets it; tank restores to 1e-12 ✓ |
+| **inertia scaling** | inertia ratio tracks mass ratio to 1e-9 ✓ |
+| **rocket equation** | Δv 229.837 vs ve·ln(m0/m1) = 229.828 m/s ✓ |
+| **mass bookkeeping** | model loss vs tank burn agree to 6.9e-05 kg ✓ |
+| **dry cutoff** | 30 N commanded → 0 N applied, mass floors at dry ✓ |
+| **`--fixed-mass`** | reproduces constant-mass metrics bit-for-bit ✓ |
+| **selftest suites** | thrust 50/50 and scenario 31/31 pass ✓ |

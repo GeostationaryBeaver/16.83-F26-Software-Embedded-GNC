@@ -241,13 +241,15 @@ def make_logger(ThrustLogger, names):
         def header(self):
             return (super().header
                     + ["setpoint_m", "accel_mps2", "qacc_mps2", "phase"]
-                    + [f"ctrl_{n}" for n in self.names])
+                    + [f"ctrl_{n}" for n in self.names]
+                    + ["mass_kg", "propellant_kg"])
 
         def record_tick(self, state, magnitudes, setpoint, accel, qacc,
-                        phase, ctrls):
+                        phase, ctrls, mass_kg, propellant_kg):
             super().record(state, magnitudes)
             self.rows[-1].extend([setpoint, accel, qacc, phase]
-                                 + [float(c) for c in ctrls])
+                                 + [float(c) for c in ctrls]
+                                 + [mass_kg, propellant_kg])
 
         def save(self, path):
             """Like the parent, but tolerant of the non-numeric phase column.
@@ -270,7 +272,8 @@ def make_logger(ThrustLogger, names):
     return ScenarioLogger(names)
 
 
-def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust):
+def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust,
+            tank=None):
     """Reduce the flight to the numbers worth comparing between controllers."""
     ix = {c: i for i, c in enumerate(cols)}
     t = [r[ix["time_s"]] for r in rows]
@@ -318,10 +321,22 @@ def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust):
     out["saturated_s"] = len(sat) * dt
     out["timeouts"] = list(prof.timeouts)
     out["total_duration_s"] = t[-1] if t else 0.0
+    if tank is not None:
+        mk = [r[ix["mass_kg"]] for r in rows]
+        out["mass_initial_kg"] = mk[0] if mk else None
+        out["mass_final_kg"] = mk[-1] if mk else None
+        out["propellant_used_kg"] = tank.used_kg
+        out["propellant_remaining_kg"] = tank.propellant_kg
+        out["tank_emptied_at_s"] = tank.emptied_at_s
+        # Cross-check: the mass the model actually lost must equal what the
+        # tank thinks it burned. A mismatch means a write went missing.
+        out["mass_bookkeeping_err_kg"] = (abs((mk[0] - mk[-1]) - tank.used_kg)
+                                          if mk else None)
     return out
 
 
-def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate, names):
+def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
+                names, show_mass=False):
     """One stacked figure, shared time axis, phases shaded.
 
     Agg is selected before pyplot is imported because these runs are
@@ -335,8 +350,9 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate, names):
     col = lambda n: [r[ix[n]] for r in rows]
     t = col("time_s")
 
-    fig, ax = plt.subplots(5, 1, figsize=(11, 14), sharex=True,
-                           constrained_layout=True)
+    n_panels = 6 if show_mass else 5
+    fig, ax = plt.subplots(n_panels, 1, figsize=(11, 2.8 * n_panels),
+                           sharex=True, constrained_layout=True)
 
     # Phase bands, drawn first so the traces sit on top of them.
     shades = {"GROUND_SIT": "#e8e8e8", "ASCEND": "#dcecf7",
@@ -389,8 +405,17 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate, names):
     for n in names:
         ax[4].plot(t, col(f"ctrl_{n}"), lw=1.3, label=f"ctrl_{n}")
     ax[4].set_ylabel("control input [N]")
-    ax[4].set_xlabel("time [s]")
     ax[4].legend(loc="upper right", fontsize=8, ncol=max(1, len(names) // 2))
+
+    if show_mass:
+        ax[5].plot(t, col("mass_kg"), color="#1f5fa8", lw=1.6,
+                   label="total mass")
+        ax[5].plot(t, col("propellant_kg"), color="#c44", lw=1.4, ls="--",
+                   label="propellant remaining")
+        ax[5].set_ylabel("mass [kg]")
+        ax[5].legend(loc="upper right", fontsize=8)
+
+    ax[-1].set_xlabel("time [s]")
 
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -416,6 +441,16 @@ def main() -> int:
                    help="parent directory for run dirs (default: outputs/)")
     p.add_argument("--no-plot", action="store_true", help="skip the figure")
     p.add_argument("--gravity", default=None, help="preset or m/s^2")
+    p.add_argument("--propellant", type=float, default=None,
+                   help="usable propellant, kg (default: propellant.py's "
+                        "PROPELLANT_KG). Mass falls as thrust is produced.")
+    p.add_argument("--dry-mass", type=float, default=None,
+                   help="vehicle mass with empty tanks, kg")
+    p.add_argument("--isp", type=float, default=None,
+                   help="specific impulse, s; sets mdot = F/(Isp*g0)")
+    p.add_argument("--fixed-mass", action="store_true",
+                   help="disable the propellant model and fly at the "
+                        "scene's constant mass, for comparison")
     p.add_argument("--selftest", action="store_true",
                    help="verify the profile machine numerically and exit")
     args = p.parse_args()
@@ -484,6 +519,20 @@ def main() -> int:
 
     dt = float(model.opt.timestep)
     qi, vi = vertical_indices(model, mujoco, body_id)
+
+    # The tank owns the vehicle's mass, so build it BEFORE deriving the
+    # ground height - a heavier craft settles deeper into the soft contact,
+    # so the resting height depends on the mass that will actually fly.
+    tank = None
+    if not args.fixed_mass:
+        from propellant import (PropellantTank, DRY_MASS_KG, PROPELLANT_KG,
+                                ISP_S)
+        tank = PropellantTank(
+            model, body_id,
+            dry_mass_kg=args.dry_mass if args.dry_mass is not None else DRY_MASS_KG,
+            propellant_kg=args.propellant if args.propellant is not None else PROPELLANT_KG,
+            isp_s=args.isp if args.isp is not None else ISP_S)
+
     z_rest = ground_height(model, data, mujoco, body_id)
     place_on_ground(model, data, mujoco, body_id, z_rest)
 
@@ -495,6 +544,11 @@ def main() -> int:
     print(f"controller  {args.controller}")
     print(f"ground      z = {z_rest:.6f} m (derived)   ncon at start "
           f"{data.ncon}  vz {float(data.qvel[vi]):+.2e}")
+    if tank is not None:
+        print(tank.describe())
+    else:
+        print(f"mass        {float(model.body_mass[body_id]):.3f} kg, fixed "
+              f"(--fixed-mass)")
     print(f"profile     sit {GROUND_SIT_S}s -> {args.target} m -> hold "
           f"{HOLD_AT_TARGET_S}s -> down at {args.descent_rate} m/s -> "
           f"sit {HOLD_AT_GROUND_S}s")
@@ -518,9 +572,18 @@ def main() -> int:
         else:
             state = CraftState.from_data(model, data, body_id)
 
+        # Propellant depletion runs at PHYSICS rate, not control rate: mass
+        # leaves the vehicle continuously while the thrust is applied, not
+        # only on the ticks the control law happens to run.
+        if tank is not None:
+            tank.enforce_cutoff(data)   # a dry tank produces nothing
+            tank.update(data, dt)       # mdot -> mass + inertia + mj_setConst
+
         accel = (vz - vz_prev) / dt
         logger.record_tick(state, thrusters.magnitudes(data), setpoint, accel,
-                           float(data.qacc[vi]), last_phase, list(data.ctrl))
+                           float(data.qacc[vi]), last_phase, list(data.ctrl),
+                           float(model.body_mass[body_id]),
+                           tank.propellant_kg if tank is not None else 0.0)
         vz_prev = vz
 
         if prof.phase != last_phase:
@@ -544,7 +607,7 @@ def main() -> int:
 
     main_max = thrusters["main"].max_thrust_n if "main" in thrusters.names else 0.0
     m = metrics(logger.rows, cols, prof, args.target, z_rest,
-                args.descent_rate, main_max)
+                args.descent_rate, main_max, tank)
 
     meta = {
         "scene": scene.name, "controller": args.controller,
@@ -560,6 +623,11 @@ def main() -> int:
             "phase_timeout_s": PHASE_TIMEOUT_S,
         },
         "ground_height_m": z_rest,
+        "propellant": None if tank is None else {
+            "dry_mass_kg": tank.dry_mass_kg,
+            "propellant_initial_kg": tank.propellant_initial_kg,
+            "isp_s": tank.isp_s,
+        },
         "phase_boundaries": [{"t": t, "from": a, "to": b}
                              for t, a, b in prof.boundaries],
         "metrics": m, "ticks": len(logger), "completed": prof.done,
@@ -579,7 +647,8 @@ def main() -> int:
 
     if not args.no_plot:
         plot_flight(rundir / "flight.png", logger.rows, cols, prof,
-                    args.target, z_rest, args.descent_rate, thrusters.names)
+                    args.target, z_rest, args.descent_rate, thrusters.names,
+                    show_mass=tank is not None)
 
     print()
     if prof.timeouts:
@@ -605,6 +674,7 @@ def run_selftest() -> int:
         uv run python scripts/scenario.py --selftest
     """
     import subprocess
+    from thrusters import ThrusterSet as _ThrusterSet
     bar = "=" * 74
     print(bar)
     print("SCENARIO SELF-TEST")
@@ -686,7 +756,91 @@ def run_selftest() -> int:
         n += 1
     ok("ramp duration at 0.5 m/s", n * dt, (2.0 - 0.4) / 0.5, 0.05, " s")
 
-    print("\n[5] end to end on both scenes")
+    print("\n[5] variable mass")
+    import mujoco as _mj
+    import numpy as _np
+    from propellant import PropellantTank, G0_MS2
+
+    # (a) F=ma must hold after a mass change, which needs mj_setConst.
+    def _accel(mass, ctrl=30.0, setconst=True):
+        mm = _mj.MjModel.from_xml_path(str(ROOT / "scenes" / "07_thrust_1D.xml"))
+        bid = _ThrusterSet(mm).body_id()
+        mm.opt.gravity[:] = 0.0
+        d = _mj.MjData(mm); d.qpos[0] = 5.0
+        mm.body_mass[bid] = mass
+        if setconst:
+            _mj.mj_setConst(mm, d)
+        d.ctrl[0] = ctrl
+        _mj.mj_forward(mm, d)
+        return float(d.qacc[0])
+
+    for mass in (12.0, 6.0, 3.0, 1.5):
+        ok(f"  F=ma at {mass:.1f} kg", _accel(mass), 30.0 / mass, 1e-9, " m/s^2")
+
+    # (b) THE TRAP: without mj_setConst the mass matrix stays stale, so the
+    # acceleration does not change at all. Pinned so a regression that drops
+    # the call fails loudly instead of returning a plausible wrong number.
+    truth("  no mj_setConst -> acceleration unchanged (the trap)",
+          abs(_accel(6.0, setconst=False) - _accel(12.0, setconst=False)) < 1e-12,
+          f"{_accel(6.0, setconst=False):.5f} vs {_accel(12.0, setconst=False):.5f}")
+
+    # (c) THE OTHER TRAP: mj_setConst resets qpos to the model defaults, so
+    # update() must save and restore it or the craft teleports to its spawn
+    # every tick (seen as a frozen position while velocity climbs).
+    mm = _mj.MjModel.from_xml_path(str(ROOT / "scenes" / "07_thrust_1D.xml"))
+    bid = _ThrusterSet(mm).body_id()
+    d = _mj.MjData(mm)
+    tk = PropellantTank(mm, bid, dry_mass_kg=8.0, propellant_kg=4.0, isp_s=57.80)
+    d.qpos[0] = 1.234; d.qvel[0] = 5.0
+    _mj.mj_forward(mm, d)
+    d.ctrl[0] = 20.0
+    tk.update(d, 0.002)
+    ok("  update() preserves qpos", float(d.qpos[0]), 1.234, 1e-12, " m")
+
+    # (d) inertia scales with mass, which mj_setConst does NOT do for you.
+    mm = _mj.MjModel.from_xml_path(str(ROOT / "scenes" / "06_thrust_craft.xml"))
+    bid = _ThrusterSet(mm).body_id()
+    I_wet = float(mm.body_inertia[bid][0])
+    d = _mj.MjData(mm)
+    tk = PropellantTank(mm, bid, dry_mass_kg=6.0, propellant_kg=6.0, isp_s=57.80)
+    d.qpos[2] = 5.0
+    _mj.mj_forward(mm, d)
+    d.ctrl[0] = 60.0
+    for _ in range(2000):
+        tk.update(d, 0.002)
+        _mj.mj_step(mm, d)
+    ratio_m = tk.mass_kg / 12.0
+    ok("  inertia ratio tracks mass ratio",
+       float(mm.body_inertia[bid][0]) / I_wet, ratio_m, 1e-9)
+
+    # (e) the rocket equation, end to end in zero-g.
+    mm = _mj.MjModel.from_xml_path(str(ROOT / "scenes" / "07_thrust_1D.xml"))
+    bid = _ThrusterSet(mm).body_id()
+    mm.opt.gravity[:] = 0.0
+    d = _mj.MjData(mm); d.qpos[0] = 50.0
+    tk = PropellantTank(mm, bid, dry_mass_kg=8.0, propellant_kg=4.0, isp_s=57.80)
+    _mj.mj_setConst(mm, d); _mj.mj_forward(mm, d)
+    m_start = tk.mass_kg
+    while not tk.empty:
+        d.ctrl[0] = 40.0
+        tk.enforce_cutoff(d)
+        tk.update(d, float(mm.opt.timestep))
+        _mj.mj_step(mm, d)
+    ve = 57.80 * G0_MS2
+    import math as _math
+    ok("  delta-v vs ve*ln(m0/m1)", float(d.qvel[0]),
+       ve * _math.log(m_start / tk.mass_kg), 0.05, " m/s")
+    ok("  propellant fully consumed", tk.used_kg, 4.0, 1e-9, " kg")
+    ok("  mass floors at dry", tk.mass_kg, 8.0, 1e-12, " kg")
+
+    # (f) hard cutoff: a dry tank produces nothing, whatever is commanded.
+    d.ctrl[0] = 30.0
+    tk.enforce_cutoff(d)
+    ok("  dry tank applies no thrust", float(d.ctrl[0]), 0.0, 1e-12, " N")
+    truth("  propellant never negative", tk.propellant_kg >= 0.0,
+          f"{tk.propellant_kg:.3e} kg")
+
+    print("\n[6] end to end on both scenes")
     for scene, z_expect in (("scenes/07_thrust_1D.xml", 0.399928),
                             ("scenes/06_thrust_craft.xml", 0.249977)):
         out = ROOT / "out" / "_selftest_scenario"

@@ -47,7 +47,9 @@ import numpy as np
 # One labeled block, unit suffix in every name, source in the comment -
 # the convention from assignment1/lunar-hopper/02-cad/base_frame.py.
 
-MASS_KG = 12.0            # kg, the abstract craft in scenes/06_thrust_craft.xml
+# (no MASS_KG constant: the vehicle's mass is whatever the scene compiled
+#  into model.body_mass, and scripts/propellant.py may vary it at runtime.
+#  CraftState.mass reads it live, so it always reflects the real value.)
 THRUST_MAX_N = 60.0       # N, main engine ceiling; matches that scene's ctrlrange
 RCS_MAX_N = 5.0           # N, per attitude thruster in that scene
 

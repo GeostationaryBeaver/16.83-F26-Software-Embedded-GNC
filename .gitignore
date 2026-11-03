@@ -40,3 +40,4 @@ env/
 *.log
 *.tmp
 *.bak
+*.Zone.Identifier

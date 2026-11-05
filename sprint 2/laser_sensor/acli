@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# acli -- drive the Arduino IDE's bundled arduino-cli.exe from WSL.
+#
+# WHY THIS EXISTS
+#   The Arduino IDE is installed on Windows, but these sketches live in the
+#   WSL filesystem. The Windows IDE cannot open sketches across the \\wsl$\
+#   boundary (it silently makes a blank dated sketch instead), which is why
+#   there was a duplicate copy in the Windows sketchbook.
+#
+#   arduino-cli.exe has no such problem: it reads UNC paths fine. So this
+#   script translates the WSL path to a UNC one and hands it over. One copy
+#   of each sketch, living in the repo, compiled and flashed in place.
+#
+#   No install needed -- arduino-cli.exe ships inside the IDE.
+#
+# USAGE
+#   ./acli compile laser_logging
+#   ./acli upload  laser_logging            # auto-detects the port
+#   ./acli upload  laser_logging COM10      # or name it
+#   ./acli monitor                          # serial monitor, 115200
+#   ./acli boards                           # list connected boards
+#   ./acli clean                             # remove build artifacts
+#
+# Sketch names are directories under this one: laser_logging, or
+# arduino-bringup/vl53l0x_bringup.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+CLI="/mnt/c/Program Files/Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe"
+FQBN="arduino:esp32:nano_nora"
+BAUD=115200
+
+if [[ ! -x "$CLI" ]]; then
+    echo "arduino-cli.exe not found at:" >&2
+    echo "  $CLI" >&2
+    echo >&2
+    echo "It ships inside the Arduino IDE. If the IDE is installed elsewhere," >&2
+    echo "edit CLI at the top of this script." >&2
+    exit 1
+fi
+
+# WSL path -> UNC path. ${WSL_DISTRO_NAME} is the share name Windows uses;
+# note it is the distro's registered name ('Ubuntu'), which is not always the
+# same as what `wsl -l` prints ('Ubuntu-24.04').
+to_unc() {
+    local abs
+    abs="$(cd "$1" && pwd)"
+    printf '\\\\wsl.localhost\\%s%s' "${WSL_DISTRO_NAME:-Ubuntu}" "${abs//\//\\}"
+}
+
+# arduino-cli.exe inherits the shell's cwd. With a UNC cwd, every child
+# cmd.exe prints a "UNC paths are not supported" warning -- harmless, but it
+# buries the real output. Running from /mnt/c gives it a drive letter instead.
+run_cli() { ( cd /mnt/c && "$CLI" "$@" ); }
+
+# Find the board's serial port. Prefers a port whose FQBN matches, so it does
+# not pick up an unrelated COM device.
+detect_port() {
+    run_cli board list 2>/dev/null \
+        | awk -v fqbn="$FQBN" '$0 ~ fqbn && $2 == "serial" { print $1; exit }'
+}
+
+cmd="${1:-}"
+# Print the USAGE block from the header comment when called with no command.
+[[ -n "$cmd" ]] || {
+    sed -n '/^# USAGE/,/^# ---/p' "$0" | sed '$d' | sed 's|^# \?||'
+    exit 1
+}
+shift || true
+
+case "$cmd" in
+    compile)
+        sketch="${1:?usage: ./acli compile <sketch-dir>}"
+        [[ -d "$sketch" ]] || { echo "No such sketch directory: $sketch" >&2; exit 1; }
+        echo "Compiling $sketch for $FQBN"
+        run_cli compile --fqbn "$FQBN" "$(to_unc "$sketch")"
+        ;;
+
+    upload)
+        sketch="${1:?usage: ./acli upload <sketch-dir> [PORT]}"
+        [[ -d "$sketch" ]] || { echo "No such sketch directory: $sketch" >&2; exit 1; }
+        port="${2:-$(detect_port)}"
+        if [[ -z "$port" ]]; then
+            echo "No Arduino Nano ESP32 found. Connected boards:" >&2
+            run_cli board list >&2
+            echo >&2
+            echo "The Nano ESP32 re-enumerates on every reset, so its port can" >&2
+            echo "change. If it is in DFU mode (no serial port listed), double-tap" >&2
+            echo "reset to return it to normal, or pass the port explicitly." >&2
+            exit 1
+        fi
+        echo "Uploading $sketch to $port"
+        # Compile and upload in one step, so the binary always matches the source.
+        run_cli compile --fqbn "$FQBN" --upload --port "$port" "$(to_unc "$sketch")"
+        ;;
+
+    monitor)
+        port="${1:-$(detect_port)}"
+        [[ -n "$port" ]] || { echo "No board found; pass a port." >&2; exit 1; }
+        echo "Monitoring $port at $BAUD  (Ctrl-C to stop)"
+        run_cli monitor --port "$port" --config "baudrate=$BAUD"
+        ;;
+
+    boards)
+        run_cli board list
+        ;;
+
+    clean)
+        # arduino-cli writes build output next to the sketch as build/.
+        find . -type d -name build -prune -print -exec rm -rf {} +
+        echo "Clean."
+        ;;
+
+    *)
+        echo "Unknown command: $cmd" >&2
+        echo "Try: compile | upload | monitor | boards | clean" >&2
+        exit 1
+        ;;
+esac

@@ -600,7 +600,16 @@ def main() -> int:
     name = f"{scene.stem}_{fn}_{stamp}" + (f"_{args.label}" if args.label else "")
     parent = pathlib.Path(args.outdir) if args.outdir else (ROOT / "outputs")
     rundir = parent / name
-    rundir.mkdir(parents=True, exist_ok=True)
+    # The stamp resolves to one second, so two runs started inside the same
+    # second collide - and mkdir(exist_ok=True) would quietly overwrite the
+    # first one's files. Suffix instead, so no run can destroy another.
+    if rundir.exists():
+        for n in range(2, 100):
+            alt = parent / f"{name}_{n}"
+            if not alt.exists():
+                rundir = alt
+                break
+    rundir.mkdir(parents=True, exist_ok=False)
 
     cols = logger.header
     csv_path = logger.save(rundir / "flight.csv")

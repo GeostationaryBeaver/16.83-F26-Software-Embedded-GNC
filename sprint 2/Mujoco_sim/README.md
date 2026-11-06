@@ -27,7 +27,8 @@ uv run python scripts/run.py scenes/01_ball_drop.xml
 10. [Forces and thrust](#10-forces-and-thrust)
 11. [A standardized test scenario](#11-a-standardized-test-scenario)
 12. [Variable mass](#12-variable-mass)
-13. [Where to go next](#13-where-to-go-next)
+13. [The GUI](#13-the-gui)
+14. [Where to go next](#14-where-to-go-next)
 
 ---
 
@@ -135,6 +136,9 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── example_hover.py         three example control laws
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
+│   ├── gui.py                   control panel: run/compare/demo (§13)
+│   ├── sim_worker.py            the viewer process gui.py drives (§13)
+│   ├── simlink.py               JSON-over-socket between the two (§13)
 │   └── selftest_thrust.py       50 numeric checks on the thrust physics
 ├── out/                         renders land here (gitignored)
 └── outputs/                     one dir per scenario run (gitignored)
@@ -1287,7 +1291,92 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 
 ---
 
-## 13. Where to go next
+## 13. The GUI
+
+```bash
+uv run python scripts/gui.py            # the control panel
+uv run python scripts/gui.py --demo     # bigger fonts, less clutter
+uv run python scripts/gui.py --selftest # 31 headless checks
+```
+
+Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
+control law, set the parameters, watch the phase transitions scroll by, read
+the metrics, open the figure. **Compare** lists past runs from `outputs/`,
+diffs two of them metric by metric and shows both figures side by side.
+**Live** launches MuJoCo's native viewer with sliders for target altitude and
+propellant, which is the tab to demo from — you get full orbit, zoom and
+`ctrl+drag`.
+
+### Why it is two processes
+
+Not a style choice. **MuJoCo's GLFW viewer and tkinter cannot share one
+process**, measured:
+
+| configuration | result |
+|---|---|
+| `launch_passive` alone, 269k steps | clean exit |
+| `tkinter` alone | clean exit |
+| **both together**, 165k steps | `malloc(): unsorted double linked list corrupted` |
+
+Two native event loops, one heap. So `scripts/gui.py` holds the Tk window and
+`scripts/sim_worker.py` owns the viewer, talking over a socket. Launching a
+scenario needs no socket at all — `scenario.py` already exposes every
+parameter as a CLI flag, so the Run tab just builds an argv and reads
+`run.json` afterwards.
+
+`scripts/simlink.py` carries the wire format: one JSON object per line, both
+directions. Commands are `target`, `propellant`, `pause`, `resume`, `reset`,
+`quit`; telemetry is `{t, z, vz, mass, prop, thrust, setpoint, running}`.
+
+### Four traps worth knowing
+
+**`tk.Scale.set()` does not fire the widget's `command`.** Only a user drag
+does. Binding to `command` meant every *programmatic* change — including the
+one that seeds the target when the viewer launches — silently never reached
+the worker: the slider moved on screen and the craft ignored it. The sliders
+bind a `DoubleVar` trace instead, which fires for both and makes them
+scriptable.
+
+**The viewer segfaults in interpreter teardown.** After `close()`, letting
+CPython exit normally crashes in its own cleanup of the viewer's GL
+resources — reproducibly, with nothing of ours on the stack: a `with` block
+hangs (exit 124), an explicit `close()` gives SIGSEGV (exit 139), both *after*
+`main()` has finished. The worker ends with `os._exit(0)`, which skips
+teardown and exits 0. Safe because it is a short-lived child whose only
+resource is its socket.
+
+**A non-blocking `recv` must catch `BlockingIOError` only.** The obvious
+`except Exception: pass` swallows real failures along with "no data yet". In an
+early probe that ate every command — the craft kept flying to its old target
+while telemetry reported `z=2.0` against a commanded `1.0`, with nothing
+logged. `LineReader` treats only `BlockingIOError` as normal and surfaces
+everything else, malformed JSON included.
+
+**Pausing froze the telemetry too.** `next_sync` is measured from
+`wall_start`, and resuming moves `wall_start` to now — so `wall` restarts near
+zero while `next_sync` keeps its old value, gating off rendering *and*
+telemetry for however long the pause lasted. Both `resume` and `reset`
+re-baseline it.
+
+### One pre-existing bug this surfaced
+
+Clicking **Run** twice in quick succession found a fault in `scenario.py`, not
+the GUI: the run-directory stamp resolves to one second and the directory was
+created with `mkdir(exist_ok=True)`, so two runs started in the same second
+**silently overwrote each other's files**. It now suffixes (`..._2`) and
+creates with `exist_ok=False`, so no run can destroy another.
+
+### If the viewer will not open
+
+The Live tab needs a GL-capable display; the other two tabs do not. On WSL
+that means WSLg (`echo $DISPLAY`, `ls /mnt/wslg`). Run and Compare work over a
+plain X session, and `--selftest` needs no display at all. Note that this box
+renders through `llvmpipe` in software — offscreen rendering measures 30.9 fps
+at 640×480 and 23.8 at 1280×720, which is fine for these scenes.
+
+---
+
+## 14. Where to go next
 
 This project deliberately covers only gravity and collisions. The natural next
 steps, and where each attaches:
@@ -1369,4 +1458,9 @@ steps, and where each attaches:
 | **mass bookkeeping** | model loss vs tank burn agree to 6.9e-05 kg ✓ |
 | **dry cutoff** | 30 N commanded → 0 N applied, mass floors at dry ✓ |
 | **`--fixed-mass`** | reproduces constant-mass metrics bit-for-bit ✓ |
-| **selftest suites** | thrust 50/50 and scenario 31/31 pass ✓ |
+| **GUI two-process split** | worker exits 0, no heap corruption ✓ |
+| **live commands apply** | slider 4.0 → z=3.999; slider 1.0 → z=1.002 ✓ |
+| **slider binding** | `Scale.set()` never fires `command`; var trace does ✓ |
+| **run dir collision** | two runs in one second no longer overwrite ✓ |
+| **compare** | 2 m vs 3 m runs → 13/18 metrics flagged as differing ✓ |
+| **selftest suites** | thrust 50/50, scenario 31/31, gui 31/31 pass ✓ |

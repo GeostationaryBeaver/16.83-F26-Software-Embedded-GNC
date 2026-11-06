@@ -1328,6 +1328,35 @@ parameter as a CLI flag, so the Run tab just builds an argv and reads
 directions. Commands are `target`, `propellant`, `pause`, `resume`, `reset`,
 `quit`; telemetry is `{t, z, vz, mass, prop, thrust, setpoint, running}`.
 
+### The Live tab picks its own scene and mass mode
+
+It has its own scene and controller dropdowns, a **variable / fixed mass**
+radio pair with dry and propellant entries, and a **match scene** button.
+Before you launch, a line reports what the craft can actually do:
+
+```
+variable mass:  1.000 kg   needs 1.62 N to hover   engine 10.0 N   T/W 6.17
+```
+
+**Why that line exists.** A `PropellantTank`'s `dry + propellant` *replaces*
+the scene's mass rather than adding to it. So flying `08_thrust_1D_smol` (a
+1 kg craft with a 10 N engine) with the 12 kg tank defaults needs 19.44 N to
+hover: the engine saturates at 10 N, the craft never leaves the ground, and
+the target slider looks broken when nothing is wrong with it. Measured — stuck
+at z=0.400 with `ctrl` pinned at 10.00 N, T/W 0.51. The hint now says
+`CANNOT LIFT` before you launch, **match scene** fixes it in one click
+(T/W 6.17, slider commands then track to 3.001 m), and the banner always shows
+which mass model is live:
+
+```
+08_thrust_1D_smol.xml   variable mass: 0.9 kg dry + 0.1 kg prop   1.000 kg   T/W 6.17
+08_thrust_1D_smol.xml   fixed mass                                1.000 kg   T/W 6.17
+```
+
+The worker reports its own view of this on connect, so the log shows what was
+really built — including the scene's XML mass alongside the mass actually
+flown, which is how you spot an override.
+
 ### Four traps worth knowing
 
 **`tk.Scale.set()` does not fire the widget's `command`.** Only a user drag
@@ -1463,4 +1492,5 @@ steps, and where each attaches:
 | **slider binding** | `Scale.set()` never fires `command`; var trace does ✓ |
 | **run dir collision** | two runs in one second no longer overwrite ✓ |
 | **compare** | 2 m vs 3 m runs → 13/18 metrics flagged as differing ✓ |
-| **selftest suites** | thrust 50/50, scenario 31/31, gui 31/31 pass ✓ |
+| **lift check** | smol+12 kg tank T/W 0.51 flagged; match scene → 6.17 ✓ |
+| **selftest suites** | thrust 50/50, scenario 31/31, gui 38/38 pass ✓ |

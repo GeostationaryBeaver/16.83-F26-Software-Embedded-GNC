@@ -161,6 +161,35 @@ def build_worker_cmd(params, port, python=None, script=None):
     return cmd
 
 
+def scene_capability(scene_name, override_mass_kg=None, scenes_dir=None):
+    """Can this craft lift itself? Compiles the scene and does the sum.
+
+    Returns {mass, weight, thrust_max, twr, can_lift, xml_mass}.
+
+    `override_mass_kg` is the wet mass a PropellantTank would impose. That
+    matters because the tank REPLACES the scene's mass rather than adding to
+    it: pairing 08_thrust_1D_smol (1 kg craft, 10 N engine) with the 12 kg
+    tank defaults needs 19.44 N to hover, so the engine saturates and the
+    craft never leaves the ground. Pass None for the scene's own mass.
+
+    Rendered headless with osmesa; no window and no viewer involved.
+    """
+    import os
+    os.environ.setdefault("MUJOCO_GL", "osmesa")
+    import mujoco
+    d = pathlib.Path(scenes_dir) if scenes_dir else (ROOT / "scenes")
+    model = mujoco.MjModel.from_xml_path(str(d / scene_name))
+    from thrusters import ThrusterSet
+    bid = ThrusterSet(model).body_id()
+    xml_mass = float(model.body_mass[bid])
+    mass = xml_mass if override_mass_kg is None else float(override_mass_kg)
+    weight = mass * abs(float(model.opt.gravity[2]))
+    thrust_max = float(model.actuator_ctrlrange[0][1])
+    return {"mass": mass, "weight": weight, "thrust_max": thrust_max,
+            "twr": (thrust_max / weight) if weight > 0 else float("inf"),
+            "can_lift": thrust_max > weight, "xml_mass": xml_mass}
+
+
 METRIC_ORDER = [
     "peak_altitude_m", "overshoot_m", "ascend_duration_s", "hold_mean_alt_m",
     "hold_max_err_m", "hold_rms_err_m", "peak_descent_rate_mps",
@@ -515,6 +544,50 @@ class App:
     # ---- Live tab -------------------------------------------------------
     def _build_live(self):
         tk, ttk = self.tk, self.ttk
+
+        # The Live tab gets its OWN scene/controller/mass controls. It used
+        # to read the Run tab's widgets, so launching here silently depended
+        # on what was selected on another tab - and there was no way to tell
+        # whether you were flying fixed or variable mass.
+        pick = ttk.Frame(self.tab_live, padding=(8, 8, 8, 0))
+        pick.pack(fill="x")
+        ttk.Label(pick, text="Scene").grid(row=0, column=0, sticky="w")
+        self.lv_scene = tk.StringVar(value=self.v_scene.get())
+        ttk.Combobox(pick, textvariable=self.lv_scene, values=self.scenes,
+                     state="readonly", width=26).grid(row=0, column=1, sticky="w")
+        ttk.Label(pick, text="Controller").grid(row=0, column=2, sticky="e",
+                                                padx=(12, 4))
+        self.lv_ctrl = tk.StringVar(value=self.v_ctrl.get())
+        ttk.Combobox(pick, textvariable=self.lv_ctrl, values=self.controllers,
+                     state="readonly", width=20).grid(row=0, column=3, sticky="w")
+
+        mass = ttk.Frame(self.tab_live, padding=(8, 6, 8, 0))
+        mass.pack(fill="x")
+        self.lv_massmode = tk.StringVar(value="variable")
+        ttk.Radiobutton(mass, text="variable mass (propellant burns)",
+                        variable=self.lv_massmode, value="variable",
+                        command=self._update_mass_hint
+                        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(mass, text="fixed mass (scene's own)",
+                        variable=self.lv_massmode, value="fixed",
+                        command=self._update_mass_hint
+                        ).grid(row=0, column=1, sticky="w", padx=(14, 0))
+        ttk.Label(mass, text="dry [kg]").grid(row=0, column=2, sticky="e", padx=(16, 3))
+        self.lv_dry = tk.StringVar(value=self.v_dry.get())
+        ttk.Entry(mass, textvariable=self.lv_dry, width=7).grid(row=0, column=3)
+        ttk.Label(mass, text="prop [kg]").grid(row=0, column=4, sticky="e", padx=(10, 3))
+        self.lv_prop = tk.StringVar(value=self.v_prop.get())
+        ttk.Entry(mass, textvariable=self.lv_prop, width=7).grid(row=0, column=5)
+        ttk.Button(mass, text="match scene",
+                   command=self._match_scene_mass).grid(row=0, column=6, padx=(10, 0))
+
+        self.v_hint = tk.StringVar(value="")
+        self.lbl_hint = ttk.Label(self.tab_live, textvariable=self.v_hint,
+                                  padding=(8, 4), foreground="#a05000")
+        self.lbl_hint.pack(fill="x")
+        for var in (self.lv_scene, self.lv_dry, self.lv_prop):
+            var.trace_add("write", lambda *_: self._update_mass_hint())
+
         bar = ttk.Frame(self.tab_live, padding=8)
         bar.pack(fill="x")
         self.b_launch = ttk.Button(bar, text="Launch viewer",
@@ -552,6 +625,9 @@ class App:
         self.s_prop.grid(row=1, column=1, sticky="w")
         self.var_prop.trace_add("write", self._on_prop_var)
 
+        self.v_mode = tk.StringVar(value="")
+        ttk.Label(self.tab_live, textvariable=self.v_mode, padding=(8, 2),
+                  font=("TkDefaultFont", self.base, "bold")).pack(anchor="w")
         self.v_tel = tk.StringVar(value="viewer not running")
         ttk.Label(self.tab_live, textvariable=self.v_tel,
                   font=("TkFixedFont", self.base + (6 if self.demo else 2)),
@@ -560,6 +636,57 @@ class App:
         self.live_log.pack(fill="both", expand=True, padx=8, pady=8)
         if self.demo:
             self.live_log.pack_forget()
+
+    def live_params(self):
+        """Live-tab widget state, independent of the Run tab."""
+        return {"scene": self.lv_scene.get(),
+                "controller": self.lv_ctrl.get(),
+                "target": f"{float(self.var_target.get()):g}",
+                "propellant": self.lv_prop.get().strip(),
+                "dry_mass": self.lv_dry.get().strip(),
+                "isp": self.v_isp.get().strip(),
+                "gravity": self.v_grav.get().strip(),
+                "fixed_mass": self.lv_massmode.get() == "fixed"}
+
+    def _update_mass_hint(self):
+        """Say up front whether the craft can lift at all.
+
+        A light scene flown with heavy tank defaults is pinned to the ground
+        and the target slider looks dead. Better to say so before launching
+        than to let it look like a broken control.
+        """
+        try:
+            info = scene_capability(self.lv_scene.get(),
+                                    None if self.lv_massmode.get() == "fixed"
+                                    else (float(self.lv_dry.get() or 0)
+                                          + float(self.lv_prop.get() or 0)))
+        except (ValueError, OSError, KeyError):
+            self.v_hint.set("")
+            return
+        mode = ("fixed mass" if self.lv_massmode.get() == "fixed"
+                else "variable mass")
+        msg = (f"{mode}:  {info['mass']:.3f} kg   needs {info['weight']:.2f} N "
+               f"to hover   engine {info['thrust_max']:.1f} N   "
+               f"T/W {info['twr']:.2f}")
+        if not info["can_lift"]:
+            msg += "   <-- CANNOT LIFT: engine is weaker than the weight"
+        self.v_hint.set(msg)
+        try:
+            self.lbl_hint.configure(
+                foreground="#b00000" if not info["can_lift"] else "#206020")
+        except Exception:
+            pass
+
+    def _match_scene_mass(self):
+        """Set dry+propellant to the scene's own mass, 90/10."""
+        try:
+            info = scene_capability(self.lv_scene.get(), None)
+        except (ValueError, OSError, KeyError):
+            return
+        m = info["mass"]
+        self.lv_dry.set(f"{m * 0.9:g}")
+        self.lv_prop.set(f"{m * 0.1:g}")
+        self._update_mass_hint()
 
     def _on_target_var(self, *_):
         self.send_worker({"cmd": "target", "value": float(self.var_target.get())})
@@ -573,7 +700,7 @@ class App:
             return
         from simlink import LineReader, listening_socket
         self.worker_srv, port = listening_socket()
-        cmd = build_worker_cmd(self.params(), port)
+        cmd = build_worker_cmd(self.live_params(), port)
         self.live_log.insert("end", " ".join(cmd) + "\n")
         self.worker = subprocess.Popen(cmd, cwd=str(ROOT),
                                        stdout=subprocess.DEVNULL,
@@ -587,7 +714,7 @@ class App:
             return
         self.worker_conn.setblocking(False)
         self.worker_link = LineReader(self.worker_conn)
-        self.var_target.set(float(self.params()["target"] or 2.0))
+        self._update_mass_hint()
         self.b_launch.configure(state="disabled")
         self.b_kill.configure(state="normal")
 
@@ -624,6 +751,7 @@ class App:
         self.worker = self.worker_conn = self.worker_srv = None
         self.worker_link = None
         self.v_tel.set("viewer not running")
+        self.v_mode.set("")
         self.b_launch.configure(state="normal")
         self.b_kill.configure(state="disabled")
 
@@ -650,6 +778,30 @@ class App:
             for msg in self.worker_link.poll():
                 if "error" in msg:
                     self.live_log.insert("end", f"worker: {msg['error']}\n")
+                    self.live_log.see("end")
+                elif "info" in msg:
+                    # What the worker ACTUALLY built, which can differ from
+                    # the widgets if the tank overrode the scene's mass.
+                    i = msg["info"]
+                    mode = ("variable mass: "
+                            f"{i['dry_mass_kg']:g} kg dry + "
+                            f"{i['propellant_kg']:g} kg prop"
+                            if i["variable_mass"] else "fixed mass")
+                    self.v_mode.set(
+                        f"{i['scene']}   {mode}   {i['mass_kg']:.3f} kg   "
+                        f"T/W {i['twr']:.2f}"
+                        + ("" if i["can_lift"] else "   CANNOT LIFT"))
+                    self.live_log.insert(
+                        "end", f"flying {i['scene']} / {i['controller']}: "
+                               f"{mode}, mass {i['mass_kg']:.3f} kg "
+                               f"(scene XML says {i['scene_xml_mass_kg']:g} kg), "
+                               f"engine {i['thrust_max_n']:g} N, "
+                               f"hover needs {i['weight_n']:.2f} N\n")
+                    if not i["can_lift"]:
+                        self.live_log.insert(
+                            "end", "  ^ the engine is weaker than the craft's "
+                                   "weight, so it cannot leave the ground and "
+                                   "the target slider will look dead.\n")
                     self.live_log.see("end")
                 else:
                     last = msg
@@ -775,6 +927,31 @@ def run_selftest() -> int:
         truth("a corrupt run.json does not crash discovery",
               len(got) == 1 and got[0]["meta"] == {})
 
+    print("\n[4b] lift capability is computed, not assumed")
+    # The tank's dry+propellant REPLACES the scene's mass, so a light scene
+    # with heavy tank defaults is pinned to the ground: the engine saturates,
+    # nothing moves, and the target slider looks broken. Reported before
+    # launch now instead of being discovered the hard way.
+    smol = scene_capability("08_thrust_1D_smol.xml", None)
+    truth("smol scene lifts on its own mass",
+          smol["can_lift"] and smol["mass"] == 1.0,
+          f"{smol['mass']:g} kg, T/W {smol['twr']:.2f}")
+    bad = scene_capability("08_thrust_1D_smol.xml", 12.0)
+    truth("smol + 12 kg tank defaults CANNOT lift",
+          not bad["can_lift"], f"T/W {bad['twr']:.2f} (needs > 1)")
+    truth("override does not change the scene's own XML mass",
+          bad["xml_mass"] == 1.0, f"xml {bad['xml_mass']:g} kg")
+    big = scene_capability("07_thrust_1D.xml", 12.0)
+    truth("07 + 12 kg tank defaults lifts fine",
+          big["can_lift"], f"T/W {big['twr']:.2f}")
+    gsrc_live = (HERE / "gui.py").read_text()
+    truth("Live tab has its own scene selector",
+          "self.lv_scene" in gsrc_live and "def live_params" in gsrc_live)
+    truth("Live tab exposes the mass mode",
+          "self.lv_massmode" in gsrc_live)
+    truth("worker reports can_lift so the GUI can show it",
+          '"can_lift"' in (HERE / "sim_worker.py").read_text())
+
     print("\n[5] run directories never collide")
     # scenario.py's stamp resolves to one second, and it used to
     # mkdir(exist_ok=True) - so two runs started in the same second
@@ -797,8 +974,10 @@ def run_selftest() -> int:
     truth("sliders use a variable trace, not Scale(command=...)",
           "self.var_target.trace_add" in gsrc
           and not hasattr(App, "_on_target_slider"))
-    truth("launch_worker seeds the target through the var",
-          "self.var_target.set(" in gsrc)
+    # live_params must read the slider's var, so the launched worker starts
+    # at whatever the slider shows rather than a Run-tab entry box.
+    truth("live_params takes its target from the slider var",
+          "self.var_target.get()" in gsrc)
 
     print("\n[7] worker lifecycle contract")
     wsrc = (HERE / "sim_worker.py").read_text()

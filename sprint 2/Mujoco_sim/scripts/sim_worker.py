@@ -68,6 +68,7 @@ def main() -> int:
     thrusters = ThrusterSet(model)
     body_id = thrusters.body_id()
     controller = load_controller(args.controller)
+    scene_xml_mass = float(model.body_mass[body_id])   # before the tank
 
     mod_name = args.controller.split(":")[0]
     mod = sys.modules.get(mod_name)
@@ -90,6 +91,31 @@ def main() -> int:
     target = float(args.target)
     if setter is not None:
         setter(target)
+
+    # Report the thrust-to-weight the craft actually has, and say so loudly
+    # when it cannot lift. The tank's dry+propellant REPLACES the scene's
+    # mass, so pairing a light scene with heavy tank defaults silently
+    # creates a craft pinned to the ground - the engine saturates, nothing
+    # moves, and the target slider looks broken. Measured on
+    # 08_thrust_1D_smol (1 kg, 10 N engine) with the 12 kg tank defaults:
+    # stuck at z=0.400 with ctrl pinned at 10.00 N.
+    mass_now = float(model.body_mass[body_id])
+    weight = mass_now * abs(float(model.opt.gravity[2]))
+    thrust_max = float(model.actuator_ctrlrange[0][1])
+    send(sock, {"info": {
+        "scene": scene.name,
+        "controller": args.controller,
+        "mass_kg": round(mass_now, 4),
+        "weight_n": round(weight, 3),
+        "thrust_max_n": round(thrust_max, 3),
+        "twr": round(thrust_max / weight, 3) if weight > 0 else None,
+        "variable_mass": tank is not None,
+        "dry_mass_kg": round(tank.dry_mass_kg, 4) if tank else None,
+        "propellant_kg": round(tank.propellant_initial_kg, 4) if tank else None,
+        "isp_s": tank.isp_s if tank else None,
+        "scene_xml_mass_kg": round(float(scene_xml_mass), 4),
+        "can_lift": bool(thrust_max > weight),
+    }})
 
     dt = float(model.opt.timestep)
     running = True

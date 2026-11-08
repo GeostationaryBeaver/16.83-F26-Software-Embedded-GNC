@@ -41,10 +41,28 @@ if str(HERE) not in sys.path:
 
 CONTROLLER_MODULE = "example_hover"   # where control laws are looked up
 
-# The gains given entry boxes. Not every settable gain - just the ones worth
-# reaching for while testing a vertical law. Anything else goes through
-# --gains on the command line; set_gains() is the full list.
-GAIN_FIELDS = ("KP_ALT", "KI_ALT", "KD_ALT", "KP_POS_V", "KP_V")
+# The gains given entry boxes, grouped by which law reads them. Not every
+# settable gain - just the ones worth reaching for while testing a vertical
+# law. Anything else goes through --gains on the command line; set_gains() is
+# the full list.
+#
+# This grouping is a LABEL ONLY. Which gains a law actually reads is derived
+# from the law's own code by gains_used_by(), and that is what greys a box
+# out - so a law you write later gets the right boxes with no edit here, and
+# a stale group name can never disable a gain that is really in use.
+GAIN_GROUPS = (
+    ("hover / hover_pid  (PD core)", ("KP_ALT", "KD_ALT")),
+    ("hover_pid  (integral)",        ("KI_ALT", "I_LIMIT_N")),
+    ("hover_cascade",                ("KP_POS_V", "KP_V", "V_MAX_MPS")),
+)
+GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
+
+# Fields that exist only because a PropellantTank is flying. With
+# --fixed-mass the scene's own body mass is used and no tank is built, so
+# scenario.py and sim_worker.py never read these. The GUI greys them out and
+# the cmd builders below DROP them - they used to be passed and silently
+# ignored, which also put meaningless numbers in run.json.
+MASS_FIELDS = ("propellant", "dry_mass", "isp")
 POLL_MS = 50                          # queue drain / telemetry cadence
 
 
@@ -99,6 +117,41 @@ def find_runs(outdir=None):
     return runs
 
 
+def gains_used_by(law_name, module_name=CONTROLLER_MODULE):
+    """Which settable gains a control law actually reads.
+
+    Read off the law's own bytecode (the global names it references,
+    intersected with the module's _GAIN_NAMES whitelist) and followed one
+    level into helpers it calls. Same spirit as find_controllers: the GUI
+    discovers this instead of carrying a per-law table that would quietly
+    go stale the first time a law is edited.
+
+    An unknown law returns EVERY gain, so the failure mode is "nothing is
+    greyed out" rather than "the box you need is disabled".
+    """
+    import importlib
+    mod = importlib.import_module(module_name)
+    names = set(getattr(mod, "_GAIN_NAMES", ()))
+    fn = getattr(mod, law_name, None)
+    if not hasattr(fn, "__code__"):
+        return names
+    out, seen, stack = set(), set(), [fn]
+    while stack:
+        f = stack.pop()
+        if id(f) in seen:
+            continue
+        seen.add(id(f))
+        for n in f.__code__.co_names:
+            if n in names:
+                out.add(n)
+                continue
+            helper = getattr(mod, n, None)
+            if (hasattr(helper, "__code__")
+                    and getattr(helper, "__module__", None) == mod.__name__):
+                stack.append(helper)
+    return out
+
+
 def run_label(run):
     """One readable line for a run, for the Compare list."""
     m = run["meta"]
@@ -125,6 +178,7 @@ def build_scenario_cmd(params, python=None, script=None):
     """
     py = python or sys.executable
     sc = script or str(HERE / "scenario.py")
+    fixed = bool(params.get("fixed_mass"))
     cmd = [py, sc, "--controller",
            f"{CONTROLLER_MODULE}:{params['controller']}",
            "--scene", f"scenes/{params['scene']}"]
@@ -137,10 +191,12 @@ def build_scenario_cmd(params, python=None, script=None):
                       ("--gravity", "gravity"),
                       ("--gains", "gains"),
                       ("--label", "label")):
+        if fixed and key in MASS_FIELDS:
+            continue      # no tank is built, so these would be ignored
         v = params.get(key)
         if v not in (None, ""):
             cmd += [flag, str(v)]
-    if params.get("fixed_mass"):
+    if fixed:
         cmd.append("--fixed-mass")
     if params.get("no_plot"):
         cmd.append("--no-plot")
@@ -151,6 +207,7 @@ def build_worker_cmd(params, port, python=None, script=None):
     """argv for sim_worker.py, the live-viewer process."""
     py = python or sys.executable
     sc = script or str(HERE / "sim_worker.py")
+    fixed = bool(params.get("fixed_mass"))
     cmd = [py, sc, "--port", str(port),
            "--controller", f"{CONTROLLER_MODULE}:{params['controller']}",
            "--scene", f"scenes/{params['scene']}"]
@@ -160,10 +217,12 @@ def build_worker_cmd(params, port, python=None, script=None):
                       ("--isp", "isp"),
                       ("--gravity", "gravity"),
                       ("--gains", "gains")):
+        if fixed and key in MASS_FIELDS:
+            continue      # no tank is built, so these would be ignored
         v = params.get(key)
         if v not in (None, ""):
             cmd += [flag, str(v)]
-    if params.get("fixed_mass"):
+    if fixed:
         cmd.append("--fixed-mass")
     return cmd
 
@@ -307,20 +366,98 @@ class App:
                 "isp": self.v_isp.get().strip(),
                 "gravity": self.v_grav.get().strip(),
                 "label": self.v_label.get().strip(),
-                "gains": self.gain_spec(self.g_vars),
+                "gains": self.gain_spec(self.g_vars,
+                                        self._used_gains(self.v_ctrl.get())),
                 "fixed_mass": bool(self.v_fixed.get()),
                 "no_plot": False}
 
     @staticmethod
-    def gain_spec(vars_map):
+    def gain_spec(vars_map, used=None):
         """Non-empty gain boxes -> 'NAME=VALUE,NAME=VALUE'.
 
         Blank boxes are omitted so the controller keeps its own default,
         rather than this GUI having to mirror every constant.
+
+        `used` (from gains_used_by) drops gains the selected law does not
+        read. Passing them would be harmless to the flight but would record
+        a gain in run.json that had no effect on the run - which is exactly
+        the kind of thing that makes a sweep's results unreadable later.
         """
         return ",".join(f"{name}={var.get().strip()}"
                         for name, var in vars_map.items()
-                        if var.get().strip())
+                        if var.get().strip()
+                        and (used is None or name in used))
+
+    # ---- greying out what is not in play --------------------------------
+    @staticmethod
+    def _set_enabled(widgets, on):
+        """Enable/disable (label, entry) pairs, greying the label too.
+
+        ttk disables an Entry via state, but a ttk.Label has no disabled
+        look of its own, so the foreground is set explicitly - otherwise a
+        dead box still reads as live.
+        """
+        for lbl, ent in widgets:
+            try:
+                ent.configure(state="normal" if on else "disabled")
+                lbl.configure(foreground="" if on else "#909090")
+            except Exception:
+                pass
+
+    def _update_gain_fields(self):
+        """Grey the gain boxes the selected control law does not read.
+
+        Derived from the law's own code (gains_used_by), not from
+        GAIN_GROUPS' labels, so this stays correct for laws added later.
+        """
+        for prefix, var, widgets, hint in (
+                ("", self.v_ctrl, getattr(self, "g_widgets", None),
+                 getattr(self, "v_gainhint", None)),
+                ("live", getattr(self, "lv_ctrl", None),
+                 getattr(self, "lv_g_widgets", None),
+                 getattr(self, "lv_gainhint", None))):
+            if var is None or not widgets:
+                continue
+            law = var.get()
+            try:
+                used = gains_used_by(law)
+            except Exception:
+                used = set(GAIN_FIELDS)        # fail open, never grey wrongly
+            for name, pair in widgets.items():
+                self._set_enabled([pair], name in used)
+            if hint is not None:
+                live = [n for n in GAIN_FIELDS if n in used]
+                hint.set(f"{law} reads: " + (", ".join(live) if live
+                                             else "none of these"))
+
+    def _update_mass_fields(self):
+        """Grey propellant / dry mass / Isp when flying fixed mass.
+
+        With --fixed-mass no PropellantTank is built, so the runner never
+        reads any of the three. They were previously still editable AND
+        still passed on the command line, where they were silently ignored.
+        """
+        if hasattr(self, "mass_widgets"):
+            self._set_enabled(self.mass_widgets, not bool(self.v_fixed.get()))
+        if hasattr(self, "lv_mass_widgets"):
+            variable = self.lv_massmode.get() != "fixed"
+            self._set_enabled(self.lv_mass_widgets, variable)
+            for w in getattr(self, "lv_mass_buttons", []):
+                try:
+                    w.configure(state="normal" if variable else "disabled")
+                except Exception:
+                    pass
+            # The propellant SLIDER is live-only and equally meaningless
+            # under fixed mass: sim_worker ignores the command because
+            # there is no tank to refill.
+            if hasattr(self, "s_prop"):
+                try:
+                    self.s_prop.configure(state="normal" if variable
+                                          else "disabled")
+                    self.lbl_prop.configure(foreground="" if variable
+                                            else "#909090")
+                except Exception:
+                    pass
 
     # ---- Run tab --------------------------------------------------------
     def _build_run(self):
@@ -343,11 +480,16 @@ class App:
 
         self.grid_params = ttk.Frame(self.tab_run, padding=(8, 0))
         self.grid_params.pack(fill="x")
+        # Returns the (label, entry) pair so the mass-only fields can be
+        # greyed out when --fixed-mass makes them meaningless.
         def field(col, label, var, width=9):
             f = ttk.Frame(self.grid_params)
             f.grid(row=0, column=col, sticky="w", padx=(0, 10))
-            ttk.Label(f, text=label).pack(anchor="w")
-            ttk.Entry(f, textvariable=var, width=width).pack()
+            lbl = ttk.Label(f, text=label)
+            lbl.pack(anchor="w")
+            ent = ttk.Entry(f, textvariable=var, width=width)
+            ent.pack()
+            return lbl, ent
         self.v_target = tk.StringVar(value=str(d["target"]))
         self.v_descent = tk.StringVar(value=str(d["descent_rate"]))
         self.v_hz = tk.StringVar(value="")
@@ -360,28 +502,45 @@ class App:
         field(0, "target [m]", self.v_target)
         field(1, "descent [m/s]", self.v_descent)
         field(2, "control [Hz]", self.v_hz)
-        field(3, "propellant [kg]", self.v_prop)
-        field(4, "dry mass [kg]", self.v_dry)
-        field(5, "Isp [s]", self.v_isp)
+        # Collected so _update_mass_fields can disable them: with fixed mass
+        # no PropellantTank is built and these three are never read.
+        self.mass_widgets = [field(3, "propellant [kg]", self.v_prop),
+                             field(4, "dry mass [kg]", self.v_dry),
+                             field(5, "Isp [s]", self.v_isp)]
         field(6, "gravity", self.v_grav)
         field(7, "label", self.v_label, 12)
         ttk.Checkbutton(self.grid_params, text="fixed mass",
-                        variable=self.v_fixed).grid(row=0, column=8, sticky="w")
+                        variable=self.v_fixed,
+                        command=self._update_mass_fields
+                        ).grid(row=0, column=8, sticky="w")
 
-        # A second row for control gains. Blank means "use the controller's
-        # own default", so this grid never has to mirror example_hover's
-        # constants - it only carries what you deliberately override.
+        # Gains, grouped by the law that reads them, in a labelled box per
+        # group - so it is visible at a glance that KI_ALT does nothing to
+        # the cascade and KP_V does nothing to the PID. On top of the
+        # grouping, boxes the SELECTED law does not read are disabled, which
+        # is derived from the law's code rather than from these labels.
+        gbox = ttk.Frame(self.tab_run, padding=(8, 4))
+        gbox.pack(fill="x")
         self.g_vars = {}
-        for col, name in enumerate(GAIN_FIELDS):
-            f = ttk.Frame(self.grid_params)
-            f.grid(row=1, column=col, sticky="w", padx=(0, 10), pady=(4, 0))
-            ttk.Label(f, text=name).pack(anchor="w")
-            var = tk.StringVar(value="")
-            ttk.Entry(f, textvariable=var, width=9).pack()
-            self.g_vars[name] = var
-        ttk.Label(self.grid_params, text="(blank = controller default)"
-                  ).grid(row=1, column=len(GAIN_FIELDS), sticky="w",
-                         pady=(4, 0))
+        self.g_widgets = {}
+        for gcol, (title, names) in enumerate(GAIN_GROUPS):
+            grp = ttk.Labelframe(gbox, text=title, padding=(6, 2, 6, 4))
+            grp.grid(row=0, column=gcol, sticky="nw", padx=(0, 10))
+            for col, name in enumerate(names):
+                lbl = ttk.Label(grp, text=name)
+                lbl.grid(row=0, column=col, sticky="w", padx=(0, 6))
+                var = tk.StringVar(value="")
+                ent = ttk.Entry(grp, textvariable=var, width=9)
+                ent.grid(row=1, column=col, sticky="w", padx=(0, 6))
+                self.g_vars[name] = var
+                self.g_widgets[name] = (lbl, ent)
+        self.v_gainhint = tk.StringVar(value="")
+        ttk.Label(gbox, textvariable=self.v_gainhint, foreground="#606060"
+                  ).grid(row=0, column=len(GAIN_GROUPS), sticky="nw",
+                         padx=(4, 0))
+        self.v_ctrl.trace_add("write", lambda *_: self._update_gain_fields())
+        self._update_gain_fields()
+        self._update_mass_fields()
 
         bar = ttk.Frame(self.tab_run, padding=8)
         bar.pack(fill="x")
@@ -610,33 +769,54 @@ class App:
         self.lv_massmode = tk.StringVar(value="variable")
         ttk.Radiobutton(mass, text="variable mass (propellant burns)",
                         variable=self.lv_massmode, value="variable",
-                        command=self._update_mass_hint
+                        command=self._on_mass_mode
                         ).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(mass, text="fixed mass (scene's own)",
                         variable=self.lv_massmode, value="fixed",
-                        command=self._update_mass_hint
+                        command=self._on_mass_mode
                         ).grid(row=0, column=1, sticky="w", padx=(14, 0))
-        ttk.Label(mass, text="dry [kg]").grid(row=0, column=2, sticky="e", padx=(16, 3))
+        # Collected as (label, entry) pairs so fixed mass can grey them:
+        # sim_worker builds no tank in that mode and reads none of them.
+        l_dry = ttk.Label(mass, text="dry [kg]")
+        l_dry.grid(row=0, column=2, sticky="e", padx=(16, 3))
         self.lv_dry = tk.StringVar(value=self.v_dry.get())
-        ttk.Entry(mass, textvariable=self.lv_dry, width=7).grid(row=0, column=3)
-        ttk.Label(mass, text="prop [kg]").grid(row=0, column=4, sticky="e", padx=(10, 3))
+        e_dry = ttk.Entry(mass, textvariable=self.lv_dry, width=7)
+        e_dry.grid(row=0, column=3)
+        l_prop = ttk.Label(mass, text="prop [kg]")
+        l_prop.grid(row=0, column=4, sticky="e", padx=(10, 3))
         self.lv_prop = tk.StringVar(value=self.v_prop.get())
-        ttk.Entry(mass, textvariable=self.lv_prop, width=7).grid(row=0, column=5)
-        ttk.Button(mass, text="match scene",
-                   command=self._match_scene_mass).grid(row=0, column=6, padx=(10, 0))
+        e_prop = ttk.Entry(mass, textvariable=self.lv_prop, width=7)
+        e_prop.grid(row=0, column=5)
+        b_match = ttk.Button(mass, text="match scene",
+                             command=self._match_scene_mass)
+        b_match.grid(row=0, column=6, padx=(10, 0))
+        self.lv_mass_widgets = [(l_dry, e_dry), (l_prop, e_prop)]
+        self.lv_mass_buttons = [b_match]
 
+        # Same grouped layout as the Run tab, same derived greying. Gains
+        # apply at LAUNCH here - there is no gain command in the worker
+        # protocol - so editing these mid-flight changes nothing until the
+        # viewer is relaunched.
         gains = ttk.Frame(self.tab_live, padding=(8, 6, 8, 0))
         gains.pack(fill="x")
-        ttk.Label(gains, text="gains (blank = default):").grid(
-            row=0, column=0, sticky="w")
+        ttk.Label(gains, text="gains at launch (blank = default):").grid(
+            row=0, column=0, sticky="nw", padx=(0, 8))
         self.lv_g_vars = {}
-        for i, name in enumerate(GAIN_FIELDS):
-            ttk.Label(gains, text=name).grid(row=0, column=1 + 2 * i,
-                                             sticky="e", padx=(10, 2))
-            var = tk.StringVar(value="")
-            ttk.Entry(gains, textvariable=var, width=7).grid(
-                row=0, column=2 + 2 * i)
-            self.lv_g_vars[name] = var
+        self.lv_g_widgets = {}
+        for gcol, (title, names) in enumerate(GAIN_GROUPS):
+            grp = ttk.Labelframe(gains, text=title, padding=(6, 2, 6, 4))
+            grp.grid(row=0, column=1 + gcol, sticky="nw", padx=(0, 10))
+            for col, name in enumerate(names):
+                lbl = ttk.Label(grp, text=name)
+                lbl.grid(row=0, column=col, sticky="w", padx=(0, 6))
+                var = tk.StringVar(value="")
+                ent = ttk.Entry(grp, textvariable=var, width=7)
+                ent.grid(row=1, column=col, sticky="w", padx=(0, 6))
+                self.lv_g_vars[name] = var
+                self.lv_g_widgets[name] = (lbl, ent)
+        self.lv_gainhint = tk.StringVar(value="")
+        ttk.Label(gains, textvariable=self.lv_gainhint, foreground="#606060"
+                  ).grid(row=0, column=1 + len(GAIN_GROUPS), sticky="nw")
 
         self.v_hint = tk.StringVar(value="")
         self.lbl_hint = ttk.Label(self.tab_live, textvariable=self.v_hint,
@@ -674,7 +854,8 @@ class App:
         self.s_target.grid(row=0, column=1, sticky="w")
         self.var_target.trace_add("write", self._on_target_var)
 
-        ttk.Label(sl, text="propellant [kg]").grid(row=1, column=0, sticky="w")
+        self.lbl_prop = ttk.Label(sl, text="propellant [kg]")
+        self.lbl_prop.grid(row=1, column=0, sticky="w")
         self.var_prop = tk.DoubleVar(value=4.0)
         self.s_prop = tk.Scale(sl, from_=0.0, to=8.0, resolution=0.05,
                                orient="horizontal", length=380,
@@ -694,6 +875,10 @@ class App:
         if self.demo:
             self.live_log.pack_forget()
 
+        self.lv_ctrl.trace_add("write", lambda *_: self._update_gain_fields())
+        self._update_gain_fields()
+        self._update_mass_fields()
+
     def live_params(self):
         """Live-tab widget state, independent of the Run tab."""
         return {"scene": self.lv_scene.get(),
@@ -703,8 +888,23 @@ class App:
                 "dry_mass": self.lv_dry.get().strip(),
                 "isp": self.v_isp.get().strip(),
                 "gravity": self.v_grav.get().strip(),
-                "gains": self.gain_spec(self.lv_g_vars),
+                "gains": self.gain_spec(self.lv_g_vars,
+                                        self._used_gains(self.lv_ctrl.get())),
                 "fixed_mass": self.lv_massmode.get() == "fixed"}
+
+    @staticmethod
+    def _used_gains(law):
+        """gains_used_by, failing open so a lookup problem never drops a
+        gain the user deliberately typed."""
+        try:
+            return gains_used_by(law)
+        except Exception:
+            return None
+
+    def _on_mass_mode(self):
+        """Mass mode changed: re-grey the tank fields and redo the hint."""
+        self._update_mass_fields()
+        self._update_mass_hint()
 
     def _update_mass_hint(self):
         """Say up front whether the craft can lift at all.
@@ -954,6 +1154,79 @@ def run_selftest() -> int:
     truth("worker gets the port", "--port" in wcmd and "4321" in wcmd)
     truth("worker takes no scenario-only flags",
           "--descent-rate" not in wcmd and "--no-plot" not in wcmd)
+
+    print("\n[2b] gains are attributed to the right law")
+    import example_hover
+    # Which gain boxes stay live is DERIVED from each law's code, not from
+    # GAIN_GROUPS' labels, so a law added later is handled with no edit here.
+    used_pd = gains_used_by("hover")
+    used_pid = gains_used_by("hover_pid")
+    used_cas = gains_used_by("hover_cascade")
+    truth("hover reads the PD gains only",
+          {"KP_ALT", "KD_ALT"} <= used_pd
+          and not ({"KI_ALT", "KP_V"} & used_pd),
+          ", ".join(sorted(n for n in GAIN_FIELDS if n in used_pd)))
+    truth("hover_pid adds the integral gains",
+          {"KI_ALT", "I_LIMIT_N"} <= used_pid and "KP_V" not in used_pid,
+          ", ".join(sorted(n for n in GAIN_FIELDS if n in used_pid)))
+    truth("hover_cascade reads the cascade gains, not KI_ALT",
+          {"KP_POS_V", "KP_V", "V_MAX_MPS"} <= used_cas
+          and "KI_ALT" not in used_cas,
+          ", ".join(sorted(n for n in GAIN_FIELDS if n in used_cas)))
+    truth("every GAIN_GROUPS name is a real settable gain",
+          set(GAIN_FIELDS) <= set(example_hover._GAIN_NAMES))
+    # The grouping is only a label; the greying must come from the code. A
+    # law this table has never heard of still gets attributed correctly.
+    example_hover._SELFTEST_GAIN = 0.0
+    try:
+        example_hover._GAIN_NAMES += ("_SELFTEST_GAIN",)
+        src = ("def _selftest_law(state):\n"
+               "    return KP_V * _SELFTEST_GAIN\n")
+        exec(compile(src, "<selftest>", "exec"), vars(example_hover))
+        found = gains_used_by("_selftest_law")
+        truth("a law absent from GAIN_GROUPS is still attributed",
+              found == {"KP_V", "_SELFTEST_GAIN"}, ", ".join(sorted(found)))
+    finally:
+        example_hover._GAIN_NAMES = tuple(
+            n for n in example_hover._GAIN_NAMES if n != "_SELFTEST_GAIN")
+        del example_hover._SELFTEST_GAIN
+        del vars(example_hover)["_selftest_law"]
+    truth("an unknown law greys nothing (fails open)",
+          gains_used_by("no_such_law") == set(example_hover._GAIN_NAMES))
+    # A gain the law cannot read must not be recorded as if it mattered.
+    class _V:
+        def __init__(self, v): self.v = v
+        def get(self): return self.v
+    allg = {n: _V("1.5") for n in GAIN_FIELDS}
+    spec_cas = App.gain_spec(allg, used_cas)
+    truth("gain_spec drops gains the chosen law ignores",
+          "KI_ALT" not in spec_cas and "KP_V=1.5" in spec_cas, spec_cas)
+    truth("gain_spec unfiltered still passes everything",
+          App.gain_spec(allg).count("=") == len(GAIN_FIELDS))
+
+    print("\n[2c] fixed mass drops the tank-only flags")
+    # scenario.py / sim_worker.py build no PropellantTank with --fixed-mass,
+    # so --propellant/--dry-mass/--isp were accepted and silently ignored -
+    # and landed in run.json as if they had applied.
+    fixed = build_scenario_cmd({**base, "fixed_mass": True},
+                               python="PY", script="S")
+    truth("variable mass passes all three tank flags",
+          all(f in cmd for f in ("--propellant", "--dry-mass", "--isp")))
+    truth("fixed mass passes none of them",
+          not any(f in fixed for f in ("--propellant", "--dry-mass", "--isp")),
+          " ".join(fixed[4:]))
+    truth("fixed mass keeps the non-tank flags",
+          "--target" in fixed and "--descent-rate" in fixed)
+    wfixed = build_worker_cmd({**base, "fixed_mass": True}, 1,
+                              python="PY", script="W")
+    truth("worker cmd drops them too",
+          not any(f in wfixed for f in ("--propellant", "--dry-mass", "--isp")))
+    truth("MASS_FIELDS names match the params() keys",
+          set(MASS_FIELDS) <= set(base))
+    truth("the greying helpers exist and are wired to both tabs",
+          hasattr(App, "_update_gain_fields")
+          and hasattr(App, "_update_mass_fields")
+          and hasattr(App, "_on_mass_mode"))
 
     print("\n[3] metric diffing")
     a = {"peak_altitude_m": 2.0, "overshoot_m": 0.05, "timeouts": []}

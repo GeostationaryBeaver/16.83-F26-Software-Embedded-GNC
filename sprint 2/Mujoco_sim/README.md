@@ -1333,6 +1333,16 @@ directions. Commands are `target`, `propellant`, `pause`, `resume`, `reset`,
 
 It has its own scene and controller dropdowns, a **variable / fixed mass**
 radio pair with dry and propellant entries, and a **match scene** button.
+
+Choosing **fixed mass** greys out everything that only a `PropellantTank`
+would read — propellant, dry mass, Isp, the propellant slider and **match
+scene** — on both tabs, because in that mode no tank is built and the scene's
+own body mass flies. Those fields used to stay editable *and* still be passed
+on the command line, where `scenario.py` ignored them and then recorded them in
+`run.json`, which made a fixed-mass run look as if it had a 4 kg tank. They are
+now dropped from the argv as well as greyed, so `run.json` reports
+`propellant: null` and nothing else.
+
 Before you launch, a line reports what the craft can actually do:
 
 ```
@@ -1428,12 +1438,29 @@ uv run python scripts/scenario.py --controller example_hover:hover_cascade \
     --gain KP_V=20 --gain KP_POS_V=0.5
 ```
 
-In the GUI there is a second row of gain boxes on the Run tab and the same row
-on the Live tab. **A blank box means "use the controller's default"**, so the
-GUI never has to mirror the constants — it carries only what you deliberately
-override. Gains are applied at launch, not live: retuning mid-flight would
-raise the question of what happens to an integrator accumulated under the old
-gains, and the honest answer is to relaunch.
+In the GUI the gain boxes sit in three labelled groups — `hover / hover_pid
+(PD core)`, `hover_pid (integral)` and `hover_cascade` — on the Run tab and
+again on the Live tab. **A blank box means "use the controller's default"**, so
+the GUI never has to mirror the constants: it carries only what you
+deliberately override. Gains are applied at launch, not live: retuning
+mid-flight would raise the question of what happens to an integrator
+accumulated under the old gains, and the honest answer is to relaunch.
+
+**Boxes the selected law does not read are greyed out**, and the line beside
+them says which it does read (`hover_cascade reads: KP_POS_V, KP_V,
+V_MAX_MPS`). That matters because the laws share a namespace but not a
+structure — `KI_ALT` does nothing to the cascade, which has no integrator, and
+`KP_V` does nothing to the PID. A disabled box is also *dropped* from
+`--gains`, so a number left in a greyed field cannot show up in `run.json` as
+though it had applied.
+
+The greying is **derived from each law's own code**, not from the group
+labels: `gains_used_by()` reads the global names the law's bytecode references,
+intersects them with `_GAIN_NAMES`, and follows one level into helpers it
+calls. So a law you add later gets the right boxes with no edit to `gui.py`,
+and a stale label can never disable a gain that is genuinely in use. An
+unrecognised law greys *nothing* — the failure mode is a box you did not need,
+never a missing box you did.
 
 `set_gains(**kw)` is the mechanism, the companion to `set_target()`. It
 validates names against a whitelist and **raises on an unknown one** — a
@@ -1617,4 +1644,7 @@ steps, and where each attaches:
 | **cascade ramp lag** | −0.0073 m vs the PD's −0.1218 m, 17× better ✓ |
 | **cascade rate limit** | peak vz pinned at 0.600 m/s on a 7.6 m step ✓ |
 | **gains reach a run** | GUI boxes → `--gains` → `set_gains` → `run.json` ✓ |
+| **gain attribution** | derived from bytecode; a law absent from the table still resolves ✓ |
+| **greyed gains dropped** | `KI_ALT=99` in a greyed box never reaches a cascade run ✓ |
+| **fixed mass drops tank flags** | no `--propellant/--dry-mass/--isp`; `run.json` null ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

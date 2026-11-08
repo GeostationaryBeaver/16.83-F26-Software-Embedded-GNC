@@ -36,6 +36,8 @@ def main() -> int:
     p.add_argument("--dry-mass", type=float, default=None)
     p.add_argument("--isp", type=float, default=None)
     p.add_argument("--fixed-mass", action="store_true")
+    p.add_argument("--gains", default=None, metavar="N=V,...",
+                   help="controller gain overrides, applied at launch")
     p.add_argument("--gravity", default=None)
     p.add_argument("--speed", type=float, default=1.0)
     args = p.parse_args()
@@ -48,6 +50,7 @@ def main() -> int:
     import mujoco.viewer
     from simlink import LineReader, send
     from fly import GRAVITY_PRESETS, control_tick, load_controller, resolve_scene
+    from scenario import parse_gains
     from thrusters import CraftState, ThrusterSet
 
     sock = socket.socket()
@@ -75,6 +78,27 @@ def main() -> int:
     setter = getattr(mod, "set_target", None) if mod else None
     if mod is not None and hasattr(mod, "_listener"):
         mod._listener = False          # no stdin thread; we drive the setpoint
+
+    # Controller state and gains, applied once at launch. Gains are not part
+    # of the live command protocol by design - retuning mid-flight would mean
+    # deciding what happens to an integrator that accumulated under the old
+    # tuning, and the honest answer is to relaunch.
+    if mod is not None and hasattr(mod, "reset_state"):
+        mod.reset_state()
+    applied_gains = None
+    if args.gains:
+        gain_setter = getattr(mod, "set_gains", None) if mod else None
+        if gain_setter is None:
+            print(f"error: {mod_name!r} has no set_gains(**kw)",
+                  file=sys.stderr)
+            return 1
+        try:
+            gain_setter(**parse_gains(args.gains))
+        except (KeyError, ValueError, TypeError) as e:
+            print(f"error: bad --gains: {e}", file=sys.stderr)
+            return 1
+    if mod is not None and hasattr(mod, "current_gains"):
+        applied_gains = mod.current_gains()
 
     tank = None
     if not args.fixed_mass:
@@ -115,6 +139,7 @@ def main() -> int:
         "isp_s": tank.isp_s if tank else None,
         "scene_xml_mass_kg": round(float(scene_xml_mass), 4),
         "can_lift": bool(thrust_max > weight),
+        "gains": applied_gains,
     }})
 
     dt = float(model.opt.timestep)

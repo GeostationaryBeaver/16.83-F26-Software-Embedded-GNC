@@ -30,6 +30,112 @@ TARGET_ALT_M = 2.0      # m, commanded altitude
 KP_ALT = 18.0           # N per m of altitude error
 KD_ALT = 22.0           # N per m/s of vertical speed
 
+# --- GAINS, overridable at runtime ----------------------------------------
+# Change these from the command line or the GUI rather than by editing:
+#     uv run python scripts/scenario.py --controller example_hover:hover_pid \
+#         --gains "KI_ALT=4,KD_ALT=25"
+# set_gains() below is what applies them. Every name here is settable.
+KI_ALT = 6.0            # N per m*s of accumulated error      (hover_pid)
+I_LIMIT_N = 15.0        # N, cap on the integral's contribution (hover_pid)
+ANTI_WINDUP = True      # stop integrating while the engine is saturated
+KP_POS_V = 0.6          # (m/s) per m of error, outer loop  (hover_cascade)
+KP_V = 15.0             # N per (m/s) of rate error, inner loop (hover_cascade)
+V_MAX_MPS = 0.6         # m/s, limit on the commanded climb rate
+SP_RATE_LPF = 0.05      # 0..1, smoothing on the differenced setpoint rate.
+                        #   Measured on the standard profile: 0.002 -> lag
+                        #   -0.0180 m, 0.01 -> -0.0089, 0.05 -> -0.0073, with
+                        #   overshoot unchanged at 0.0518 m throughout. The
+                        #   V_MAX_MPS clamp contains the step spike on its
+                        #   own (peak vz pinned at exactly 0.600 m/s even on
+                        #   a 7.6 m step), so the filter only has to smooth.
+
+# hover_pid needs two things a control law cannot read off CraftState:
+THRUST_CEILING_N = 60.0 # N, where the command saturates. The real ceiling
+                        #   is the actuator's ctrlrange in the scene XML and
+                        #   a law never sees it, so this is the figure the
+                        #   anti-windup test uses. Set it to match the scene
+                        #   you are flying (10.0 for 08_thrust_1D_smol), or
+                        #   the integral will keep winding while the engine
+                        #   is already pinned.
+DT_NOMINAL_S = 0.002    # s, the integration step for the accumulator. Equal
+                        #   to every scene's <option timestep>; with
+                        #   --control-hz the law runs less often than this,
+                        #   which scales the integral's effective gain.
+
+# The names set_gains() will accept. A whitelist, so a typo in a sweep is an
+# error rather than a silent no-op.
+_GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
+               "KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF",
+               "THRUST_CEILING_N",
+               "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
+               "MAX_CANT")
+
+_integral = 0.0         # hover_pid's accumulator, in m*s
+_sp_prev = None         # hover_cascade: previous setpoint, for differencing
+_sp_rate = 0.0          # hover_cascade: filtered setpoint rate, m/s
+
+
+def _as_bool(value):
+    """Parse a flag that may arrive as a string from the command line.
+
+    bool() is the wrong tool: bool("0") and bool("False") are both True, so
+    --gains "ANTI_WINDUP=0" silently left the guard ON and the flag could
+    never be turned off - which also made the anti-windup regression test
+    pass vacuously, since both arms ran with it enabled.
+    """
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("0", "false", "no", "off", ""):
+            return False
+        if v in ("1", "true", "yes", "on"):
+            return True
+        raise ValueError(f"cannot read {value!r} as a true/false flag")
+    return bool(value)
+
+
+def reset_state():
+    """Clear any controller state that must not survive into the next run.
+
+    Right now that is hover_pid's integrator. It matters for gain sweeps:
+    two runs in one process would otherwise start with whatever the previous
+    run left accumulated, and only the first result would be trustworthy.
+    scenario.py calls this before every run.
+    """
+    global _integral, _sp_prev, _sp_rate
+    _integral = 0.0
+    _sp_prev = None
+    _sp_rate = 0.0
+
+
+def set_gains(**kw):
+    """Override gains by name: set_gains(KP_ALT=20.0, KI_ALT=0.0).
+
+    The companion to set_target() - same shape, same reason. A driver
+    outside this module cannot know what a law called its gains, so this is
+    the one agreed way in, and scenario.py / sim_worker.py both use it.
+
+    An unknown name RAISES rather than being ignored. A silent no-op here
+    would make a mistyped gain in a sweep look like a legitimate result,
+    which is the worst possible failure for something whose whole purpose is
+    comparing tunings.
+
+    Setting any gain also clears the integrator, since an accumulator built
+    up under the old tuning means nothing under the new one.
+    """
+    for name, value in kw.items():
+        if name not in _GAIN_NAMES:
+            raise KeyError(
+                f"unknown gain {name!r}; settable gains are "
+                f"{', '.join(_GAIN_NAMES)}")
+        globals()[name] = (_as_bool(value) if name == "ANTI_WINDUP"
+                           else float(value))
+    reset_state()
+
+
+def current_gains():
+    """Every settable gain and its current value, for logging a run."""
+    return {n: globals()[n] for n in _GAIN_NAMES}
+
 
 def hover(state):
     """Hold TARGET_ALT_M with the main engine. Vertical axis only.
@@ -194,6 +300,148 @@ def hover_interactive(state):
     err_vel = -state.vel[2]
 
     thrust = state.weight_n() + KP_ALT * err_alt + KD_ALT * err_vel
+
+    return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
+
+
+def hover_pid(state):
+    """hover() plus an integral term. Kills steady-state error.
+
+    THE MATH. Three feedback terms on top of the m*g feedforward:
+
+        e(t)   = target - z                       altitude error, m
+        u(t)   = m*g + KP*e + KD*(-vz) + KI*INT   thrust command, N
+        INT    = integral of e dt                 accumulated error, m*s
+
+    WHAT THE I TERM IS FOR. A P+D loop settles wherever its own output
+    happens to balance the disturbance, so any constant error the P term
+    must fight shows up as permanent offset. Measured, holding 2.0 m:
+
+        feedforward exact          PD -0.00000 m   PID +0.00000 m
+        feedforward 10% low        PD +0.10800 m   PID +0.00000 m
+        feedforward 25% low        PD +0.27000 m   PID +0.00000 m
+
+    And against a constant-rate descent, where a P+D law has a structural
+    lag of -KD*rate/KP (-0.1222 m predicted at these gains):
+
+        descent ramp 0.1 m/s       PD -0.12202 m   PID +0.00013 m
+
+    The ramp case is the one that bites in normal use: it happens on every
+    descent even when the feedforward is perfect.
+
+    *** AND WHY ANTI-WINDUP IS NOT OPTIONAL. *** While the engine is
+    saturated the loop is open - more command produces no more thrust - but
+    a naive integrator keeps accumulating anyway, so by the time the error
+    finally closes it has built up a huge spurious term. Measured, stepping
+    0.4 -> 12 m against the 60 N ceiling:
+
+        PD only                     peak 14.877 m   overshoot  +2.877 m
+        PID, no anti-windup         peak 27.211 m   overshoot +15.211 m
+        PID, conditional integral   peak 16.738 m   overshoot  +4.738 m
+
+    Unguarded, the integral makes the law five times WORSE than the PD it
+    was meant to improve. Two defences, both on by default:
+
+      ANTI_WINDUP   only accumulate when the command is not saturated.
+      I_LIMIT_N     cap the integral's contribution in Newtons regardless.
+    """
+    global _integral
+
+    err_alt = _target_alt - state.pos[2]
+    err_vel = -state.vel[2]
+
+    # The integral's contribution, clamped. Computed before the update so
+    # the clamp applies to what is actually commanded this tick.
+    i_term = max(-I_LIMIT_N, min(I_LIMIT_N, KI_ALT * _integral))
+
+    unsaturated = state.weight_n() + KP_ALT * err_alt + KD_ALT * err_vel + i_term
+
+    # Would this command be clipped? Thruster.set clamps to the actuator's
+    # ctrlrange, and the lower bound is 0 because a rocket cannot pull.
+    # THRUST_CEILING_N is a conservative stand-in: the real ceiling lives in
+    # the XML, and a law cannot see it, so this uses the configured value.
+    hit_limit = unsaturated < 0.0 or unsaturated > THRUST_CEILING_N
+
+    if not (ANTI_WINDUP and hit_limit):
+        _integral += err_alt * DT_NOMINAL_S
+
+    return {"main": (unsaturated, np.array([0.0, 0.0, 1.0]))}
+
+
+def hover_cascade(state):
+    """Two nested loops: position commands a climb RATE, rate commands thrust.
+
+    THE IDEA. A single-loop PD on position has to produce a steady error to
+    hold a steady velocity - that is what -KD*rate/KP means. Split the
+    problem instead:
+
+        OUTER (position)   v_cmd = KP_POS_V * (target - z)      [m/s]
+                           clamped to +-V_MAX_MPS
+        INNER (rate)       u     = m*g + KP_V * (v_cmd - vz)    [N]
+
+    Now the thing being tracked IS a velocity, so following a constant-rate
+    reference needs no accumulated error and no integrator at all. Measured
+    mean lag on a 0.1 m/s descent ramp:
+
+        PD         -0.12265 m
+        PID (Ki=6) -0.01188 m
+        cascade    +0.00119 m
+
+    The cascade wins outright, and it wins structurally rather than by
+    tuning: there is nothing left to accumulate.
+
+    WHY THE CLAMP MATTERS. V_MAX_MPS is not cosmetic - it is the whole
+    reason this law behaves on large steps. A 10 m error asks the outer loop
+    for 6 m/s, which the inner loop would chase at full throttle; clamping
+    the commanded rate turns an aggressive step into a controlled climb at a
+    known speed, and the engine never saturates. That is also why the
+    cascade overshoots 0.05 m where the PD overshoots 2.9 m on a big step:
+    the rate limit is doing the work a trajectory generator normally would.
+
+    GAIN CHOICE, from a sweep at 12 kg / 60 N stepping 0.4 -> 2.0 m:
+
+        KP_POS_V  KP_V   overshoot   final
+          0.6      6.0    +0.2846    1.9996
+          0.6     15.0    +0.0518    2.0000   <- the default
+          0.9      9.0    +0.2245    2.0000
+          1.5     15.0    +0.1488    2.0000
+
+    A stiff inner loop and a gentle outer one is the usual answer, and the
+    numbers agree: raising KP_V helps, raising KP_POS_V hurts. The same
+    gains converge on 08_thrust_1D_smol (1 kg, 10 N) with no overshoot, so
+    they are not tuned to one vehicle.
+    """
+    global _sp_prev, _sp_rate
+
+    sp = _target_alt
+
+    # SETPOINT RATE, estimated by differencing. This is the term that makes
+    # the cascade actually beat the PID on a ramp, and leaving it out is a
+    # trap I walked into: without it the outer loop can only ask for a
+    # descent by holding a standing position error of rate/KP_POS_V, which
+    # at 0.1 m/s and KP_POS_V=0.6 is 0.167 m - measured -0.165 m, WORSE than
+    # the PD law it was supposed to improve on. A law cannot be told the
+    # ramp rate (CraftState carries no setpoint history), so it differences
+    # the setpoint itself and feeds that forward.
+    #
+    # Low-pass filtered because a stepped setpoint differences to a spike:
+    # a 1.6 m step over one 2 ms tick looks like 800 m/s.
+    if _sp_prev is None:
+        _sp_prev = sp
+    raw_rate = (sp - _sp_prev) / DT_NOMINAL_S
+    raw_rate = max(-V_MAX_MPS, min(V_MAX_MPS, raw_rate))   # ignore step spikes
+    _sp_rate += SP_RATE_LPF * (raw_rate - _sp_rate)
+    _sp_prev = sp
+
+    # OUTER LOOP: how fast should we be moving right now?
+    #   feedforward  the setpoint's own rate, so tracking a ramp needs no
+    #                standing position error at all
+    #   proportional close whatever position error remains
+    v_cmd = _sp_rate + KP_POS_V * (sp - state.pos[2])
+    v_cmd = max(-V_MAX_MPS, min(V_MAX_MPS, v_cmd))
+
+    # INNER LOOP: what thrust holds that rate?
+    thrust = state.weight_n() + KP_V * (v_cmd - state.vel[2])
 
     return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
 

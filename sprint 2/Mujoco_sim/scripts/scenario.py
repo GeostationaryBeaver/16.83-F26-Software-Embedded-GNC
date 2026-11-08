@@ -76,6 +76,31 @@ def vertical_indices(model, mujoco, body_id):
     return qadr, vadr
 
 
+def parse_gains(spec):
+    """'KP_ALT=20,KI_ALT=4' -> {'KP_ALT': 20.0, 'KI_ALT': 4.0}.
+
+    Accepts a comma-separated string or a list of NAME=VALUE strings, so
+    --gains "a=1,b=2" and repeated --gain a=1 --gain b=2 both work. Values
+    stay strings here; the controller's set_gains() does the coercion and
+    the name validation, which is the one place that knows what is legal.
+    """
+    if not spec:
+        return {}
+    items = spec if isinstance(spec, (list, tuple)) else [spec]
+    out = {}
+    for item in items:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(
+                    f"bad gain {part!r}: expected NAME=VALUE")
+            name, _, value = part.partition("=")
+            out[name.strip()] = value.strip()
+    return out
+
+
 def ground_height(model, data, mujoco, body_id):
     """The body-origin z at which the craft rests on the floor.
 
@@ -448,6 +473,12 @@ def main() -> int:
                    help="vehicle mass with empty tanks, kg")
     p.add_argument("--isp", type=float, default=None,
                    help="specific impulse, s; sets mdot = F/(Isp*g0)")
+    p.add_argument("--gains", default=None, metavar="N=V,...",
+                   help="override controller gains, e.g. "
+                        "\"KP_ALT=20,KI_ALT=4\". Applied through the "
+                        "controller module's set_gains().")
+    p.add_argument("--gain", action="append", default=None, metavar="N=V",
+                   help="one gain override; repeatable")
     p.add_argument("--fixed-mass", action="store_true",
                    help="disable the propellant model and fly at the "
                         "scene's constant mass, for comparison")
@@ -517,6 +548,38 @@ def main() -> int:
     if mod is not None and hasattr(mod, "_listener"):
         mod._listener = False
 
+    # Clear any controller state left from a previous run in this process -
+    # an integrator especially. Without this, the second run of a gain sweep
+    # starts with the first run's accumulator and only run one is honest.
+    resetter = getattr(mod, "reset_state", None) if mod else None
+    if resetter is not None:
+        resetter()
+
+    # Gains. Unlike set_target this is OPTIONAL: a controller without
+    # set_gains is still perfectly runnable, it just cannot be retuned.
+    try:
+        wanted_gains = parse_gains(args.gains)
+        wanted_gains.update(parse_gains(args.gain))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    gain_setter = getattr(mod, "set_gains", None) if mod else None
+    if wanted_gains:
+        if gain_setter is None:
+            print(f"error: {mod_name!r} defines no set_gains(**kw), so "
+                  f"--gains cannot be applied.\n"
+                  f"  See scripts/example_hover.py:set_gains.",
+                  file=sys.stderr)
+            return 1
+        try:
+            gain_setter(**wanted_gains)
+        except (KeyError, ValueError, TypeError) as e:
+            print(f"error: bad --gains: {e}", file=sys.stderr)
+            return 1
+    applied_gains = (mod.current_gains()
+                     if mod is not None and hasattr(mod, "current_gains")
+                     else None)
+
     dt = float(model.opt.timestep)
     qi, vi = vertical_indices(model, mujoco, body_id)
 
@@ -549,6 +612,9 @@ def main() -> int:
     else:
         print(f"mass        {float(model.body_mass[body_id]):.3f} kg, fixed "
               f"(--fixed-mass)")
+    if wanted_gains:
+        print("gains       " + "  ".join(f"{k}={v}" for k, v in
+                                          wanted_gains.items()))
     print(f"profile     sit {GROUND_SIT_S}s -> {args.target} m -> hold "
           f"{HOLD_AT_TARGET_S}s -> down at {args.descent_rate} m/s -> "
           f"sit {HOLD_AT_GROUND_S}s")
@@ -632,6 +698,8 @@ def main() -> int:
             "phase_timeout_s": PHASE_TIMEOUT_S,
         },
         "ground_height_m": z_rest,
+        "gains": applied_gains,
+        "gains_overridden": wanted_gains or None,
         "propellant": None if tank is None else {
             "dry_mass_kg": tank.dry_mass_kg,
             "propellant_initial_kg": tank.propellant_initial_kg,
@@ -849,6 +917,42 @@ def run_selftest() -> int:
     truth("  propellant never negative", tk.propellant_kg >= 0.0,
           f"{tk.propellant_kg:.3e} kg")
 
+    print("\n[5b] gain plumbing")
+    import example_hover as _eh
+    truth("parse_gains handles a comma string",
+          parse_gains("KP_ALT=20,KI_ALT=4") == {"KP_ALT": "20", "KI_ALT": "4"})
+    truth("parse_gains handles a repeated list",
+          parse_gains(["KP_ALT=20", "KI_ALT=4"]) == {"KP_ALT": "20",
+                                                     "KI_ALT": "4"})
+    try:
+        parse_gains("KP_ALT")
+        truth("parse_gains rejects a missing '='", False)
+    except ValueError:
+        truth("parse_gains rejects a missing '='", True)
+
+    _kp0, _kd0, _ki0 = _eh.KP_ALT, _eh.KD_ALT, _eh.KI_ALT
+    _eh.set_gains(KP_ALT=20.0)
+    truth("set_gains writes the constant", _eh.KP_ALT == 20.0)
+    try:
+        _eh.set_gains(KP_NOPE=1.0)
+        truth("set_gains rejects an unknown name", False)
+    except KeyError:
+        truth("set_gains rejects an unknown name", True)
+    # bool("0") is True, so a naive coercion left ANTI_WINDUP permanently on
+    # and the guard could never be disabled from the CLI.
+    _eh.set_gains(ANTI_WINDUP="0")
+    truth("ANTI_WINDUP='0' parses as False", _eh.ANTI_WINDUP is False)
+    _eh.set_gains(ANTI_WINDUP="true")
+    truth("ANTI_WINDUP='true' parses as True", _eh.ANTI_WINDUP is True)
+    _eh._integral = 5.0
+    _eh.set_gains(KP_ALT=_kp0)
+    truth("set_gains clears the integrator", _eh._integral == 0.0)
+    _eh._integral = 5.0
+    _eh.reset_state()
+    truth("reset_state clears the integrator and setpoint history",
+          _eh._integral == 0.0 and _eh._sp_prev is None)
+    _eh.set_gains(KP_ALT=_kp0, KD_ALT=_kd0, KI_ALT=_ki0)
+
     print("\n[6] end to end on both scenes")
     for scene, z_expect in (("scenes/07_thrust_1D.xml", 0.399928),
                             ("scenes/06_thrust_craft.xml", 0.249977)):
@@ -875,6 +979,66 @@ def run_selftest() -> int:
         import example_hover as eh
         ok(f"  {pathlib.Path(scene).stem} descent lag vs -KD*r/KP",
            m["descent_lag_mean_m"], -eh.KD_ALT * 0.1 / eh.KP_ALT, 0.02, " m")
+
+    print("\n[7] the new laws do what they claim")
+    out7 = ROOT / "out" / "_selftest_laws"
+
+    def fly(law, extra=(), target=None, scene="scenes/07_thrust_1D.xml"):
+        argv = [sys.executable, str(HERE / "scenario.py"),
+                "--controller", f"example_hover:{law}", "--scene", scene,
+                "--fixed-mass", "--no-plot", "--outdir", str(out7)]
+        if target is not None:
+            argv += ["--target", str(target)]
+        argv += list(extra)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None
+        newest = max(out7.glob("*/run.json"), key=lambda q: q.stat().st_mtime)
+        return json.loads(newest.read_text())["metrics"]
+
+    # The PID and the cascade both exist to kill the PD's ramp lag.
+    m_pd = fly("hover")
+    m_pid = fly("hover_pid")
+    m_casc = fly("hover_cascade")
+    truth("all three laws complete the profile",
+          all(m is not None for m in (m_pd, m_pid, m_casc)))
+    ok("  PD ramp lag (the baseline)", m_pd["descent_lag_mean_m"],
+       -0.1222, 0.02, " m")
+    truth("  PID cuts the ramp lag at least 3x",
+          abs(m_pid["descent_lag_mean_m"]) < abs(m_pd["descent_lag_mean_m"]) / 3,
+          f"{m_pid['descent_lag_mean_m']:+.5f} vs {m_pd['descent_lag_mean_m']:+.5f} m")
+    truth("  cascade cuts it at least 10x",
+          abs(m_casc["descent_lag_mean_m"]) < abs(m_pd["descent_lag_mean_m"]) / 10,
+          f"{m_casc['descent_lag_mean_m']:+.5f} m")
+    truth("  cascade keeps PD-like overshoot",
+          m_casc["overshoot_m"] < 0.10,
+          f"{m_casc['overshoot_m']:.5f} m")
+
+    # ANTI-WINDUP IS LOAD-BEARING. The disabled arm must stay bad, or this
+    # check is not testing anything. I_LIMIT is raised out of the way so
+    # ANTI_WINDUP is the only guard in play.
+    big = 12.0
+    m_aw = fly("hover_pid", ["--gains", "ANTI_WINDUP=1,I_LIMIT_N=1000"], big)
+    m_no = fly("hover_pid", ["--gains", "ANTI_WINDUP=0,I_LIMIT_N=1000"], big)
+    truth("  anti-windup on: overshoot under 6 m",
+          m_aw["overshoot_m"] < 6.0, f"{m_aw['overshoot_m']:+.3f} m")
+    truth("  anti-windup OFF: overshoot over 10 m (must stay bad)",
+          m_no["overshoot_m"] > 10.0, f"{m_no['overshoot_m']:+.3f} m")
+    truth("  so the guard is worth >5 m of overshoot",
+          m_no["overshoot_m"] - m_aw["overshoot_m"] > 5.0,
+          f"{m_no['overshoot_m'] - m_aw['overshoot_m']:+.3f} m")
+
+    # The cascade's gains must not be tuned to one vehicle.
+    m_smol = fly("hover_cascade", scene="scenes/08_thrust_1D_smol.xml")
+    truth("  cascade also converges on 08_smol (1 kg, 10 N)",
+          m_smol is not None and m_smol["return_err_m"] < 0.02,
+          f"return err {m_smol['return_err_m']:.5f} m" if m_smol else "FAILED")
+
+    # Gains must be recoverable from a run's own output.
+    newest = max(out7.glob("*/run.json"), key=lambda q: q.stat().st_mtime)
+    meta = json.loads(newest.read_text())
+    truth("  run.json records the gains it flew",
+          isinstance(meta.get("gains"), dict) and "KP_ALT" in meta["gains"])
 
     print()
     print(bar)

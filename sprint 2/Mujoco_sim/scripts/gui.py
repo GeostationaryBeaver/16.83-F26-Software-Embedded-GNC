@@ -40,6 +40,11 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 CONTROLLER_MODULE = "example_hover"   # where control laws are looked up
+
+# The gains given entry boxes. Not every settable gain - just the ones worth
+# reaching for while testing a vertical law. Anything else goes through
+# --gains on the command line; set_gains() is the full list.
+GAIN_FIELDS = ("KP_ALT", "KI_ALT", "KD_ALT", "KP_POS_V", "KP_V")
 POLL_MS = 50                          # queue drain / telemetry cadence
 
 
@@ -130,6 +135,7 @@ def build_scenario_cmd(params, python=None, script=None):
                       ("--dry-mass", "dry_mass"),
                       ("--isp", "isp"),
                       ("--gravity", "gravity"),
+                      ("--gains", "gains"),
                       ("--label", "label")):
         v = params.get(key)
         if v not in (None, ""):
@@ -152,7 +158,8 @@ def build_worker_cmd(params, port, python=None, script=None):
                       ("--propellant", "propellant"),
                       ("--dry-mass", "dry_mass"),
                       ("--isp", "isp"),
-                      ("--gravity", "gravity")):
+                      ("--gravity", "gravity"),
+                      ("--gains", "gains")):
         v = params.get(key)
         if v not in (None, ""):
             cmd += [flag, str(v)]
@@ -300,8 +307,20 @@ class App:
                 "isp": self.v_isp.get().strip(),
                 "gravity": self.v_grav.get().strip(),
                 "label": self.v_label.get().strip(),
+                "gains": self.gain_spec(self.g_vars),
                 "fixed_mass": bool(self.v_fixed.get()),
                 "no_plot": False}
+
+    @staticmethod
+    def gain_spec(vars_map):
+        """Non-empty gain boxes -> 'NAME=VALUE,NAME=VALUE'.
+
+        Blank boxes are omitted so the controller keeps its own default,
+        rather than this GUI having to mirror every constant.
+        """
+        return ",".join(f"{name}={var.get().strip()}"
+                        for name, var in vars_map.items()
+                        if var.get().strip())
 
     # ---- Run tab --------------------------------------------------------
     def _build_run(self):
@@ -348,6 +367,21 @@ class App:
         field(7, "label", self.v_label, 12)
         ttk.Checkbutton(self.grid_params, text="fixed mass",
                         variable=self.v_fixed).grid(row=0, column=8, sticky="w")
+
+        # A second row for control gains. Blank means "use the controller's
+        # own default", so this grid never has to mirror example_hover's
+        # constants - it only carries what you deliberately override.
+        self.g_vars = {}
+        for col, name in enumerate(GAIN_FIELDS):
+            f = ttk.Frame(self.grid_params)
+            f.grid(row=1, column=col, sticky="w", padx=(0, 10), pady=(4, 0))
+            ttk.Label(f, text=name).pack(anchor="w")
+            var = tk.StringVar(value="")
+            ttk.Entry(f, textvariable=var, width=9).pack()
+            self.g_vars[name] = var
+        ttk.Label(self.grid_params, text="(blank = controller default)"
+                  ).grid(row=1, column=len(GAIN_FIELDS), sticky="w",
+                         pady=(4, 0))
 
         bar = ttk.Frame(self.tab_run, padding=8)
         bar.pack(fill="x")
@@ -503,7 +537,17 @@ class App:
         a, b = sel
         self.v_cmp_status.set("")
         self.cmp_out.delete("1.0", "end")
-        self.cmp_out.insert("end", f"A  {a['name']}\nB  {b['name']}\n\n", "hdr")
+        self.cmp_out.insert("end", f"A  {a['name']}\nB  {b['name']}\n", "hdr")
+        # Name the tuning each run flew. Without this a directory of sweep
+        # results is unidentifiable - the metrics differ and you cannot say
+        # why.
+        for tag, run in (("A", a), ("B", b)):
+            ov = run["meta"].get("gains_overridden")
+            self.cmp_out.insert(
+                "end", f"   {tag} gains: "
+                       + (", ".join(f"{k}={v}" for k, v in ov.items())
+                          if ov else "(all defaults)") + "\n")
+        self.cmp_out.insert("end", "\n")
         self.cmp_out.insert("end", f"{'metric':<30s} {'A':>16s} {'B':>16s}\n", "hdr")
         rows = diff_metrics(a["meta"].get("metrics", {}),
                             b["meta"].get("metrics", {}))
@@ -581,6 +625,19 @@ class App:
         ttk.Button(mass, text="match scene",
                    command=self._match_scene_mass).grid(row=0, column=6, padx=(10, 0))
 
+        gains = ttk.Frame(self.tab_live, padding=(8, 6, 8, 0))
+        gains.pack(fill="x")
+        ttk.Label(gains, text="gains (blank = default):").grid(
+            row=0, column=0, sticky="w")
+        self.lv_g_vars = {}
+        for i, name in enumerate(GAIN_FIELDS):
+            ttk.Label(gains, text=name).grid(row=0, column=1 + 2 * i,
+                                             sticky="e", padx=(10, 2))
+            var = tk.StringVar(value="")
+            ttk.Entry(gains, textvariable=var, width=7).grid(
+                row=0, column=2 + 2 * i)
+            self.lv_g_vars[name] = var
+
         self.v_hint = tk.StringVar(value="")
         self.lbl_hint = ttk.Label(self.tab_live, textvariable=self.v_hint,
                                   padding=(8, 4), foreground="#a05000")
@@ -646,6 +703,7 @@ class App:
                 "dry_mass": self.lv_dry.get().strip(),
                 "isp": self.v_isp.get().strip(),
                 "gravity": self.v_grav.get().strip(),
+                "gains": self.gain_spec(self.lv_g_vars),
                 "fixed_mass": self.lv_massmode.get() == "fixed"}
 
     def _update_mass_hint(self):

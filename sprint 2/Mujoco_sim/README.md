@@ -28,7 +28,8 @@ uv run python scripts/run.py scenes/01_ball_drop.xml
 11. [A standardized test scenario](#11-a-standardized-test-scenario)
 12. [Variable mass](#12-variable-mass)
 13. [The GUI](#13-the-gui)
-14. [Where to go next](#14-where-to-go-next)
+14. [Control laws and gains](#14-control-laws-and-gains)
+15. [Where to go next](#15-where-to-go-next)
 
 ---
 
@@ -133,7 +134,7 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── import_mesh.py           STL/OBJ -> MJCF, with sanity checks
 │   ├── thrusters.py             Thruster / ThrusterSet / CraftState  (§10)
 │   ├── fly.py                   run a scene under closed-loop control (§10)
-│   ├── example_hover.py         three example control laws
+│   ├── example_hover.py         five control laws + gain plumbing (§14)
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
 │   ├── gui.py                   control panel: run/compare/demo (§13)
@@ -1405,7 +1406,125 @@ at 640×480 and 23.8 at 1280×720, which is fine for these scenes.
 
 ---
 
-## 14. Where to go next
+## 14. Control laws and gains
+
+Five laws in `scripts/example_hover.py`. The three vertical ones are the
+interesting comparison:
+
+| law | descent-ramp lag | step overshoot | hold RMS |
+|---|---|---|---|
+| `hover` (PD) | −0.12177 m | 0.0458 m | 0.0233 m |
+| `hover_pid` | −0.02314 m | 0.5574 m | 0.0105 m |
+| `hover_cascade` | **−0.00731 m** | 0.0518 m | 0.0318 m |
+
+All measured on the standard profile, `07_thrust_1D`, fixed mass.
+
+### Setting gains without editing code
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover_pid \
+    --gains "KI_ALT=3,KD_ALT=25"
+uv run python scripts/scenario.py --controller example_hover:hover_cascade \
+    --gain KP_V=20 --gain KP_POS_V=0.5
+```
+
+In the GUI there is a second row of gain boxes on the Run tab and the same row
+on the Live tab. **A blank box means "use the controller's default"**, so the
+GUI never has to mirror the constants — it carries only what you deliberately
+override. Gains are applied at launch, not live: retuning mid-flight would
+raise the question of what happens to an integrator accumulated under the old
+gains, and the honest answer is to relaunch.
+
+`set_gains(**kw)` is the mechanism, the companion to `set_target()`. It
+validates names against a whitelist and **raises on an unknown one** — a
+silent no-op would make a mistyped gain in a sweep look like a real result.
+Every applied gain is written to the run's `run.json` under `gains`, with the
+overrides under `gains_overridden`, so a tuning is recoverable from its own
+output and Compare can label two runs rather than leaving you to guess.
+
+### `hover_pid` — and why anti-windup is not optional
+
+The integral removes error a P+D loop structurally cannot. Holding 2.0 m with
+a deliberately wrong feedforward:
+
+| feedforward | PD | PID |
+|---|---|---|
+| exact | −0.00000 m | +0.00000 m |
+| 10% low | **+0.10800 m** | +0.00000 m |
+| 25% low | **+0.27000 m** | +0.00000 m |
+
+But while the engine is saturated the loop is *open*, and a naive integrator
+keeps accumulating anyway. Stepping 0.4 → 12 m against the 60 N ceiling:
+
+| | peak | overshoot |
+|---|---|---|
+| PD only | 14.877 m | +2.877 m |
+| PID, `ANTI_WINDUP=0` | 27.211 m | **+15.211 m** |
+| PID, `ANTI_WINDUP=1` | 16.738 m | +4.738 m |
+
+Unguarded the integral makes the law **five times worse** than the PD it was
+meant to improve. Two defences, both on: `ANTI_WINDUP` stops accumulating while
+the command is clipped, and `I_LIMIT_N` caps the integral's contribution in
+Newtons. The self-test asserts the disabled arm *stays* bad (>10 m), because a
+guard whose absence costs nothing is not being tested.
+
+Note `hover_pid`'s 0.557 m step overshoot at the default `KI_ALT=6` — that is
+the price of the integral. `--gains "KI_ALT=6,I_LIMIT_N=5"` brings it to
+0.331 m while keeping the lag at −0.023 m, and `KI_ALT=1.5` trades the other
+way (0.201 m overshoot, −0.090 m lag).
+
+### `hover_cascade` — two nested loops
+
+```
+OUTER (position)   v_cmd = sp_rate + KP_POS_V * (target - z)   [m/s]
+                   clamped to +-V_MAX_MPS
+INNER (rate)       u     = m*g + KP_V * (v_cmd - vz)           [N]
+```
+
+A single-loop PD must hold a steady *error* to hold a steady *velocity* — that
+is exactly what `-KD*rate/KP` means. The cascade tracks velocity directly, so
+following a constant-rate reference needs no accumulated error and no
+integrator at all.
+
+**The term that makes it work is `sp_rate`, the setpoint's own rate**, fed
+forward into the outer loop. Without it the cascade can only command a descent
+by holding a standing position error of `rate / KP_POS_V` — at 0.1 m/s and
+`KP_POS_V=0.6` that is 0.167 m, and measured it came out at −0.165 m, *worse
+than the PD it was meant to beat*. A law cannot be told the ramp rate
+(`CraftState` carries no setpoint history), so it differences the setpoint
+itself, low-passed by `SP_RATE_LPF` because a stepped setpoint differences to a
+spike — 1.6 m over one 2 ms tick looks like 800 m/s.
+
+`V_MAX_MPS` is load-bearing too, not cosmetic. It converts a large step into a
+controlled climb at a known speed: peak velocity stays pinned at exactly
+0.600 m/s even on a 7.6 m step, which is why the cascade overshoots 0.05 m
+where the PD overshoots 2.9 m. The rate limit is doing the job a trajectory
+generator normally would.
+
+Gains come from a sweep at 12 kg / 60 N stepping 0.4 → 2.0 m:
+
+| `KP_POS_V` | `KP_V` | overshoot | final |
+|---|---|---|---|
+| 0.6 | 6.0 | +0.2846 | 1.9996 |
+| 0.6 | **15.0** | **+0.0518** | 2.0000 |
+| 0.9 | 9.0 | +0.2245 | 2.0000 |
+| 1.5 | 15.0 | +0.1488 | 2.0000 |
+
+A stiff inner loop with a gentle outer one is the usual answer and the numbers
+agree. The same gains converge on `08_thrust_1D_smol` (1 kg, 10 N) to within
+0.00007 m, so they are not tuned to one vehicle.
+
+### One gain a law cannot discover
+
+`THRUST_CEILING_N` defaults to 60.0 because `hover_pid`'s anti-windup needs to
+know where the command saturates, and a control law never sees the actuator's
+`ctrlrange` — that lives in the scene XML. **Flying `08_thrust_1D_smol` means
+`--gains "THRUST_CEILING_N=10"`**, or the integral keeps winding while the
+engine is already pinned.
+
+---
+
+## 15. Where to go next
 
 This project deliberately covers only gravity and collisions. The natural next
 steps, and where each attaches:
@@ -1493,4 +1612,9 @@ steps, and where each attaches:
 | **run dir collision** | two runs in one second no longer overwrite ✓ |
 | **compare** | 2 m vs 3 m runs → 13/18 metrics flagged as differing ✓ |
 | **lift check** | smol+12 kg tank T/W 0.51 flagged; match scene → 6.17 ✓ |
-| **selftest suites** | thrust 50/50, scenario 31/31, gui 38/38 pass ✓ |
+| **PID kills the droop** | feedforward 10% low: PD +0.108 m → PID 0.000 m ✓ |
+| **anti-windup matters** | 12 m step: 4.74 m guarded vs 15.21 m unguarded ✓ |
+| **cascade ramp lag** | −0.0073 m vs the PD's −0.1218 m, 17× better ✓ |
+| **cascade rate limit** | peak vz pinned at 0.600 m/s on a 7.6 m step ✓ |
+| **gains reach a run** | GUI boxes → `--gains` → `set_gains` → `run.json` ✓ |
+| **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

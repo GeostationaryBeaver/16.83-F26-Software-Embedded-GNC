@@ -401,6 +401,41 @@ def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust,
     return out
 
 
+def gains_used_by(law_name, module_name="example_hover"):
+    """Which settable gains a control law actually reads.
+
+    Read off the law's own bytecode (the global names it references,
+    intersected with the module's _GAIN_NAMES whitelist) and followed one
+    level into helpers it calls. Same spirit as find_controllers: the GUI
+    discovers this instead of carrying a per-law table that would quietly
+    go stale the first time a law is edited.
+
+    An unknown law returns EVERY gain, so the failure mode is "nothing is
+    greyed out" rather than "the box you need is disabled".
+    """
+    import importlib
+    mod = importlib.import_module(module_name)
+    names = set(getattr(mod, "_GAIN_NAMES", ()))
+    fn = getattr(mod, law_name, None)
+    if not hasattr(fn, "__code__"):
+        return names
+    out, seen, stack = set(), set(), [fn]
+    while stack:
+        f = stack.pop()
+        if id(f) in seen:
+            continue
+        seen.add(id(f))
+        for n in f.__code__.co_names:
+            if n in names:
+                out.add(n)
+                continue
+            helper = getattr(mod, n, None)
+            if (hasattr(helper, "__code__")
+                    and getattr(helper, "__module__", None) == mod.__name__):
+                stack.append(helper)
+    return out
+
+
 def active_thrusters(rows, cols, names, tol=THRUST_PLOT_TOL_N):
     """The thrusters that actually fired, for plotting.
 
@@ -430,8 +465,61 @@ def active_thrusters(rows, cols, names, tol=THRUST_PLOT_TOL_N):
     return (kept, dropped) if kept else (list(names), [])
 
 
+def config_lines(controller, scene, gains, overridden, profile, mass_note,
+                 metrics=None, gain_names=None):
+    """The text for the figure's configuration panel, as (label, value) rows.
+
+    A figure that does not say what produced it is not much use in a report:
+    two flight.png files from different tunings are indistinguishable. This
+    puts the law, the gains it actually read, and the headline numbers on
+    the figure itself.
+
+    Only the gains the law READS are listed - the same bytecode-derived set
+    the GUI greys its boxes with. Printing all sixteen settable constants
+    would bury the three that mattered, and listing KI_ALT under a cascade
+    run would be actively misleading, since the cascade has no integrator.
+
+    An overridden gain is marked, because "KP_ALT 18.0" alone cannot
+    distinguish a deliberate choice from the default.
+    """
+    overridden = overridden or {}
+    rows = [("controller", controller), ("scene", scene)]
+    if profile:
+        rows.append(("profile", profile))
+    if mass_note:
+        rows.append(("mass", mass_note))
+    rows.append(("", ""))           # separator: setup above, gains below
+
+    if gain_names is None:
+        gain_names = set(gains or ())
+    shown = [n for n in (gains or ()) if n in gain_names]
+    # Stable, readable order: the gains this law reads, alphabetically,
+    # rather than dict order, which depends on _GAIN_NAMES' layout.
+    for n in sorted(shown):
+        v = gains[n]
+        v = f"{v:g}" if isinstance(v, (int, float)) and not isinstance(v, bool) \
+            else str(v)
+        rows.append((n, v + ("   (set)" if n in overridden else "")))
+
+    # An override of a gain the law does not read is worth SAYING, not
+    # hiding: it means a sweep is varying something with no effect.
+    inert = [n for n in overridden if n not in gain_names]
+    if inert:
+        rows.append(("unused overrides", ", ".join(sorted(inert))))
+
+    shown_metrics = [(k, f"{metrics[k]:+.5f}")
+                     for k in ("overshoot_m", "hold_rms_err_m",
+                               "descent_lag_mean_m", "return_err_m")
+                     if metrics and k in metrics]
+    if shown_metrics:
+        rows.append(("", ""))       # separator: gains above, results below
+        rows.extend(shown_metrics)
+    return rows
+
+
 def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
-                names, show_mass=False, all_thrusters=False):
+                names, show_mass=False, all_thrusters=False,
+                config=None):
     """One stacked figure, shared time axis, phases shaded.
 
     Agg is selected before pyplot is imported because these runs are
@@ -439,6 +527,10 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
 
     all_thrusters=True plots every nozzle including the ones that never
     fired (--all-thrusters); by default those are dropped.
+
+    config, from config_lines(), adds a text panel down the right-hand side
+    naming the law, its gains and the headline metrics, so the figure says
+    what produced it.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -454,8 +546,23 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
         plotted, hidden = active_thrusters(rows, cols, names)
 
     n_panels = 6 if show_mass else 5
-    fig, ax = plt.subplots(n_panels, 1, figsize=(11, 2.8 * n_panels),
-                           sharex=True, constrained_layout=True)
+    if config:
+        # A narrow second COLUMN rather than another row in the stack: the
+        # text is about twenty short lines, and a full-width panel would
+        # either waste most of its area or squash the plots it describes.
+        # The text axes spans every row, so it can run the full height.
+        fig = plt.figure(figsize=(13.6, 2.8 * n_panels),
+                         constrained_layout=True)
+        gs = fig.add_gridspec(n_panels, 2, width_ratios=[4.6, 1.0])
+        ax = [fig.add_subplot(gs[i, 0]) for i in range(n_panels)]
+        for a in ax[:-1]:
+            a.sharex(ax[-1])
+            a.tick_params(labelbottom=False)
+        ax_cfg = fig.add_subplot(gs[:, 1])
+    else:
+        fig, ax = plt.subplots(n_panels, 1, figsize=(11, 2.8 * n_panels),
+                               sharex=True, constrained_layout=True)
+        ax_cfg = None
 
     # Phase bands, drawn first so the traces sit on top of them.
     shades = {"GROUND_SIT": "#e8e8e8", "ASCEND": "#dcecf7",
@@ -531,6 +638,44 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
         ax[5].legend(loc="upper right", fontsize=8)
 
     ax[-1].set_xlabel("time [s]")
+
+    if ax_cfg is not None:
+        ax_cfg.axis("off")
+        ax_cfg.set_title("configuration", fontsize=10, loc="left")
+        # Drawn as text at a fixed line pitch rather than as a matplotlib
+        # table: a table forces every column to one width, which turns a
+        # long controller name into an unreadable squeeze.
+        import textwrap
+        # Wrap before measuring, because the long rows (a module-qualified
+        # controller name, the profile line) otherwise run off the panel -
+        # the text is clipped at the figure edge with no warning.
+        WRAP = 27
+        drawn = []
+        for label, value in config:
+            if label == "":
+                drawn.append(("", []))
+            else:
+                drawn.append((label, textwrap.wrap(str(value), WRAP) or [""]))
+        # Pitch chosen from the ACTUAL line count so the column fills
+        # whatever height the figure has, rather than a fixed guess that
+        # leaves a third of the panel blank on a short run.
+        n_lines = sum(1.75 + len(v) for lbl, v in drawn if lbl) \
+            + sum(0.8 for lbl, _ in drawn if not lbl)
+        pitch = min(0.021, 0.97 / max(n_lines, 1.0))
+        y = 0.995
+        for label, vlines in drawn:
+            if not label:
+                y -= pitch * 0.8
+                continue
+            ax_cfg.text(0.0, y, label, fontsize=7.4, color="#666",
+                        va="top", ha="left", transform=ax_cfg.transAxes)
+            y -= pitch * 0.95
+            for vl in vlines:
+                ax_cfg.text(0.0, y, vl, fontsize=8.4, color="#111",
+                            va="top", ha="left", family="monospace",
+                            transform=ax_cfg.transAxes)
+                y -= pitch
+            y -= pitch * 0.55
 
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -640,6 +785,8 @@ def main() -> int:
     p.add_argument("--outdir", default=None,
                    help="parent directory for run dirs (default: outputs/)")
     p.add_argument("--no-plot", action="store_true", help="skip the figure")
+    p.add_argument("--no-config-panel", action="store_true",
+                   help="omit the figure's controller/gains panel")
     p.add_argument("--all-thrusters", action="store_true",
                    help="plot every thruster, including ones that never "
                         "fired (by default those are left off)")
@@ -1011,10 +1158,32 @@ def main() -> int:
     (rundir / "summary.txt").write_text("\n".join(lines) + "\n")
 
     if not args.no_plot:
+        # Which gains to caption with: the ones the law actually reads,
+        # derived from its own code. Falls back to every applied gain if the
+        # lookup fails, so a caption is never silently empty.
+        try:
+            _used = gains_used_by(args.controller.split(":")[-1], mod_name)
+        except Exception:
+            _used = None
+        _cfg = config_lines(
+            controller=args.controller,
+            scene=scene.name,
+            gains=applied_gains,
+            overridden=wanted_gains,
+            profile=(f"{z_rest:.3f} -> {args.target:g} m, "
+                     f"down at {args.descent_rate:g} m/s"),
+            mass_note=(f"{float(model.body_mass[body_id]):.3f} kg fixed"
+                       if tank is None else
+                       f"{tank.dry_mass_kg:g} + {tank.propellant_initial_kg:g} kg, "
+                       f"Isp {tank.isp_s:g} s"),
+            metrics=m,
+            gain_names=_used,
+        )
         plot_flight(rundir / "flight.png", logger.rows, cols, prof,
                     args.target, z_rest, args.descent_rate, thrusters.names,
                     show_mass=tank is not None,
-                    all_thrusters=args.all_thrusters)
+                    all_thrusters=args.all_thrusters,
+                    config=None if args.no_config_panel else _cfg)
         _, _hidden = active_thrusters(logger.rows, cols, thrusters.names)
         if _hidden and not args.all_thrusters:
             print(f"plot         left off {len(_hidden)} thruster(s) that "
@@ -1452,6 +1621,69 @@ def run_selftest() -> int:
         truth("  hiding changes only the figure, not the metrics",
               json.loads((d_hide / "run.json").read_text())["metrics"]
               == json.loads((d_show / "run.json").read_text())["metrics"])
+
+    print("\n[10] the figure says what produced it")
+    # A figure with no provenance is useless in a report: two flight.png
+    # files from different tunings are otherwise indistinguishable.
+    cfg = config_lines(
+        controller="example_hover:hover_cascade", scene="07_thrust_1D.xml",
+        gains={"KP_ALT": 18.0, "KI_ALT": 6.0, "KP_POS_V": 0.6, "KP_V": 14.0},
+        overridden={"KP_V": "14"},
+        profile="0.400 -> 2 m, down at 0.1 m/s",
+        mass_note="12.000 kg fixed",
+        metrics={"overshoot_m": 0.0518, "hold_rms_err_m": 0.0317},
+        gain_names={"KP_POS_V", "KP_V"})
+    labels = [k for k, _ in cfg]
+    byname = dict(cfg)
+    truth("names the controller and scene",
+          byname.get("controller", "").endswith("hover_cascade")
+          and byname.get("scene") == "07_thrust_1D.xml")
+    # Only the gains the LAW reads. Listing KI_ALT under a cascade run would
+    # be actively misleading - the cascade has no integrator.
+    truth("lists only the gains the law reads",
+          "KP_POS_V" in labels and "KP_V" in labels
+          and "KI_ALT" not in labels and "KP_ALT" not in labels,
+          ", ".join(n for n in labels if n.startswith(("KP", "KI", "KD"))))
+    truth("marks an overridden gain as set",
+          "(set)" in byname["KP_V"] and "(set)" not in byname["KP_POS_V"],
+          f"KP_V={byname['KP_V']!r}")
+    # An override of a gain the law ignores must be SAID, not hidden: it
+    # means a sweep is varying something with no effect on the run.
+    cfg2 = config_lines(
+        controller="example_hover:hover_pid", scene="s.xml",
+        gains={"KI_ALT": 6.0}, overridden={"KP_POS_V": "0.9"},
+        profile="", mass_note="", gain_names={"KI_ALT"})
+    truth("flags an override the law cannot read",
+          dict(cfg2).get("unused overrides") == "KP_POS_V")
+    truth("carries the headline metrics",
+          dict(cfg).get("overshoot_m") == "+0.05180")
+    truth("gains are in a stable alphabetical order",
+          [n for n in labels if n in ("KP_POS_V", "KP_V")] == ["KP_POS_V", "KP_V"])
+    # One implementation, shared with the GUI. Compared by source rather
+    # than identity: run as a script this module is __main__, so gui.py
+    # imports a SECOND copy of it under the name "scenario" and an `is`
+    # check would compare two objects that are both correct.
+    import inspect as _inspect
+    truth("one gains_used_by, shared with the GUI",
+          _inspect.getsource(__import__("gui").gains_used_by)
+          == _inspect.getsource(gains_used_by)
+          and __import__("gui").gains_used_by.__module__ == "scenario")
+
+    # End to end: the panel must widen the figure, and --no-config-panel
+    # must restore the old one.
+    d_cfg, _ = fly_dir("hover_cascade", plot=True)
+    d_bare, _ = fly_dir("hover_cascade", ["--no-config-panel"], plot=True)
+    if d_cfg is not None and d_bare is not None:
+        from PIL import Image
+        w_cfg = Image.open(d_cfg / "flight.png").size[0]
+        w_bare = Image.open(d_bare / "flight.png").size[0]
+        truth("  the panel widens the figure", w_cfg > w_bare,
+              f"{w_cfg}px vs {w_bare}px")
+        truth("  --no-config-panel restores the plain figure",
+              w_bare == 1210, f"{w_bare}px")
+        truth("  the panel does not change the run",
+              json.loads((d_cfg / "run.json").read_text())["metrics"]
+              == json.loads((d_bare / "run.json").read_text())["metrics"])
 
     # --view with no display must lose the WINDOW, not the run. glfw aborts
     # the process at import time when DISPLAY is unset, which is earlier

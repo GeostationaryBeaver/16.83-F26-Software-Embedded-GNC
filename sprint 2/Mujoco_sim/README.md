@@ -1191,6 +1191,42 @@ outputs/<scene>_<controller>_<YYYY-MM-DD_HHMMSS>/
     summary.txt   the same metrics, readable
 ```
 
+### The figure says what produced it
+
+A narrow panel down the right-hand side of `flight.png` names the controller,
+the scene, the profile, the mass configuration, the gains and the headline
+metrics. Without it two `flight.png` files from different tunings are
+indistinguishable, which makes the figure close to useless in a report.
+
+```
+configuration
+controller   example_hover:hover_cascade
+scene        07_thrust_1D.xml
+profile      0.400 -> 1.5 m, down at 0.1 m/s
+mass         12.000 kg fixed
+KP_POS_V     0.6
+KP_V         14   (set)
+V_MAX_MPS    0.6
+overshoot_m  +0.05131
+```
+
+**Only the gains the law actually reads** are listed, using the same
+bytecode-derived set that greys the GUI's boxes (`gains_used_by`, which now
+lives in `scenario.py` and is imported by `gui.py` — two copies of "which gains
+does this law read" would be two answers the moment a law changed). Printing
+all sixteen settable constants would bury the three that mattered, and listing
+`KI_ALT` under a cascade run would be actively *misleading*, since the cascade
+has no integrator.
+
+`(set)` marks a gain that was overridden, because `KP_ALT 18.0` alone cannot
+distinguish a deliberate choice from the default. And an override of a gain the
+law *cannot* read gets its own `unused overrides` row rather than being silently
+dropped — that means a sweep is varying something with no effect on the run,
+which is worth knowing before you draw conclusions from it.
+
+The panel widens the figure from 1210 px to 1496 px and leaves the plots' own
+proportions alone. `--no-config-panel` restores the plain figure.
+
 ### Thrusters that never fired are left off the plot
 
 Every thrust scene declares four RCS nozzles beside the main engine, and a
@@ -1734,4 +1770,6 @@ steps, and where each attaches:
 | **`--view` with no display** | run completes headless, exit 0, reason on stderr ✓ |
 | **idle thrusters hidden** | 4 RCS nozzles at exactly 0.0 N dropped; CSV keeps all ✓ |
 | **a nozzle that fires is kept** | one non-zero sample, or command alone, survives ✓ |
+| **figure states its provenance** | law, gains, metrics on the figure; 1496 px vs 1210 ✓ |
+| **only the law's own gains** | cascade run lists no `KI_ALT`/`KP_ALT`; inert overrides flagged ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

@@ -117,39 +117,11 @@ def find_runs(outdir=None):
     return runs
 
 
-def gains_used_by(law_name, module_name=CONTROLLER_MODULE):
-    """Which settable gains a control law actually reads.
-
-    Read off the law's own bytecode (the global names it references,
-    intersected with the module's _GAIN_NAMES whitelist) and followed one
-    level into helpers it calls. Same spirit as find_controllers: the GUI
-    discovers this instead of carrying a per-law table that would quietly
-    go stale the first time a law is edited.
-
-    An unknown law returns EVERY gain, so the failure mode is "nothing is
-    greyed out" rather than "the box you need is disabled".
-    """
-    import importlib
-    mod = importlib.import_module(module_name)
-    names = set(getattr(mod, "_GAIN_NAMES", ()))
-    fn = getattr(mod, law_name, None)
-    if not hasattr(fn, "__code__"):
-        return names
-    out, seen, stack = set(), set(), [fn]
-    while stack:
-        f = stack.pop()
-        if id(f) in seen:
-            continue
-        seen.add(id(f))
-        for n in f.__code__.co_names:
-            if n in names:
-                out.add(n)
-                continue
-            helper = getattr(mod, n, None)
-            if (hasattr(helper, "__code__")
-                    and getattr(helper, "__module__", None) == mod.__name__):
-                stack.append(helper)
-    return out
+# gains_used_by lives in scenario.py so the plotter can caption a figure
+# with the gains that actually applied. Imported here rather than
+# duplicated: two copies of "which gains does this law read" would be two
+# answers the moment a law changed. gui.py already imports scenario.
+from scenario import gains_used_by          # noqa: E402  (re-exported)
 
 
 def run_label(run):

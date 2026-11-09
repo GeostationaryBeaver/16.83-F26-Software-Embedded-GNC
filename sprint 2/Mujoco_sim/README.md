@@ -1658,6 +1658,56 @@ A stiff inner loop with a gentle outer one is the usual answer and the numbers
 agree. The same gains converge on `08_thrust_1D_smol` (1 kg, 10 N) to within
 0.00007 m, so they are not tuned to one vehicle.
 
+### Control rate, and why the cascade does not need two of them
+
+The driver steps physics at the scene's timestep (2 ms = 500 Hz) and calls the
+control law **every step by default**. `--control-hz` decimates that: the law
+runs every Nth step, and its last command persists in `data.ctrl` in between —
+a zero-order hold, which is what real hardware does. A flight computer at 50 Hz
+genuinely cannot correct a 500 Hz disturbance, so the decimated case is the
+realistic one.
+
+**`hover_cascade` runs both loops at the same rate.** A textbook cascade runs
+the inner loop several times per outer update, which is how the outer loop earns
+the right to treat the inner one as instantaneous. This law does not: both lines
+execute once per call. The separation is in the **gains**, not the timing —
+`KP_V = 15` against `KP_POS_V = 0.6` is a 25× stiffness ratio, so the rate loop
+settles far faster than the position loop commands it to move, which buys the
+same separation-of-timescales argument without a second timer. Measured,
+overshoot moves only 0.0518 → 0.0581 m between 500 Hz and 10 Hz.
+
+What a stateful law *does* need is **the real interval between its own calls**:
+
+```python
+dt = _tick_dt(state.t)      # measured, not assumed
+```
+
+`DT_NOMINAL_S` is only correct when the law runs every physics step. Dividing
+the setpoint difference by a nominal 2 ms while actually being called every
+20 ms overestimates the rate by 10×, and since that estimate is fed forward
+into `v_cmd`, it pinned the command at the `V_MAX_MPS` clamp:
+
+| `--control-hz` | peak descent, before | after |
+|---|---|---|
+| 500 (every step) | −0.1206 m/s | −0.1206 m/s |
+| 200 | −0.1763 | −0.1216 |
+| 50 | **−0.4223** | −0.1285 |
+| 20 | **−0.3785** | −0.1330 |
+| 10 | **−0.3198** | −0.1318 |
+
+against a commanded −0.1000 m/s throughout. The same bug ran the other way in
+`hover_pid`: accumulating a nominal 2 ms per call under-integrates by the
+decimation factor, silently scaling `KI_ALT` down. Its ramp lag is now flat
+across a 50× range of rates (−0.02314 at 500 Hz, −0.02308 at 10 Hz) where it
+had drifted before.
+
+`_tick_dt` falls back to `DT_NOMINAL_S` on its first call and refuses a repeated
+or rewound timestamp, so a reset cannot divide by zero. In `hover_pid` it is
+called **unconditionally**, even on a tick where anti-windup skips the
+accumulation — timing it inside the `if` would make the first tick after a
+saturated stretch measure the whole stretch and dump it into the integral at
+once.
+
 ### One gain a law cannot discover
 
 `THRUST_CEILING_N` defaults to 60.0 because `hover_pid`'s anti-windup needs to
@@ -1772,4 +1822,6 @@ steps, and where each attaches:
 | **a nozzle that fires is kept** | one non-zero sample, or command alone, survives ✓ |
 | **figure states its provenance** | law, gains, metrics on the figure; 1496 px vs 1210 ✓ |
 | **only the law's own gains** | cascade run lists no `KI_ALT`/`KP_ALT`; inert overrides flagged ✓ |
+| **rate independence** | 0.1 m/s descent honoured from 500 Hz to 10 Hz (was 0.42 at 50) ✓ |
+| **integral is rate-independent** | PID ramp lag −0.02314 → −0.02308 across 50× ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

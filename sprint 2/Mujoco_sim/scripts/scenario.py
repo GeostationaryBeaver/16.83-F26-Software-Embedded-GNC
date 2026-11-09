@@ -1506,6 +1506,46 @@ def run_selftest() -> int:
     truth("  run.json records the gains it flew",
           isinstance(meta.get("gains"), dict) and "KP_ALT" in meta["gains"])
 
+    # BOTH stateful laws must behave at a DECIMATED control rate. They carry
+    # per-call state (an integrator, a differenced setpoint), and anything
+    # that divides or accumulates over "a tick" has to use the REAL interval
+    # between its own calls, not the physics timestep. Before this was
+    # fixed, the cascade's setpoint-rate estimate was high by the decimation
+    # factor, which pinned v_cmd at the V_MAX_MPS clamp and drove a
+    # commanded 0.1 m/s descent at 0.42 m/s at 50 Hz.
+    print("  rate independence (--control-hz)")
+    for law, tol in (("hover_cascade", 0.06), ("hover_pid", 0.06)):
+        at = {}
+        for hz in (None, 50, 10):
+            extra = () if hz is None else ("--control-hz", str(hz))
+            at[hz] = fly(law, extra)
+        truth(f"  {law} runs at every rate",
+              all(v is not None for v in at.values()))
+        if all(v is not None for v in at.values()):
+            # The commanded descent must be honoured, not just "a descent".
+            worst = max(abs(v["peak_descent_rate_mps"]) for v in at.values())
+            truth(f"  {law} honours the 0.1 m/s descent at 10-500 Hz",
+                  worst < 0.1 + tol,
+                  "  ".join(f"{k or 500}Hz {v['peak_descent_rate_mps']:+.4f}"
+                            for k, v in at.items()))
+            # And the ramp lag must not scale with the rate, which is what
+            # an integrator accumulating a nominal dt would do.
+            lags = [v["descent_lag_mean_m"] for v in at.values()]
+            truth(f"  {law} ramp lag is rate-independent",
+                  max(lags) - min(lags) < 0.03,
+                  "  ".join(f"{x:+.5f}" for x in lags))
+    # The timing helper itself: it must not trust a bad timestamp.
+    _eh._t_prev = None
+    truth("  _tick_dt falls back to nominal on the first call",
+          _eh._tick_dt(1.0) == _eh.DT_NOMINAL_S)
+    truth("  _tick_dt then measures the real interval",
+          abs(_eh._tick_dt(1.02) - 0.02) < 1e-12)
+    truth("  _tick_dt refuses a repeated or rewound timestamp",
+          _eh._tick_dt(1.02) == _eh.DT_NOMINAL_S
+          and _eh._tick_dt(0.5) == _eh.DT_NOMINAL_S)
+    _eh.reset_state()
+    truth("  reset_state clears the timestamp too", _eh._t_prev is None)
+
     print("\n[8] --video records the run without changing it")
     # The whole value of recording a run is that it IS the run. If rendering
     # perturbed the physics the video would be of something else, so this

@@ -73,6 +73,27 @@ _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
 _integral = 0.0         # hover_pid's accumulator, in m*s
 _sp_prev = None         # hover_cascade: previous setpoint, for differencing
 _sp_rate = 0.0          # hover_cascade: filtered setpoint rate, m/s
+_t_prev = None          # last tick's state.t, for measuring the real interval
+
+
+def _tick_dt(t):
+    """Seconds since this law last ran, measured rather than assumed.
+
+    DT_NOMINAL_S is only correct when the law runs every physics step. With
+    --control-hz it runs less often, and a law that divides by the nominal
+    step then overestimates every rate by the decimation factor - measured,
+    the cascade's setpoint-rate estimate was 10x high at 50 Hz, which
+    pinned v_cmd at the V_MAX_MPS clamp and drove a 0.1 m/s commanded
+    descent at 0.42 m/s. Timing itself off state.t fixes that for any rate.
+
+    Returns DT_NOMINAL_S on the first call (no previous timestamp) and after
+    a reset, and refuses a non-positive interval, so a repeated or rewound
+    timestamp cannot divide by zero.
+    """
+    global _t_prev
+    dt = DT_NOMINAL_S if _t_prev is None else t - _t_prev
+    _t_prev = t
+    return dt if dt > 0.0 else DT_NOMINAL_S
 
 
 def _as_bool(value):
@@ -101,10 +122,11 @@ def reset_state():
     run left accumulated, and only the first result would be trustworthy.
     scenario.py calls this before every run.
     """
-    global _integral, _sp_prev, _sp_rate
+    global _integral, _sp_prev, _sp_rate, _t_prev
     _integral = 0.0
     _sp_prev = None
     _sp_rate = 0.0
+    _t_prev = None
 
 
 def set_gains(**kw):
@@ -347,6 +369,13 @@ def hover_pid(state):
     """
     global _integral
 
+    # The real interval since this law last ran. Taken UNCONDITIONALLY, even
+    # on a tick where anti-windup then skips the accumulation: _tick_dt
+    # advances the timestamp, so timing it inside the `if` would make the
+    # first tick after a saturated stretch measure the whole stretch and
+    # dump it into the integral in one go.
+    dt = _tick_dt(state.t)
+
     err_alt = _target_alt - state.pos[2]
     err_vel = -state.vel[2]
 
@@ -363,7 +392,11 @@ def hover_pid(state):
     hit_limit = unsaturated < 0.0 or unsaturated > THRUST_CEILING_N
 
     if not (ANTI_WINDUP and hit_limit):
-        _integral += err_alt * DT_NOMINAL_S
+        # Accumulate over the MEASURED interval, not DT_NOMINAL_S: under
+        # --control-hz the law runs less often, and adding a nominal 2 ms
+        # per call would under-integrate by the decimation factor, silently
+        # scaling KI_ALT down (10x at 50 Hz).
+        _integral += err_alt * dt
 
     return {"main": (unsaturated, np.array([0.0, 0.0, 1.0]))}
 
@@ -410,8 +443,32 @@ def hover_cascade(state):
     numbers agree: raising KP_V helps, raising KP_POS_V hurts. The same
     gains converge on 08_thrust_1D_smol (1 kg, 10 N) with no overshoot, so
     they are not tuned to one vehicle.
+
+    *** RATES. BOTH LOOPS RUN AT THE SAME RATE HERE. *** A textbook cascade
+    runs its inner loop several times per outer update - that is how the
+    outer loop gets to treat the inner one as instantaneous. This law does
+    not: both lines below execute once per call, so both run at whatever
+    rate the driver calls the law (every physics step by default, or
+    --control-hz). The separation that makes the cascade work is in the
+    GAINS, not the timing: KP_V = 15 against KP_POS_V = 0.6 is a 25x
+    stiffness ratio, so the rate loop settles far faster than the position
+    loop commands, which buys the same separation-of-timescales argument
+    without a second timer. Measured, it holds: overshoot moves 0.0518 ->
+    0.0581 m between 500 Hz and 10 Hz.
+
+    What the law DOES need is the real interval between its own calls, which
+    is why dt comes from _tick_dt(state.t) and not DT_NOMINAL_S. Dividing
+    the setpoint difference by a nominal 2 ms while actually being called
+    every 20 ms overestimates the rate 10x; that pinned v_cmd at the
+    V_MAX_MPS clamp and drove a commanded 0.1 m/s descent at 0.42 m/s. With
+    the measured interval, peak descent is -0.13 m/s at every rate from
+    500 Hz to 10 Hz.
     """
     global _sp_prev, _sp_rate
+
+    # The REAL interval since this law last ran, not the nominal timestep.
+    # Both loops run in this one call, so they share it - see RATES below.
+    dt = _tick_dt(state.t)
 
     sp = _target_alt
 
@@ -428,7 +485,7 @@ def hover_cascade(state):
     # a 1.6 m step over one 2 ms tick looks like 800 m/s.
     if _sp_prev is None:
         _sp_prev = sp
-    raw_rate = (sp - _sp_prev) / DT_NOMINAL_S
+    raw_rate = (sp - _sp_prev) / dt
     raw_rate = max(-V_MAX_MPS, min(V_MAX_MPS, raw_rate))   # ignore step spikes
     _sp_rate += SP_RATE_LPF * (raw_rate - _sp_rate)
     _sp_prev = sp

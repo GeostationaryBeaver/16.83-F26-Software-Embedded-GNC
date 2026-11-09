@@ -203,6 +203,8 @@ def build_scenario_cmd(params, python=None, script=None):
         cmd.append("--no-plot")
     if params.get("video"):
         cmd.append("--video")
+    if params.get("all_thrusters"):
+        cmd.append("--all-thrusters")
     return cmd
 
 
@@ -373,6 +375,7 @@ class App:
                                         self._used_gains(self.v_ctrl.get())),
                 "fixed_mass": bool(self.v_fixed.get()),
                 "video": bool(self.v_video.get()),
+                "all_thrusters": bool(self.v_allthr.get()),
                 "no_plot": False}
 
     @staticmethod
@@ -524,6 +527,14 @@ class App:
         ttk.Checkbutton(self.grid_params, text="record mp4",
                         variable=self.v_video
                         ).grid(row=0, column=9, sticky="w", padx=(10, 0))
+        # Off by default: on a vertical law the four RCS nozzles are exactly
+        # 0.0 N throughout, and plotting them drags the thrust axis down to
+        # include zero, squeezing the main engine's trace into a fifth of
+        # the panel. The CSV keeps every column either way.
+        self.v_allthr = tk.IntVar(value=0)
+        ttk.Checkbutton(self.grid_params, text="plot idle thrusters",
+                        variable=self.v_allthr
+                        ).grid(row=0, column=10, sticky="w", padx=(10, 0))
 
         # Gains, grouped by the law that reads them, in a labelled box per
         # group - so it is visible at a glance that KI_ALT does nothing to
@@ -1250,6 +1261,12 @@ def run_selftest() -> int:
                              python="PY", script="S")
     truth("a camera choice is passed through",
           "--camera" in cam and "chase" in cam)
+    # Idle thrusters are hidden by DEFAULT, so the flag must be absent
+    # unless the box is ticked.
+    truth("--all-thrusters absent by default", "--all-thrusters" not in cmd)
+    truth("--all-thrusters present when ticked",
+          "--all-thrusters" in build_scenario_cmd(
+              {**base, "all_thrusters": True}, python="PY", script="S"))
 
     print("\n[3] metric diffing")
     a = {"peak_altitude_m": 2.0, "overshoot_m": 0.05, "timeouts": []}

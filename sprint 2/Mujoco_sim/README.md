@@ -1185,11 +1185,40 @@ than flying a law it cannot command. `example_hover.set_target` sets both
 outputs/<scene>_<controller>_<YYYY-MM-DD_HHMMSS>/
     flight.csv    every tick: setpoint, pos, vel, both accelerations,
                   applied thrust per thruster, raw command per actuator, phase
-    flight.png    five stacked panels, phases shaded
+    flight.png    five stacked panels, phases shaded (six with a tank)
     flight.mp4    the run, rendered - only with --video
     run.json      profile constants, phase boundaries, metrics, timeouts
     summary.txt   the same metrics, readable
 ```
+
+### Thrusters that never fired are left off the plot
+
+Every thrust scene declares four RCS nozzles beside the main engine, and a
+vertical control law never touches them — measured, `rcs_px`, `rcs_nx`,
+`rcs_py` and `rcs_ny` are **exactly 0.0 N** for a whole run. They are dropped
+from the two thrust panels by default, and the figure says which ones it left
+out.
+
+This is legibility, not tidiness. Four flat lines on zero drag the y-axis down
+to include zero, which compresses the main engine's real 17.3–30.2 N trace into
+about a fifth of the panel; the legend also doubles up into two columns. With
+them gone the axis autoscales to the engine's own range and the thrust detail
+is readable.
+
+The test is **"did it fire"**, not "is it called `rcs`" — a law that does use
+the RCS still gets its nozzles plotted, and there is no name list to maintain.
+A thruster is kept if either its applied force or its command moved at any
+point in the run, so a nozzle commanded while saturated to zero thrust still
+shows (the command is the law's intent). If *nothing* fired, everything is
+kept: an empty panel would hide the finding that the engine never lit.
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover --all-thrusters
+```
+
+shows them all, as does the GUI's **plot idle thrusters** box. Either way
+`flight.csv` keeps **every** column — hiding is a plotting choice, and dropping
+the data would make a run unanalysable after the fact.
 
 ### Watching the run: `--video` and `--view`
 
@@ -1703,4 +1732,6 @@ steps, and where each attaches:
 | **frame cadence** | 593 frames measured vs 593 predicted from fps × duration ✓ |
 | **camera fallback** | `pad` → `chase` → free, by name, per scene ✓ |
 | **`--view` with no display** | run completes headless, exit 0, reason on stderr ✓ |
+| **idle thrusters hidden** | 4 RCS nozzles at exactly 0.0 N dropped; CSV keeps all ✓ |
+| **a nozzle that fires is kept** | one non-zero sample, or command alone, survives ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

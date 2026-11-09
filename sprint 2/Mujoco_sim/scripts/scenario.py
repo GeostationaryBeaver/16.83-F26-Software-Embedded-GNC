@@ -66,6 +66,16 @@ PHASE_TIMEOUT_S  = 30.0   # s, give up on a phase that never arrives
 PHASES = ("GROUND_SIT", "ASCEND", "HOLD_TARGET", "DESCEND", "GROUND_HOLD")
 STAMP_FMT = "%Y-%m-%d_%H%M%S"   # matches the 03 - Checks house convention
 
+# --- PLOTTING -------------------------------------------------------------
+THRUST_PLOT_TOL_N = 1e-9  # N. A thruster whose applied force and command
+                          #   both stay under this for the whole run counts
+                          #   as never fired and is left off the two thrust
+                          #   panels. Measured on a vertical law, the four
+                          #   RCS nozzles are exactly 0.0, so this only has
+                          #   to reject float dust - it is NOT a "small
+                          #   thrust" threshold, which would hide a real
+                          #   trace. --all-thrusters plots everything.
+
 # --- RENDERING (--video / --view) -----------------------------------------
 VIDEO_FPS      = 30      # frames per second in the written mp4
 VIDEO_WIDTH    = 1280    # px
@@ -391,12 +401,44 @@ def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust,
     return out
 
 
+def active_thrusters(rows, cols, names, tol=THRUST_PLOT_TOL_N):
+    """The thrusters that actually fired, for plotting.
+
+    Every thrust scene declares four RCS nozzles alongside the main engine,
+    and a vertical control law never touches them - measured, they are
+    EXACTLY 0.0 N for the whole run. Plotting them puts four flat lines on
+    the zero axis of two panels and four entries in each legend, which
+    crowds out the only trace that carries information.
+
+    The test is "did it fire", not "is it called rcs": a law that does use
+    the RCS still gets its nozzles plotted, with no list to maintain here.
+
+    Returns (kept, dropped). If NOTHING fired - a law that commanded zero
+    thrust throughout, or a timed-out run - everything is kept, because an
+    empty panel hides the finding that the engine never lit.
+    """
+    ix = {c: i for i, c in enumerate(cols)}
+    kept, dropped = [], []
+    for n in names:
+        fired = False
+        for key in (f"{n}_N", f"ctrl_{n}"):
+            j = ix.get(key)
+            if j is not None and any(abs(r[j]) > tol for r in rows):
+                fired = True
+                break
+        (kept if fired else dropped).append(n)
+    return (kept, dropped) if kept else (list(names), [])
+
+
 def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
-                names, show_mass=False):
+                names, show_mass=False, all_thrusters=False):
     """One stacked figure, shared time axis, phases shaded.
 
     Agg is selected before pyplot is imported because these runs are
     headless; picking a backend afterwards has no effect.
+
+    all_thrusters=True plots every nozzle including the ones that never
+    fired (--all-thrusters); by default those are dropped.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -405,6 +447,11 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     ix = {c: i for i, c in enumerate(cols)}
     col = lambda n: [r[ix[n]] for r in rows]
     t = col("time_s")
+
+    if all_thrusters:
+        plotted, hidden = list(names), []
+    else:
+        plotted, hidden = active_thrusters(rows, cols, names)
 
     n_panels = 6 if show_mass else 5
     fig, ax = plt.subplots(n_panels, 1, figsize=(11, 2.8 * n_panels),
@@ -453,15 +500,27 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     ax[2].set_ylabel("accel [m/s$^2$]")
     ax[2].legend(loc="upper right", fontsize=8)
 
-    for n in names:
+    ncol = max(1, len(plotted) // 2)
+    for n in plotted:
         ax[3].plot(t, col(f"{n}_N"), lw=1.3, label=n)
     ax[3].set_ylabel("thrust applied [N]")
-    ax[3].legend(loc="upper right", fontsize=8, ncol=max(1, len(names) // 2))
+    ax[3].legend(loc="upper right", fontsize=8, ncol=ncol)
 
-    for n in names:
+    for n in plotted:
         ax[4].plot(t, col(f"ctrl_{n}"), lw=1.3, label=f"ctrl_{n}")
     ax[4].set_ylabel("control input [N]")
-    ax[4].legend(loc="upper right", fontsize=8, ncol=max(1, len(names) // 2))
+    ax[4].legend(loc="upper right", fontsize=8, ncol=ncol)
+
+    # Say what was left out, so a missing nozzle is never a mystery. The CSV
+    # still has every column either way.
+    if hidden:
+        ax[4].text(0.005, 0.03,
+                   f"not plotted (never fired): {', '.join(hidden)}"
+                   f"   \u2014  --all-thrusters shows them",
+                   transform=ax[4].transAxes, fontsize=7.5, color="#333",
+                   ha="left", va="bottom",
+                   bbox=dict(facecolor="white", alpha=0.75, edgecolor="none",
+                             boxstyle="round,pad=0.25"))
 
     if show_mass:
         ax[5].plot(t, col("mass_kg"), color="#1f5fa8", lw=1.6,
@@ -581,6 +640,9 @@ def main() -> int:
     p.add_argument("--outdir", default=None,
                    help="parent directory for run dirs (default: outputs/)")
     p.add_argument("--no-plot", action="store_true", help="skip the figure")
+    p.add_argument("--all-thrusters", action="store_true",
+                   help="plot every thruster, including ones that never "
+                        "fired (by default those are left off)")
     p.add_argument("--video", action="store_true",
                    help="also record flight.mp4 into the run directory")
     p.add_argument("--view", action="store_true",
@@ -951,7 +1013,13 @@ def main() -> int:
     if not args.no_plot:
         plot_flight(rundir / "flight.png", logger.rows, cols, prof,
                     args.target, z_rest, args.descent_rate, thrusters.names,
-                    show_mass=tank is not None)
+                    show_mass=tank is not None,
+                    all_thrusters=args.all_thrusters)
+        _, _hidden = active_thrusters(logger.rows, cols, thrusters.names)
+        if _hidden and not args.all_thrusters:
+            print(f"plot         left off {len(_hidden)} thruster(s) that "
+                  f"never fired: {', '.join(_hidden)}"
+                  f"  (--all-thrusters to include them)")
 
     print()
     if prof.timeouts:
@@ -1275,11 +1343,14 @@ def run_selftest() -> int:
     # compares a recorded run against a headless one bit for bit.
     out8 = ROOT / "out" / "_selftest_video"
 
-    def fly_dir(law, extra=()):
+    def fly_dir(law, extra=(), plot=False):
         argv = [sys.executable, str(HERE / "scenario.py"),
                 "--controller", f"example_hover:{law}",
                 "--scene", "scenes/07_thrust_1D.xml", "--target", "1.0",
-                "--fixed-mass", "--no-plot", "--outdir", str(out8)] + list(extra)
+                "--fixed-mass", "--outdir", str(out8)]
+        if not plot:
+            argv.append("--no-plot")
+        argv += list(extra)
         r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
         if r.returncode != 0:
             return None, r
@@ -1333,6 +1404,54 @@ def run_selftest() -> int:
           Recorder._resolve_camera(_mjv, _mm, "nope")[1] == "chase")
     truth("camera falls back to the free camera when asked",
           Recorder._resolve_camera(_mjv, _mm, "free") == (-1, "free"))
+
+    print("\n[9] the plotter hides thrusters that never fired")
+    # Every thrust scene declares four RCS nozzles, and a vertical law never
+    # touches them: measured, EXACTLY 0.0 N for the whole run. Four flat
+    # lines on zero in two panels also drag the y-axis down to include zero,
+    # which compresses the main engine's 17-30 N trace into a fifth of the
+    # panel - so this is legibility, not just tidiness.
+    _cols = ["time_s", "main_N", "rcs_px_N", "ctrl_main", "ctrl_rcs_px"]
+    _rows = [[0.0, 19.4, 0.0, 19.4, 0.0], [0.1, 20.1, 0.0, 20.1, 0.0]]
+    keep, drop = active_thrusters(_rows, _cols, ["main", "rcs_px"])
+    truth("drops a thruster that is zero throughout",
+          keep == ["main"] and drop == ["rcs_px"], f"kept {keep}")
+    # A nozzle that fires ONCE must survive - the test is "did it fire",
+    # not "is it called rcs", so a law that uses the RCS still sees it.
+    _rows2 = [[0.0, 19.4, 0.0, 19.4, 0.0], [0.1, 20.1, 0.3, 20.1, 0.3]]
+    keep2, drop2 = active_thrusters(_rows2, _cols, ["main", "rcs_px"])
+    truth("keeps a thruster that fires even briefly",
+          keep2 == ["main", "rcs_px"] and not drop2, f"kept {keep2}")
+    # Only the COMMAND is non-zero (saturated to zero applied thrust, or a
+    # dry tank): still worth plotting, since the command is the law's intent.
+    _rows3 = [[0.0, 0.0, 0.0, 5.0, 0.0], [0.1, 0.0, 0.0, 5.0, 0.0]]
+    keep3, _ = active_thrusters(_rows3, _cols, ["main", "rcs_px"])
+    truth("keeps a thruster commanded but producing nothing",
+          "main" in keep3, f"kept {keep3}")
+    # If NOTHING fired, keep everything: an empty panel would hide the
+    # finding that the engine never lit.
+    _rows4 = [[0.0, 0.0, 0.0, 0.0, 0.0], [0.1, 0.0, 0.0, 0.0, 0.0]]
+    keep4, drop4 = active_thrusters(_rows4, _cols, ["main", "rcs_px"])
+    truth("keeps everything when no thruster fired at all",
+          keep4 == ["main", "rcs_px"] and not drop4, f"kept {keep4}")
+
+    # And end to end: the figure is written, and --all-thrusters still works.
+    d_hide, _ = fly_dir("hover", plot=True)
+    d_show, _ = fly_dir("hover", ["--all-thrusters"], plot=True)
+    truth("a plotted run writes flight.png",
+          d_hide is not None and (d_hide / "flight.png").exists())
+    truth("--all-thrusters also writes flight.png",
+          d_show is not None and (d_show / "flight.png").exists())
+    # The CSV must keep every column either way - hiding is a PLOT choice,
+    # and dropping the data would make a run unanalysable after the fact.
+    if d_hide is not None:
+        head = (d_hide / "flight.csv").read_text().splitlines()[0]
+        truth("  the CSV still carries every thruster column",
+              all(f"{n}_N" in head for n in
+                  ("main", "rcs_px", "rcs_nx", "rcs_py", "rcs_ny")))
+        truth("  hiding changes only the figure, not the metrics",
+              json.loads((d_hide / "run.json").read_text())["metrics"]
+              == json.loads((d_show / "run.json").read_text())["metrics"])
 
     # --view with no display must lose the WINDOW, not the run. glfw aborts
     # the process at import time when DISPLAY is unset, which is earlier

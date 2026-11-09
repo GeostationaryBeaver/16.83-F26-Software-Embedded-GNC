@@ -11,3 +11,6 @@ out/
 # Scenario runs: one timestamped directory per flight, regenerate with
 # scripts/scenario.py
 outputs/
+
+# MuJoCo writes this on some GL paths (seen with --video on osmesa)
+MUJOCO_LOG.TXT

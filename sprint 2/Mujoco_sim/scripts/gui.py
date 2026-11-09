@@ -190,6 +190,7 @@ def build_scenario_cmd(params, python=None, script=None):
                       ("--isp", "isp"),
                       ("--gravity", "gravity"),
                       ("--gains", "gains"),
+                      ("--camera", "camera"),
                       ("--label", "label")):
         if fixed and key in MASS_FIELDS:
             continue      # no tank is built, so these would be ignored
@@ -200,6 +201,8 @@ def build_scenario_cmd(params, python=None, script=None):
         cmd.append("--fixed-mass")
     if params.get("no_plot"):
         cmd.append("--no-plot")
+    if params.get("video"):
+        cmd.append("--video")
     return cmd
 
 
@@ -369,6 +372,7 @@ class App:
                 "gains": self.gain_spec(self.g_vars,
                                         self._used_gains(self.v_ctrl.get())),
                 "fixed_mass": bool(self.v_fixed.get()),
+                "video": bool(self.v_video.get()),
                 "no_plot": False}
 
     @staticmethod
@@ -513,6 +517,13 @@ class App:
                         variable=self.v_fixed,
                         command=self._update_mass_fields
                         ).grid(row=0, column=8, sticky="w")
+        # Recording costs about 10 s of wall time on an 18 s profile and
+        # cannot change the flight (scenario.py's selftest asserts the CSV
+        # is byte-identical), so it is a plain opt-in checkbox.
+        self.v_video = tk.IntVar(value=0)
+        ttk.Checkbutton(self.grid_params, text="record mp4",
+                        variable=self.v_video
+                        ).grid(row=0, column=9, sticky="w", padx=(10, 0))
 
         # Gains, grouped by the law that reads them, in a labelled box per
         # group - so it is visible at a glance that KI_ALT does nothing to
@@ -1227,6 +1238,18 @@ def run_selftest() -> int:
           hasattr(App, "_update_gain_fields")
           and hasattr(App, "_update_mass_fields")
           and hasattr(App, "_on_mass_mode"))
+
+    print("\n[2d] the record-mp4 checkbox")
+    truth("--video absent when unchecked", "--video" not in cmd)
+    vid = build_scenario_cmd({**base, "video": True}, python="PY", script="S")
+    truth("--video present when checked", "--video" in vid)
+    truth("--video is scenario-only, never sent to the worker",
+          "--video" not in build_worker_cmd({**base, "video": True}, 1,
+                                            python="PY", script="W"))
+    cam = build_scenario_cmd({**base, "video": True, "camera": "chase"},
+                             python="PY", script="S")
+    truth("a camera choice is passed through",
+          "--camera" in cam and "chase" in cam)
 
     print("\n[3] metric diffing")
     a = {"peak_altitude_m": 2.0, "overshoot_m": 0.05, "timeouts": []}

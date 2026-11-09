@@ -29,6 +29,15 @@ control law had to change to honour it.
 
 Outputs land in outputs/<scene>_<controller>_<stamp>/ as flight.csv,
 flight.png, run.json and summary.txt.
+
+SEEING IT. Two flags, because "render the run" means two different things:
+
+    --video            write flight.mp4 into the run directory
+    --view             watch it live in the interactive viewer
+
+Both fly the IDENTICAL profile through the identical loop, so what you watch
+is the run that is logged - not a re-flight that might diverge. --video is
+headless and safe for a batch; --view needs a display and paces to real time.
 """
 import argparse
 import datetime as _dt
@@ -56,6 +65,28 @@ PHASE_TIMEOUT_S  = 30.0   # s, give up on a phase that never arrives
 
 PHASES = ("GROUND_SIT", "ASCEND", "HOLD_TARGET", "DESCEND", "GROUND_HOLD")
 STAMP_FMT = "%Y-%m-%d_%H%M%S"   # matches the 03 - Checks house convention
+
+# --- RENDERING (--video / --view) -----------------------------------------
+VIDEO_FPS      = 30      # frames per second in the written mp4
+VIDEO_WIDTH    = 1280    # px
+VIDEO_HEIGHT   = 720     # px
+VIDEO_CAMERA   = "pad"   # scene camera to film from. Tried in order:
+                         #   this name, then "chase", then the free camera.
+                         #
+                         #   "pad" is a FIXED world camera, and that choice
+                         #   matters more than it sounds. "chase" rides the
+                         #   craft (mode="trackcom"), which pins the vehicle
+                         #   to the same screen position - rendered, a 2 m
+                         #   climb looks like a stationary capsule with a
+                         #   sliding floor, and the altitude the whole
+                         #   profile is about is the one thing you cannot
+                         #   see. Verified by looking at both. Use
+                         #   --camera chase when the thrust plume or the
+                         #   attitude is the subject instead.
+# Measured offscreen on osmesa (software GL): 18.5 ms/frame at 1280x720,
+# 16.4 at 960x540, 13.3 at 640x360. So a full 18 s profile costs about 10 s
+# of extra wall time at 720p - cheap enough that full quality is the default
+# rather than something to opt into.
 
 
 def vertical_indices(model, mujoco, body_id):
@@ -447,6 +478,91 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     return path
 
 
+def run_directory(parent, name):
+    """Create and return the directory for one run.
+
+    The stamp resolves to one second, so two runs started inside the same
+    second collide - and mkdir(exist_ok=True) would quietly overwrite the
+    first one's files. Suffix instead, so no run can destroy another.
+
+    Split out of main() because --video has to open its writer BEFORE the
+    flight while everything else is written after it, and two copies of this
+    logic could disagree about where a run lives.
+    """
+    rundir = parent / name
+    if rundir.exists():
+        for n in range(2, 100):
+            alt = parent / f"{name}_{n}"
+            if not alt.exists():
+                rundir = alt
+                break
+    rundir.mkdir(parents=True, exist_ok=False)
+    return rundir
+
+
+class Recorder:
+    """Writes an mp4 of a scenario run, filmed from the scene's chase camera.
+
+    Deliberately NOT a second simulation. It is handed the same mjData the
+    control loop is stepping, so the video is the run that produced the CSV.
+    A re-flight would be a different run: a controller with an integrator,
+    or any state at all, need not reproduce itself tick for tick.
+
+    Frames are taken every Nth physics step, not every step: at a 2 ms
+    timestep a full 18 s profile is ~9000 steps, and 30 fps needs ~540.
+    """
+
+    def __init__(self, mujoco, model, path, dt, fps=VIDEO_FPS,
+                 width=VIDEO_WIDTH, height=VIDEO_HEIGHT, camera=VIDEO_CAMERA):
+        import imageio
+        self.mujoco = mujoco
+        self.path = path
+        self.fps = fps
+        self.every = max(1, round((1.0 / fps) / dt))
+        self.frames = 0
+        self.renderer = mujoco.Renderer(model, height=height, width=width)
+        self.camera, self.camera_name = self._resolve_camera(mujoco, model,
+                                                             camera)
+        self.camera_requested = camera
+        # macro_block_size=1 keeps the requested resolution; ffmpeg otherwise
+        # rounds up to a multiple of 16 and silently changes the dimensions.
+        self.writer = imageio.get_writer(str(path), fps=fps,
+                                         macro_block_size=1)
+
+    @staticmethod
+    def _resolve_camera(mujoco, model, name):
+        """(id, name) for the camera to film from, falling back by name.
+
+        Tries the requested name, then "chase", then the free camera (-1).
+        Falling back rather than failing: a scene with no cameras at all
+        should still record, just framed less usefully.
+        """
+        if name in (None, "", -1, "free"):
+            return -1, "free"
+        for candidate in (name, "chase"):
+            cid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                    candidate)
+            if cid >= 0:
+                return cid, candidate
+        return -1, "free"
+
+    def maybe_frame(self, data, step_i):
+        """Capture if this step lands on a frame boundary."""
+        if step_i % self.every:
+            return
+        # update_scene reads the CURRENT data. Omit it and every frame is
+        # identical - which looks like a frozen video, not an error.
+        self.renderer.update_scene(data, camera=self.camera)
+        self.writer.append_data(self.renderer.render())
+        self.frames += 1
+
+    def close(self):
+        try:
+            self.writer.close()
+        finally:
+            self.renderer.close()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -465,6 +581,20 @@ def main() -> int:
     p.add_argument("--outdir", default=None,
                    help="parent directory for run dirs (default: outputs/)")
     p.add_argument("--no-plot", action="store_true", help="skip the figure")
+    p.add_argument("--video", action="store_true",
+                   help="also record flight.mp4 into the run directory")
+    p.add_argument("--view", action="store_true",
+                   help="also watch the run live in the interactive viewer "
+                        "(needs a display; paces to real time)")
+    p.add_argument("--video-fps", type=int, default=VIDEO_FPS,
+                   help=f"frame rate for --video (default {VIDEO_FPS})")
+    p.add_argument("--video-size", default=f"{VIDEO_WIDTH}x{VIDEO_HEIGHT}",
+                   metavar="WxH", help="frame size for --video")
+    p.add_argument("--camera", default=VIDEO_CAMERA,
+                   help=f"scene camera to film from (default "
+                        f"{VIDEO_CAMERA!r}; 'free' for the free camera)")
+    p.add_argument("--view-speed", type=float, default=1.0, metavar="X",
+                   help="real-time multiplier for --view (2 = double speed)")
     p.add_argument("--gravity", default=None, help="preset or m/s^2")
     p.add_argument("--propellant", type=float, default=None,
                    help="usable propellant, kg (default: propellant.py's "
@@ -490,7 +620,35 @@ def main() -> int:
         return run_selftest()
 
     # Headless throughout; and MUJOCO_GL must be set before mujoco imports.
-    os.environ.setdefault("MUJOCO_GL", "osmesa")
+    # --view is the exception: an interactive window needs a real GL context,
+    # and osmesa (software, offscreen) cannot provide one. Setting this after
+    # mujoco is imported has no effect, which is why it happens here.
+    #
+    # The display is checked FIRST because glfw aborts the whole process at
+    # import time when DISPLAY is unset ("could not initialize GLFW", exit 1)
+    # - earlier than any try/except around launch_passive could catch, so a
+    # --view run on a headless box lost the run itself rather than just the
+    # window. Falling back to a headless run keeps the data.
+    if args.view and not (os.environ.get("DISPLAY")
+                          or os.environ.get("WAYLAND_DISPLAY")):
+        print("note: no DISPLAY, so --view cannot open a window; running "
+              "headless.\n      Use --video to get a file you can watch "
+              "instead.", file=sys.stderr)
+        args.view = False
+    if args.view:
+        os.environ["MUJOCO_GL"] = os.environ.get("MUJOCO_GL_VIEW", "glfw")
+    else:
+        os.environ.setdefault("MUJOCO_GL", "osmesa")
+
+    try:
+        vid_w, vid_h = (int(x) for x in str(args.video_size).lower().split("x"))
+    except ValueError:
+        print(f"error: --video-size wants WxH, got {args.video_size!r}",
+              file=sys.stderr)
+        return 1
+    if args.video_fps <= 0:
+        print("error: --video-fps must be positive", file=sys.stderr)
+        return 1
 
     from fly import GRAVITY_PRESETS, load_controller, resolve_scene, control_tick
 
@@ -618,6 +776,46 @@ def main() -> int:
     print(f"profile     sit {GROUND_SIT_S}s -> {args.target} m -> hold "
           f"{HOLD_AT_TARGET_S}s -> down at {args.descent_rate} m/s -> "
           f"sit {HOLD_AT_GROUND_S}s")
+
+    # The run directory exists BEFORE the flight, because --video streams
+    # frames into it as the run happens rather than buffering 540 frames of
+    # RGB in memory and writing them at the end.
+    stamp = _dt.datetime.now().strftime(STAMP_FMT)
+    fn = args.controller.replace(":", "_").replace(".", "_")
+    name = f"{scene.stem}_{fn}_{stamp}" + (f"_{args.label}" if args.label else "")
+    parent = pathlib.Path(args.outdir) if args.outdir else (ROOT / "outputs")
+    rundir = run_directory(parent, name)
+
+    rec = None
+    if args.video:
+        try:
+            rec = Recorder(mujoco, model, rundir / "flight.mp4", dt,
+                           fps=args.video_fps, width=vid_w, height=vid_h,
+                           camera=args.camera)
+        except Exception as e:
+            # A missing ffmpeg or an unavailable GL backend must not cost the
+            # run: the CSV and metrics are the point, the video is a bonus.
+            print(f"video       UNAVAILABLE ({type(e).__name__}: {e})")
+            rec = None
+        else:
+            fell_back = rec.camera_name != rec.camera_requested
+            print(f"video       {vid_w}x{vid_h} @ {args.video_fps} fps from "
+                  f"camera {rec.camera_name!r}, every {rec.every} steps"
+                  + (f"   <-- no {rec.camera_requested!r} camera in this scene"
+                     if fell_back else ""))
+
+    viewer = None
+    if args.view:
+        try:
+            import mujoco.viewer
+            viewer = mujoco.viewer.launch_passive(model, data)
+        except Exception as e:
+            print(f"viewer      UNAVAILABLE ({type(e).__name__}: {e})")
+            print("            (needs a display; --video works headless)")
+            viewer = None
+        else:
+            print(f"viewer      live at {args.view_speed:g}x real time; "
+                  f"close the window to stop early")
     print()
 
     max_wall = (GROUND_SIT_S + HOLD_AT_TARGET_S + HOLD_AT_GROUND_S
@@ -626,56 +824,79 @@ def main() -> int:
     step_i = 0
     last_phase = prof.phase
 
-    while not prof.done and data.time < max_wall:
-        z = float(data.xpos[body_id][2])
-        vz = float(data.qvel[vi])
-        setpoint = prof.update(data.time, z, vz)
-        setter(setpoint)
+    # --view only. The profile is driven by SIM time, so pacing is purely a
+    # playback concern: sleep until the wall clock catches up, and sync the
+    # window at ~60 Hz rather than every 2 ms tick. Importantly the loop is
+    # still stepped by this scenario, not by the viewer, so the run is
+    # identical to a headless one - the viewer only watches.
+    import time as _time
+    paced = viewer is not None
+    wall_start = _time.perf_counter()
+    next_sync = 0.0
+    sync_interval = 1.0 / 60.0
 
-        if step_i % ctrl_every == 0:
-            state = control_tick(mujoco, model, data, thrusters, body_id,
-                                 controller, None)
-        else:
-            state = CraftState.from_data(model, data, body_id)
+    try:
+        while not prof.done and data.time < max_wall:
+            if viewer is not None and not viewer.is_running():
+                print("  viewer closed - stopping early")
+                break
+            z = float(data.xpos[body_id][2])
+            vz = float(data.qvel[vi])
+            setpoint = prof.update(data.time, z, vz)
+            setter(setpoint)
 
-        # Propellant depletion runs at PHYSICS rate, not control rate: mass
-        # leaves the vehicle continuously while the thrust is applied, not
-        # only on the ticks the control law happens to run.
-        if tank is not None:
-            tank.enforce_cutoff(data)   # a dry tank produces nothing
-            tank.update(data, dt)       # mdot -> mass + inertia + mj_setConst
+            if step_i % ctrl_every == 0:
+                state = control_tick(mujoco, model, data, thrusters, body_id,
+                                     controller, None)
+            else:
+                state = CraftState.from_data(model, data, body_id)
 
-        accel = (vz - vz_prev) / dt
-        logger.record_tick(state, thrusters.magnitudes(data), setpoint, accel,
-                           float(data.qacc[vi]), last_phase, list(data.ctrl),
-                           float(model.body_mass[body_id]),
-                           tank.propellant_kg if tank is not None else 0.0)
-        vz_prev = vz
+            # Propellant depletion runs at PHYSICS rate, not control rate: mass
+            # leaves the vehicle continuously while the thrust is applied, not
+            # only on the ticks the control law happens to run.
+            if tank is not None:
+                tank.enforce_cutoff(data)   # a dry tank produces nothing
+                tank.update(data, dt)       # mdot -> mass + inertia + mj_setConst
 
-        if prof.phase != last_phase:
-            print(f"  t={data.time:6.2f}s  {last_phase:>11s} -> "
-                  f"{prof.phase:<11s}  z={z:7.4f}  vz={vz:+7.4f}")
-            last_phase = prof.phase
+            accel = (vz - vz_prev) / dt
+            logger.record_tick(state, thrusters.magnitudes(data), setpoint, accel,
+                               float(data.qacc[vi]), last_phase, list(data.ctrl),
+                               float(model.body_mass[body_id]),
+                               tank.propellant_kg if tank is not None else 0.0)
+            vz_prev = vz
 
-        mujoco.mj_step(model, data)
-        step_i += 1
+            if prof.phase != last_phase:
+                print(f"  t={data.time:6.2f}s  {last_phase:>11s} -> "
+                      f"{prof.phase:<11s}  z={z:7.4f}  vz={vz:+7.4f}")
+                last_phase = prof.phase
+
+            # Capture BEFORE stepping, so frame 0 is the start of the run
+            # rather than one tick into it.
+            if rec is not None:
+                rec.maybe_frame(data, step_i)
+
+            mujoco.mj_step(model, data)
+            step_i += 1
+
+            if paced:
+                wall = _time.perf_counter() - wall_start
+                if wall >= next_sync:
+                    viewer.sync()
+                    next_sync = wall + sync_interval
+                ahead = data.time / max(args.view_speed, 1e-9) - wall
+                if ahead > 0:
+                    _time.sleep(min(ahead, sync_interval))
+    finally:
+        # Always close both, even on a timeout or an exception: an unclosed
+        # imageio writer leaves a truncated, unplayable mp4.
+        if rec is not None:
+            rec.close()
+        if viewer is not None:
+            viewer.close()
 
     # ---- outputs ---------------------------------------------------------
-    stamp = _dt.datetime.now().strftime(STAMP_FMT)
-    fn = args.controller.replace(":", "_").replace(".", "_")
-    name = f"{scene.stem}_{fn}_{stamp}" + (f"_{args.label}" if args.label else "")
-    parent = pathlib.Path(args.outdir) if args.outdir else (ROOT / "outputs")
-    rundir = parent / name
-    # The stamp resolves to one second, so two runs started inside the same
-    # second collide - and mkdir(exist_ok=True) would quietly overwrite the
-    # first one's files. Suffix instead, so no run can destroy another.
-    if rundir.exists():
-        for n in range(2, 100):
-            alt = parent / f"{name}_{n}"
-            if not alt.exists():
-                rundir = alt
-                break
-    rundir.mkdir(parents=True, exist_ok=False)
+    # The directory was created before the flight (the recorder writes into
+    # it), so this just uses it.
 
     cols = logger.header
     csv_path = logger.save(rundir / "flight.csv")
@@ -708,6 +929,11 @@ def main() -> int:
         "phase_boundaries": [{"t": t, "from": a, "to": b}
                              for t, a, b in prof.boundaries],
         "metrics": m, "ticks": len(logger), "completed": prof.done,
+        "video": None if rec is None else {
+            "file": rec.path.name, "fps": rec.fps, "frames": rec.frames,
+            "camera": rec.camera_name,
+            "size": [vid_w, vid_h],
+        },
         "mujoco": mujoco.__version__,
     }
     (rundir / "run.json").write_text(json.dumps(meta, indent=2))
@@ -736,6 +962,9 @@ def main() -> int:
           f"(commanded {m['commanded_descent_rate_mps']:+.4f})")
     print(f"returned to {m['final_altitude_m']:.4f} m "
           f"(ground {z_rest:.4f}, err {m['return_err_m']:.5f})")
+    if rec is not None and rec.path.exists():
+        print(f"video        {rec.frames} frames -> {rec.path.name} "
+              f"({rec.path.stat().st_size / 1e6:.1f} MB)")
     print(f"\nwrote {len(logger)} ticks -> {rundir}")
     return 0
 
@@ -1039,6 +1268,87 @@ def run_selftest() -> int:
     meta = json.loads(newest.read_text())
     truth("  run.json records the gains it flew",
           isinstance(meta.get("gains"), dict) and "KP_ALT" in meta["gains"])
+
+    print("\n[8] --video records the run without changing it")
+    # The whole value of recording a run is that it IS the run. If rendering
+    # perturbed the physics the video would be of something else, so this
+    # compares a recorded run against a headless one bit for bit.
+    out8 = ROOT / "out" / "_selftest_video"
+
+    def fly_dir(law, extra=()):
+        argv = [sys.executable, str(HERE / "scenario.py"),
+                "--controller", f"example_hover:{law}",
+                "--scene", "scenes/07_thrust_1D.xml", "--target", "1.0",
+                "--fixed-mass", "--no-plot", "--outdir", str(out8)] + list(extra)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None, r
+        return max(out8.glob("*/"), key=lambda q: q.stat().st_mtime), r
+
+    d_plain, _ = fly_dir("hover")
+    d_video, r_video = fly_dir("hover", ["--video"])
+    truth("a --video run completes", d_video is not None,
+          "" if d_video else (r_video.stderr or "")[-160:])
+    if d_video is not None:
+        mp4 = d_video / "flight.mp4"
+        truth("  flight.mp4 lands in the run directory", mp4.exists(),
+              f"{mp4.stat().st_size / 1e6:.2f} MB" if mp4.exists() else "missing")
+        meta_v = json.loads((d_video / "run.json").read_text())
+        vid = meta_v.get("video") or {}
+        truth("  run.json describes the video",
+              vid.get("file") == "flight.mp4" and vid.get("frames", 0) > 100,
+              f"{vid.get('frames')} frames @ {vid.get('fps')} fps, "
+              f"camera {vid.get('camera')!r}")
+        # The default camera must be the FIXED one. Filmed from "chase"
+        # (mode="trackcom") the craft stays at the same screen position and
+        # the altitude - the only thing the profile is about - is invisible.
+        truth("  films from the fixed 'pad' camera, not the tracking one",
+              vid.get("camera") == "pad", str(vid.get("camera")))
+        # Frame cadence: 30 fps over a ~20 s profile, not one frame a tick.
+        n_ticks = meta_v["ticks"]
+        expect = n_ticks / round((1.0 / VIDEO_FPS) / meta_v["timestep_s"])
+        truth("  frame count matches fps x duration",
+              abs(vid.get("frames", 0) - expect) <= 2,
+              f"{vid.get('frames')} vs {expect:.0f} expected")
+        if d_plain is not None:
+            meta_p = json.loads((d_plain / "run.json").read_text())
+            truth("  metrics identical to the headless run",
+                  meta_p["metrics"] == meta_v["metrics"])
+            truth("  tick count identical",
+                  meta_p["ticks"] == meta_v["ticks"],
+                  f"{meta_p['ticks']} vs {meta_v['ticks']}")
+            import hashlib
+            h = [hashlib.sha256((d / "flight.csv").read_bytes()).hexdigest()
+                 for d in (d_plain, d_video)]
+            truth("  flight.csv byte-identical (recording cannot perturb)",
+                  h[0] == h[1], h[0][:16])
+        truth("  a run without --video records no video",
+              json.loads((d_plain / "run.json").read_text())["video"] is None)
+    # The camera falls back by name rather than failing on a scene with none.
+    import mujoco as _mjv
+    _mm = _mjv.MjModel.from_xml_path(str(ROOT / "scenes" / "07_thrust_1D.xml"))
+    truth("camera resolves 'pad' when present",
+          Recorder._resolve_camera(_mjv, _mm, "pad")[1] == "pad")
+    truth("camera falls back to 'chase' when 'pad' is absent",
+          Recorder._resolve_camera(_mjv, _mm, "nope")[1] == "chase")
+    truth("camera falls back to the free camera when asked",
+          Recorder._resolve_camera(_mjv, _mm, "free") == (-1, "free"))
+
+    # --view with no display must lose the WINDOW, not the run. glfw aborts
+    # the process at import time when DISPLAY is unset, which is earlier
+    # than any try/except around the viewer can reach.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    r_nd = subprocess.run(
+        [sys.executable, str(HERE / "scenario.py"),
+         "--controller", "example_hover:hover",
+         "--scene", "scenes/07_thrust_1D.xml", "--target", "1.0",
+         "--fixed-mass", "--no-plot", "--view", "--outdir", str(out8)],
+        capture_output=True, text=True, timeout=900, env=env)
+    truth("--view without a display still completes the run",
+          r_nd.returncode == 0, f"exit {r_nd.returncode}")
+    truth("  and says why the window did not open",
+          "no DISPLAY" in r_nd.stderr)
 
     print()
     print(bar)

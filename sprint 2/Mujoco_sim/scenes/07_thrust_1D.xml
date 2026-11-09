@@ -76,6 +76,19 @@
     <light pos="0 0 6" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="20 20 0.1" material="grid_mat"/>
 
+    <!-- A FIXED camera in the world, for recording a hop. The chase
+         camera rides the craft (mode="trackcom"), which keeps the vehicle
+         pinned to the same screen position - so a 2 m climb renders as a
+         stationary capsule with a sliding floor, and the altitude, the one
+         thing the profile is about, becomes invisible. This one does not
+         move, so height on screen IS height. fovy="65" (up from the 45
+         default) is what holds 0 - 4 m in frame: pulling the camera back
+         instead does not work, because backing away raises it too and the
+         craft leaves the top of the shot at the same altitude.
+         Select with `--camera pad`, or press ']' in the viewer. -->
+    <camera name="pad" pos="5.2 -6.0 1.9"
+            xyaxes="0.75 0.66 0 -0.14 0.16 0.98" fovy="65"/>
+
     <!-- Spawn clear of the floor. The capsule below has half-length
          0.25 and radius 0.15, so its bottom sits 0.40 m BELOW this
          body origin - at pos="0 0 0" it starts 0.4 m inside the floor

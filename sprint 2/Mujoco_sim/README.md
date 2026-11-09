@@ -1186,9 +1186,61 @@ outputs/<scene>_<controller>_<YYYY-MM-DD_HHMMSS>/
     flight.csv    every tick: setpoint, pos, vel, both accelerations,
                   applied thrust per thruster, raw command per actuator, phase
     flight.png    five stacked panels, phases shaded
+    flight.mp4    the run, rendered - only with --video
     run.json      profile constants, phase boundaries, metrics, timeouts
     summary.txt   the same metrics, readable
 ```
+
+### Watching the run: `--video` and `--view`
+
+Two flags, because "render the run" means two things:
+
+```bash
+# write flight.mp4 into the run directory (headless, safe in a batch)
+uv run python scripts/scenario.py --controller example_hover:hover_cascade --video
+
+# watch it live in the interactive viewer (needs a display)
+uv run python scripts/scenario.py --controller example_hover:hover_cascade --view
+uv run python scripts/scenario.py --controller example_hover:hover --view --view-speed 4
+```
+
+They can be combined, and both can be driven from the GUI's **record mp4** box.
+
+**Neither one re-flies the run.** The recorder and the viewer are handed the
+same `mjData` the control loop is already stepping, so the video is the flight
+that produced the CSV. A re-flight would be a *different* run — a law with an
+integrator, or any state at all, need not reproduce itself tick for tick. The
+self-test holds this to the strongest available standard: a recorded run's
+`flight.csv` is **byte-identical** to a headless one's, same sha256.
+
+| flag | default | notes |
+|---|---|---|
+| `--video` | off | `flight.mp4` in the run directory |
+| `--video-fps` | 30 | frames per second |
+| `--video-size` | `1280x720` | `WxH` |
+| `--camera` | `pad` | then `chase`, then the free camera |
+| `--view` | off | needs a display |
+| `--view-speed` | 1.0 | `4` = four times real time |
+
+Cost, measured offscreen on osmesa: **18.5 ms/frame** at 720p, 16.4 at 960×540,
+13.3 at 640×360 — so about 10 s of extra wall time on a full 18 s profile. Cheap
+enough that full quality is the default rather than something to opt into.
+
+**Why the default camera is `pad` and not `chase`.** The thrust scenes ship a
+`chase` camera with `mode="trackcom"`, which rides the craft. Filmed from it, a
+2 m climb renders as a *stationary* capsule with a sliding floor — the altitude,
+the one thing the whole profile is about, is the one thing you cannot see. I
+recorded both and looked at them before choosing. `pad` is a fixed world
+camera, so height on screen is height. Its `fovy="65"` (up from the 45 default)
+is what holds 0–4 m in frame; pulling the camera back instead does not work,
+because backing away raises it too and the craft leaves the top of the shot at
+the same altitude. Use `--camera chase` when the plume or the attitude is the
+subject.
+
+**`--view` on a machine with no display** loses the window, not the run. GLFW
+aborts the process at *import* time when `DISPLAY` is unset — earlier than any
+`try/except` around the viewer could catch — so the display is checked before
+MuJoCo is imported, and the run continues headless with a note on stderr.
 
 `outputs/` is gitignored. The CSV keeps **both** applied thrust (`main_N`) and
 raw command (`ctrl_main`) because they differ whenever the actuator saturates —
@@ -1647,4 +1699,8 @@ steps, and where each attaches:
 | **gain attribution** | derived from bytecode; a law absent from the table still resolves ✓ |
 | **greyed gains dropped** | `KI_ALT=99` in a greyed box never reaches a cascade run ✓ |
 | **fixed mass drops tank flags** | no `--propellant/--dry-mass/--isp`; `run.json` null ✓ |
+| **`--video` cannot perturb a run** | recorded vs headless `flight.csv` byte-identical ✓ |
+| **frame cadence** | 593 frames measured vs 593 predicted from fps × duration ✓ |
+| **camera fallback** | `pad` → `chase` → free, by name, per scene ✓ |
+| **`--view` with no display** | run completes headless, exit 0, reason on stderr ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

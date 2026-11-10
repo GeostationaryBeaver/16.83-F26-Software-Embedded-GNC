@@ -629,11 +629,128 @@ class App:
         if run is None:
             self.v_status.set("no runs yet")
             return
+        # Interactive first, the static PNG as the fallback. The figure is
+        # REBUILT from flight.csv + run.json rather than read off the PNG,
+        # because scenario.py runs as a subprocess and its figure object
+        # died with it - see scenario.load_run.
+        try:
+            self._show_figure_window(run["path"], run["name"])
+            return
+        except Exception as e:
+            self.v_status.set(f"interactive plot unavailable: "
+                              f"{type(e).__name__}")
         png = run["path"] / "flight.png"
         if not png.is_file():
             self.v_status.set("that run has no flight.png")
             return
         self._show_png_window(png, run["name"])
+
+    @staticmethod
+    def _select_tk_backend():
+        """Put matplotlib on TkAgg before any figure is built.
+
+        scenario.plot_flight only forces Agg when the current backend is
+        still Agg or template, so this has to run FIRST - otherwise the
+        figure is built for a canvas that cannot be drawn in a window.
+        Selecting a backend after pyplot is imported is a no-op, which is
+        why this is called before scenario is imported here.
+        """
+        import matplotlib
+        if matplotlib.get_backend().lower() not in ("tkagg",):
+            matplotlib.use("TkAgg", force=True)
+        # Tk draws the canvas before the window has its real geometry, and
+        # again from a deferred callback during teardown - at both moments
+        # the canvas is near-zero and constrained_layout warns that the axes
+        # "collapsed to zero". Measured once the window settles: the panels
+        # sit at 0.13-0.18 of figure height from 1200x400 up to 1200x1100,
+        # so this is transient noise, not a sizing problem. Filtered here
+        # rather than around one draw() because the deferred draws happen
+        # inside tkinter's dispatcher, out of reach of any local guard.
+        import warnings
+        warnings.filterwarnings(
+            "ignore", category=UserWarning,
+            message=".*constrained_layout not applied.*")
+
+    def _figure_window(self, title, height_frac=0.92):
+        """A Toplevel sized from the SCREEN, not from the figure.
+
+        The figure is 11x14 in (5 panels) or 11x16.8 in (6), which at 110 dpi
+        is taller than any display. A packed canvas resizes with the window
+        and constrained_layout reflows, so the panels just get shorter and
+        zoom is how detail is reached - no scrollbar needed.
+        """
+        win = self.tk.Toplevel(self.root)
+        win.title(title)
+        h = int(self.root.winfo_screenheight() * height_frac)
+        w = int(min(self.root.winfo_screenwidth() * 0.9, h * 1.05))
+        win.geometry(f"{w}x{h}")
+        return win
+
+    def _embed_figure(self, fig, master):
+        """Put a matplotlib figure in a Tk frame with the real toolbar.
+
+        Imported here, not at module scope, so a matplotlib problem cannot
+        stop the GUI from starting - open_plot falls back to the PNG.
+
+        A TkAgg canvas is pure Tk with no GL, so it is safe in this process.
+        A MuJoCo GLFW viewer is NOT - see the heap-corruption note at the top
+        of this file - which is why the interactive figure lives here and not
+        in a process that opens a viewer.
+        """
+        from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                       NavigationToolbar2Tk)
+        frame = self.tk.Frame(master)
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        toolbar = NavigationToolbar2Tk(canvas, frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="top", fill="x")
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        canvas.draw()
+        self._bind_scroll_zoom(canvas, fig)
+        return frame, canvas
+
+    @staticmethod
+    def _bind_scroll_zoom(canvas, fig, factor=1.25):
+        """Scroll wheel zooms the TIME axis about the cursor.
+
+        The toolbar's box-zoom is awkward on a tall stack of time series -
+        you want to narrow the time window, not draw a rectangle in one
+        panel. Scrolling scales xlim about the cursor instead, and because
+        every panel shares the x axis one handler moves them all.
+        """
+        def on_scroll(event):
+            if event.inaxes is None:
+                return
+            step = event.step if event.step else (
+                1.0 if event.button == "up" else -1.0)
+            scale = (1.0 / factor) if step > 0 else factor
+            x = event.xdata
+            if x is None:
+                return
+            lo, hi = event.inaxes.get_xlim()
+            event.inaxes.set_xlim(x - (x - lo) * scale,
+                                  x + (hi - x) * scale)
+            canvas.draw_idle()
+        canvas.mpl_connect("scroll_event", on_scroll)
+
+    def _show_figure_window(self, run_path, title):
+        """The interactive view of one run."""
+        self._select_tk_backend()
+        import scenario
+        fig, _info = scenario.figure_for_run(run_path)
+        win = self._figure_window(title)
+        frame, _canvas = self._embed_figure(fig, win)
+        frame.pack(fill="both", expand=True)
+        # Release the figure when the window goes, or every open leaks one.
+        def _close():
+            try:
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception:
+                pass
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _close)
+        return win
 
     def _show_png_window(self, png, title):
         tk = self.tk
@@ -718,6 +835,57 @@ class App:
         if len(sel) != 2:
             self.v_cmp_status.set(f"pick exactly 2 (you picked {len(sel)})")
             return
+        try:
+            self._show_both_interactive(sel)
+            return
+        except Exception as e:
+            self.v_cmp_status.set(f"interactive compare unavailable: "
+                                  f"{type(e).__name__}")
+        self._show_both_png(sel)
+
+    def _show_both_interactive(self, sel):
+        """Two runs side by side, panning and zooming TOGETHER.
+
+        The config panel is dropped here: at half width each it would eat
+        the space the traces need, and the Compare tab already prints the
+        gains as text. Linking the time axes is the point - comparing two
+        tunings means looking at the same instant in both.
+        """
+        self._select_tk_backend()
+        import scenario
+        tk = self.tk
+        win = self._figure_window("side by side", height_frac=0.9)
+        figs = []
+        for col, run in enumerate(sel):
+            frame = tk.Frame(win)
+            frame.grid(row=0, column=col, sticky="nsew")
+            win.grid_columnconfigure(col, weight=1)
+            tk.Label(frame, text=("A: " if col == 0 else "B: ") + run["name"],
+                     font=("TkDefaultFont", self.base)).pack()
+            fig, _ = scenario.figure_for_run(run["path"], config=False)
+            figs.append(fig)
+            inner, _canvas = self._embed_figure(fig, frame)
+            inner.pack(fill="both", expand=True)
+        win.grid_rowconfigure(0, weight=1)
+        # sharex ACROSS figures is allowed, and is what makes the two pan
+        # as one. Within a figure the panels already share x, so linking the
+        # first axis of each links everything.
+        if len(figs) == 2 and figs[0].axes and figs[1].axes:
+            figs[0].axes[0].sharex(figs[1].axes[0])
+
+        def _close():
+            try:
+                import matplotlib.pyplot as plt
+                for f in figs:
+                    plt.close(f)
+            except Exception:
+                pass
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _close)
+        return win
+
+    def _show_both_png(self, sel):
+        """The original static fallback, kept for when matplotlib cannot."""
         tk = self.tk
         from PIL import Image, ImageTk
         win = tk.Toplevel(self.root)
@@ -1335,6 +1503,150 @@ def run_selftest() -> int:
     truth("LineReader catches BlockingIOError only",
           "except BlockingIOError:" in lsrc
           and "except Exception:\n            pass" not in lsrc)
+
+    print("\n[8] the interactive figure view")
+    # The toolbar is the whole point: pan, box-zoom and Home are what make a
+    # plot interrogable. Asserted so a matplotlib release that renames or
+    # drops one is caught here rather than by a user with a dead button.
+    try:
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        tools = [t[0] for t in NavigationToolbar2Tk.toolitems if t[0]]
+        truth("the toolbar offers Home, Pan, Zoom and Save",
+              {"Home", "Pan", "Zoom", "Save"} <= set(tools),
+              ", ".join(tools))
+    except Exception as e:
+        truth("the toolbar offers Home, Pan, Zoom and Save", False,
+              f"{type(e).__name__}: {e}")
+
+    # Scroll-to-zoom, exercised with no window: the handler is pure axis
+    # arithmetic, so a stub canvas and a stub event reach all of it.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+
+    class _StubCanvas:
+        def __init__(self):
+            self.handler = None
+            self.draws = 0
+        def mpl_connect(self, name, fn):
+            assert name == "scroll_event", name
+            self.handler = fn
+        def draw_idle(self):
+            self.draws += 1
+
+    class _StubEvent:
+        def __init__(self, ax, step, xdata):
+            self.inaxes, self.step, self.xdata = ax, step, xdata
+            self.button = "up" if step > 0 else "down"
+
+    zfig, zax = _plt.subplots()
+    zax.set_xlim(0.0, 10.0)
+    cv = _StubCanvas()
+    App._bind_scroll_zoom(cv, zfig, factor=2.0)
+    truth("scroll-to-zoom binds a scroll_event handler", cv.handler is not None)
+    cv.handler(_StubEvent(zax, 1.0, 2.0))
+    lo, hi = zax.get_xlim()
+    # factor 2.0, one notch up -> the window halves, and the point under the
+    # cursor must not move: that is what makes scrolling feel like zooming
+    # rather than scrolling.
+    truth("  scrolling up narrows the time window",
+          abs((hi - lo) - 5.0) < 1e-9, f"{lo:.3f}..{hi:.3f}")
+    truth("  the point under the cursor stays put",
+          abs(lo - 1.0) < 1e-9 and abs(hi - 6.0) < 1e-9,
+          f"{lo:.3f}..{hi:.3f}")
+    cv.handler(_StubEvent(zax, -1.0, 2.0))
+    lo2, hi2 = zax.get_xlim()
+    truth("  scrolling down is its exact inverse",
+          abs(lo2 - 0.0) < 1e-9 and abs(hi2 - 10.0) < 1e-9,
+          f"{lo2:.3f}..{hi2:.3f}")
+    truth("  each notch asks for a redraw", cv.draws == 2, f"{cv.draws} draws")
+    # Outside the axes, and on a NaN cursor position, it must do nothing
+    # rather than raise - scrolling over the figure margin is normal.
+    before = zax.get_xlim()
+    cv.handler(_StubEvent(None, 1.0, 2.0))
+    cv.handler(_StubEvent(zax, 1.0, None))
+    truth("  a scroll off the axes changes nothing",
+          zax.get_xlim() == before and cv.draws == 2)
+    _plt.close(zfig)
+
+    # Panels within one figure already share x, so one scroll moves them all.
+    # This is what makes a single handler enough.
+    import scenario as _scn
+    runs_av = find_runs()
+    plotted = [r for r in runs_av if (r["path"] / "flight.csv").is_file()]
+    if plotted:
+        f1, _ = _scn.figure_for_run(plotted[0]["path"], config=False)
+        truth("a rebuilt figure has the full panel stack",
+              len(f1.axes) >= 5, f"{len(f1.axes)} axes")
+        f1.axes[0].set_xlim(3.0, 7.0)
+        truth("  every panel shares the time axis",
+              all(tuple(a.get_xlim()) == (3.0, 7.0) for a in f1.axes[:5]),
+              ", ".join(f"{a.get_xlim()[0]:.0f}-{a.get_xlim()[1]:.0f}"
+                        for a in f1.axes[:5]))
+        if len(plotted) >= 2:
+            f2, _ = _scn.figure_for_run(plotted[1]["path"], config=False)
+            # sharex across SEPARATE figures is what links the Compare pair.
+            f1.axes[0].sharex(f2.axes[0])
+            f1.axes[0].set_xlim(2.0, 4.0)
+            truth("  two compared figures pan as one",
+                  tuple(f2.axes[0].get_xlim()) == (2.0, 4.0),
+                  f"{f2.axes[0].get_xlim()}")
+            _plt.close(f2)
+        _plt.close(f1)
+
+    # Backend ordering. _select_tk_backend has to run BEFORE scenario is
+    # imported and a figure built, because plot_flight only leaves the
+    # backend alone if something interactive is already selected, and
+    # matplotlib.use after pyplot has drawn is a no-op.
+    import inspect as _insp
+    for meth in ("_show_figure_window", "_show_both_interactive"):
+        body = _insp.getsource(getattr(App, meth))
+        i_sel = body.find("_select_tk_backend")
+        i_imp = body.find("import scenario")
+        truth(f"{meth} selects TkAgg before importing scenario",
+              0 <= i_sel < i_imp, f"{i_sel} < {i_imp}")
+        truth(f"  {meth} closes its figure(s) on window close",
+              "WM_DELETE_WINDOW" in body and "plt.close" in body)
+
+    # The static path is kept precisely so a matplotlib failure degrades to
+    # a picture instead of to nothing.
+    for meth, fb in (("open_plot", "_show_png_window"),
+                     ("show_both", "_show_both_png")):
+        body = _insp.getsource(getattr(App, meth))
+        truth(f"{meth} falls back to the PNG if the figure fails",
+              "except Exception" in body and fb in body)
+    truth("flight.png is still written on every run",
+          "fig.savefig(path" in (HERE / "scenario.py").read_text())
+    # The teardown warning is filtered in _select_tk_backend, not around a
+    # single draw(): the draws that trip it are deferred into tkinter's own
+    # dispatcher, where no local catch_warnings can reach them.
+    sel_src = _insp.getsource(App._select_tk_backend)
+    truth("the transient constrained_layout warning is filtered",
+          "constrained_layout not applied" in sel_src
+          and "filterwarnings" in sel_src)
+    # Panels at a realistic window size are nowhere near collapsed, which
+    # is why the warning is noise and not a sizing bug worth chasing.
+    if plotted:
+        fchk, _ = _scn.figure_for_run(plotted[0]["path"], config=False)
+        fchk.set_size_inches(12 / 1.1, 7 / 1.1)
+        fchk.canvas.draw()
+        hs = [a.get_position().height for a in fchk.axes[:5]]
+        truth("  panels stay well clear of zero height at 1200x700",
+              min(hs) > 0.05, f"min {min(hs):.3f} of figure height")
+        _plt.close(fchk)
+    # One reader, in scenario.py next to the code that wrote the files, so
+    # the writer and the reader of a run cannot drift apart. The GUI only
+    # ever asks whether the CSV exists; parsing it is scenario.load_run's
+    # job, and a second parser here would be the drift.
+    app_src = gsrc.split("def run_selftest")[0]
+    csv_uses = [ln.strip() for ln in app_src.splitlines()
+                if "flight.csv" in ln and not ln.lstrip().startswith("#")]
+    truth("the GUI does not parse flight.csv itself",
+          "import csv" not in app_src
+          and all(".is_file()" in ln for ln in csv_uses),
+          "; ".join(csv_uses) or "never named outside comments")
+    truth("  parsing lives in scenario.load_run",
+          "import csv as _csv" in (HERE / "scenario.py").read_text())
 
     print()
     print(bar)

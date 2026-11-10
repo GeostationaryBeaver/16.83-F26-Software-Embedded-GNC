@@ -1121,7 +1121,7 @@ to a timestamped directory, so two runs can be put side by side.
 ```bash
 uv run python scripts/scenario.py --controller example_hover:hover
 uv run python scripts/scenario.py --controller example_hover:hover --target 3.5
-uv run python scripts/scenario.py --selftest        # 19 numeric checks
+uv run python scripts/scenario.py --selftest        # 118 numeric checks
 ```
 
 ### The profile
@@ -1414,7 +1414,7 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 ```bash
 uv run python scripts/gui.py            # the control panel
 uv run python scripts/gui.py --demo     # bigger fonts, less clutter
-uv run python scripts/gui.py --selftest # 31 headless checks
+uv run python scripts/gui.py --selftest # 79 headless checks
 ```
 
 Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
@@ -1424,6 +1424,65 @@ diffs two of them metric by metric and shows both figures side by side.
 **Live** launches MuJoCo's native viewer with sliders for target altitude and
 propellant, which is the tab to demo from — you get full orbit, zoom and
 `ctrl+drag`.
+
+### The figures are interactive
+
+**Open plot** opens a live matplotlib window, not a picture: the standard
+toolbar (**Home, Back, Forward, Pan, Zoom, Subplots, Save**) plus the scroll
+wheel zooming the time axis about the cursor. A 20-second run logs ~10 000
+ticks, and a 50 ms thrust transient or the exact instant a valve crosses its
+dead zone is in that data but invisible in a 1210 × 1540 px image squashed to
+fit a screen. Now you can box-zoom into the ASCEND phase, pan along it and
+press **Home** to get back.
+
+Every panel shares the time axis, so one scroll moves all five (or six, with
+the mass row) together. On **Compare**, `show_both` links the *two figures*
+to each other as well — `sharex` works across separate figures — so panning
+one run pans the other, which is the only way to read two tunings at the same
+instant.
+
+**The figure is rebuilt, not reopened.** The GUI launches `scenario.py` as a
+subprocess, so the figure object dies with the run that drew it and cannot be
+handed back. `scenario.load_run()` reads it back from what the run already
+saved, and `figure_for_run()` hands the GUI a live figure:
+
+| `plot_flight` needs | comes from |
+|---|---|
+| `rows`, `cols` | `flight.csv` (`phase` is the one string column) |
+| `names` | the `*_N` columns in that header |
+| `target`, `descent_rate` | `run.json` → `profile.*` |
+| `z_ground` | `run.json` → `ground_height_m` |
+| `show_mass` | `run.json` → `propellant is not None` |
+| the config panel | `run.json` → `controller`, `gains`, `metrics` |
+
+So nothing extra is captured during a flight, and the rebuild is the *same*
+figure — pinned by a selftest that rebuilds a real run and asserts the size
+matches its `flight.png` exactly, 1496 × 1540 px with the config panel and
+1210 wide without.
+
+**`flight.png` is still written on every run.** The interactive view is an
+extra way to read the same data, not a replacement: a run stays
+self-contained for a report, and it is the fallback if the live figure cannot
+be built for any reason — `open_plot` and `show_both` both fall back to the
+old image viewer rather than showing nothing.
+
+Two details worth knowing. `plot_flight` forces Agg **only when nothing
+interactive is already selected**, because headless runs need Agg but the GUI
+selects TkAgg before calling in and stomping that would hand it a figure no
+canvas can draw. And a TkAgg canvas is pure Tk with no GL, which is why the
+interactive figure is safe here — a MuJoCo GLFW viewer in the same process is
+not, as the two-process section below explains.
+
+The window is sized from the *screen*, not the figure: at 110 dpi a six-panel
+figure is 16.8 in tall, taller than any display. A packed canvas resizes with
+the window and `constrained_layout` reflows, so the panels just get shorter
+(measured 0.13–0.18 of figure height from 1200 × 400 up to 1200 × 1100) and
+zoom is how detail is reached — no scrollbar. Tk does draw the canvas once
+before the window has its real geometry, and again from a deferred callback
+during teardown; at both moments `constrained_layout` warns that the axes
+"collapsed to zero". That warning is filtered in `_select_tk_backend`, since
+the deferred draws happen inside tkinter's own dispatcher where no local
+`catch_warnings` can reach them.
 
 ### Why it is two processes
 

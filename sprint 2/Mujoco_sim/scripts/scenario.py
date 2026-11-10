@@ -519,11 +519,22 @@ def config_lines(controller, scene, gains, overridden, profile, mass_note,
 
 def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
                 names, show_mass=False, all_thrusters=False,
-                config=None):
+                config=None, save=True):
     """One stacked figure, shared time axis, phases shaded.
 
+    Returns (path, fig). path is None when save=False, fig is None when it
+    is True - the saved path closes its figure, the unsaved one hands it
+    over.
+
     Agg is selected before pyplot is imported because these runs are
-    headless; picking a backend afterwards has no effect.
+    headless; picking a backend afterwards has no effect. But it is only
+    FORCED when no interactive backend is already live: the GUI selects
+    TkAgg before calling in, and stomping that would hand it a figure no
+    canvas can draw.
+
+    save=False keeps the figure OPEN and writes nothing, which is what an
+    embedded canvas needs - plt.close() is exactly the wrong thing to do to
+    a figure somebody is about to render.
 
     all_thrusters=True plots every nozzle including the ones that never
     fired (--all-thrusters); by default those are dropped.
@@ -533,7 +544,8 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     what produced it.
     """
     import matplotlib
-    matplotlib.use("Agg")
+    if matplotlib.get_backend().lower() in ("agg", "template"):
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     ix = {c: i for i, c in enumerate(cols)}
@@ -677,9 +689,124 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
                 y -= pitch
             y -= pitch * 0.55
 
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
-    return path
+    # dpi=110 against the 11 in / 13.6 in figure widths is what makes the
+    # PNG 1210 px / 1496 px wide, which the selftest pins. Do not change
+    # either without updating that assertion.
+    if save:
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+        return path, None
+    return None, fig
+
+
+def load_run(path):
+    """Read a finished run back off disk, into what plot_flight() wants.
+
+    The GUI launches this script as a SUBPROCESS, so the figure object dies
+    with the run that drew it and cannot be handed back. An interactive view
+    therefore has to rebuild - and everything needed is already saved, so
+    nothing extra has to be captured during a flight:
+
+        flight.csv   rows and columns; `phase` is the one string column,
+                     every other cell is a 6-significant-digit float
+        run.json     target, descent rate, ground height, mass mode, and
+                     the gains/metrics the config caption is built from
+
+    Returns a dict ready to splat into plot_flight(). Raises FileNotFoundError
+    if there is no CSV, because without it there is nothing to draw; a
+    missing or corrupt run.json is tolerated instead, matching the way
+    gui.find_runs() already survives one.
+    """
+    import csv as _csv
+
+    path = pathlib.Path(path)
+    csv_path = path / "flight.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"{path.name} has no flight.csv to plot")
+
+    with open(csv_path, newline="") as fh:
+        reader = _csv.reader(fh)
+        cols = next(reader)
+        rows = []
+        for line in reader:
+            if not line:
+                continue
+            rows.append([v if c == "phase" else float(v)
+                         for v, c in zip(line, cols)])
+
+    meta = {}
+    meta_path = path / "run.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            meta = {}          # same tolerance as gui.find_runs()
+
+    prof = meta.get("profile") or {}
+    # Thruster names come from the CSV's own header, so a run flown with a
+    # different scene still plots without being told what was on it.
+    names = [c[:-2] for c in cols if c.endswith("_N")]
+
+    # The config caption, rebuilt so an interactive figure carries the same
+    # provenance as the PNG. gains_used_by lives in this module, so the
+    # "only the gains this law reads" rule applies here too.
+    config = None
+    if meta:
+        law = str(meta.get("controller", "")).split(":")[-1]
+        try:
+            used = gains_used_by(law) if law else None
+        except Exception:
+            used = None
+        z_ground = meta.get("ground_height_m")
+        prop = meta.get("propellant")
+        if prop:
+            mass_note = (f"{prop.get('dry_mass_kg', 0):g} + "
+                         f"{prop.get('propellant_initial_kg', 0):g} kg, "
+                         f"Isp {prop.get('isp_s', 0):g} s")
+        else:
+            mass_note = "fixed mass"
+        profile_note = ""
+        if z_ground is not None and prof.get("target_alt_m") is not None:
+            profile_note = (f"{z_ground:.3f} -> {prof['target_alt_m']:g} m, "
+                            f"down at {prof.get('descent_rate_mps', 0):g} m/s")
+        config = config_lines(
+            controller=meta.get("controller", "?"),
+            scene=meta.get("scene", "?"),
+            gains=meta.get("gains") or {},
+            overridden=meta.get("gains_overridden"),
+            profile=profile_note,
+            mass_note=mass_note,
+            metrics=meta.get("metrics"),
+            gain_names=used)
+
+    return {
+        "rows": rows,
+        "cols": cols,
+        "names": names,
+        "target": prof.get("target_alt_m", 0.0),
+        "z_ground": meta.get("ground_height_m", 0.0),
+        "descent_rate": prof.get("descent_rate_mps", 0.0),
+        "show_mass": meta.get("propellant") is not None,
+        "config": config,
+        "meta": meta,
+        "name": path.name,
+    }
+
+
+def figure_for_run(path, all_thrusters=False, config=True):
+    """A run directory -> a live matplotlib figure, nothing written.
+
+    The single seam the GUI uses. Keeping it here rather than in gui.py puts
+    all knowledge of the run layout next to the code that wrote it, so the
+    two cannot drift apart.
+    """
+    run = load_run(path)
+    _, fig = plot_flight(
+        None, run["rows"], run["cols"], None,
+        run["target"], run["z_ground"], run["descent_rate"], run["names"],
+        show_mass=run["show_mass"], all_thrusters=all_thrusters,
+        config=run["config"] if config else None, save=False)
+    return fig, run
 
 
 def run_directory(parent, name):
@@ -1796,6 +1923,131 @@ def run_selftest() -> int:
           r_nd.returncode == 0, f"exit {r_nd.returncode}")
     truth("  and says why the window did not open",
           "no DISPLAY" in r_nd.stderr)
+
+    print("\n[11] a finished run rebuilds into a live figure")
+    # The GUI runs this script as a subprocess, so the figure object dies
+    # with the run. An interactive view has to REBUILD from what was saved -
+    # which only works if flight.csv + run.json really are sufficient. These
+    # checks pin that, and pin that the rebuild is the same figure.
+    if d_cfg is not None and d_bare is not None:
+        run = load_run(d_cfg)
+        truth("load_run recovers the full table",
+              len(run["rows"]) > 1000 and len(run["rows"][0]) == len(run["cols"]),
+              f"{len(run['rows'])} rows x {len(run['cols'])} cols")
+        # phase is the one string column; everything else must be a number,
+        # or the plotter's arithmetic silently concatenates strings.
+        ixp = run["cols"].index("phase")
+        r0 = run["rows"][0]
+        truth("  phase stays a string, every other cell is a float",
+              isinstance(r0[ixp], str)
+              and all(isinstance(v, float)
+                      for i, v in enumerate(r0) if i != ixp),
+              f"phase={r0[ixp]!r}")
+        truth("  thruster names come from the CSV header",
+              run["names"] and all(f"{n}_N" in run["cols"] for n in run["names"]),
+              ", ".join(run["names"]))
+        truth("  the config caption is rebuilt from run.json",
+              run["config"] and dict(run["config"]).get("controller", "")
+              .endswith("hover_cascade"))
+
+        # The load-bearing claim: the rebuilt figure is the SAME figure. Size
+        # is the sharpest cheap proxy - panel count, the config panel and the
+        # mass row all move it - and 110 dpi is what savefig used.
+        from PIL import Image
+        for d, want_cfg, want_px in ((d_cfg, True, w_cfg), (d_bare, False, w_bare)):
+            fig, _ = figure_for_run(d, config=want_cfg)
+            got = int(round(fig.get_size_inches()[0] * 110))
+            truth(f"  rebuilt figure matches flight.png ({'with' if want_cfg else 'no'} panel)",
+                  got == want_px, f"{got}px vs {want_px}px")
+            hpx = int(round(fig.get_size_inches()[1] * 110))
+            truth("    and its height too",
+                  hpx == Image.open(d / "flight.png").size[1],
+                  f"{hpx}px")
+            import matplotlib.pyplot as _plt
+            _plt.close(fig)
+
+        # save=False must write NOTHING and hand the figure over. Closing it
+        # is exactly the wrong thing to do to a figure about to be rendered.
+        before = sorted(q.name for q in d_bare.iterdir())
+        rb = load_run(d_bare)
+        pth, fig = plot_flight(
+            d_bare / "must_not_appear.png", rb["rows"], rb["cols"], None,
+            rb["target"], rb["z_ground"], rb["descent_rate"], rb["names"],
+            show_mass=rb["show_mass"], config=None, save=False)
+        truth("  save=False returns the figure and no path",
+              pth is None and fig is not None)
+        truth("    and writes nothing",
+              sorted(q.name for q in d_bare.iterdir()) == before)
+        import matplotlib.pyplot as _plt
+        truth("    and leaves the figure open",
+              fig.number in _plt.get_fignums())
+        _plt.close(fig)
+
+    # The awkward runs. A missing CSV is fatal - there is nothing to draw -
+    # but a missing or corrupt run.json must only cost the caption, the same
+    # tolerance gui.find_runs() already has.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        empty = pathlib.Path(td) / "no_csv"
+        empty.mkdir()
+        try:
+            load_run(empty)
+            truth("a run with no flight.csv raises", False, "no exception")
+        except FileNotFoundError as e:
+            truth("a run with no flight.csv raises", True, str(e)[-40:])
+        if d_bare is not None:
+            broke = pathlib.Path(td) / "broken"
+            broke.mkdir()
+            (broke / "flight.csv").write_text((d_bare / "flight.csv").read_text())
+            (broke / "run.json").write_text("{not json at all")
+            rbk = load_run(broke)
+            truth("  a corrupt run.json costs the caption, not the plot",
+                  rbk["config"] is None and len(rbk["rows"]) > 1000,
+                  f"{len(rbk['rows'])} rows, config={rbk['config']}")
+            nojs = pathlib.Path(td) / "nojson"
+            nojs.mkdir()
+            (nojs / "flight.csv").write_text((d_bare / "flight.csv").read_text())
+            rnj = load_run(nojs)
+            truth("  a missing run.json does the same",
+                  rnj["config"] is None and rnj["show_mass"] is False)
+            # --fixed-mass writes propellant: null, so the mass row must be
+            # dropped - plotting an empty 6th panel would be a lie.
+            truth("  a --fixed-mass run rebuilds without the mass panel",
+                  load_run(d_bare)["show_mass"] is False)
+
+    # Backend isolation, in subprocesses because a backend choice is global
+    # and the selftest itself has already fixed one. Agg must still be
+    # forced when nothing interactive is live (this is what keeps the
+    # no-DISPLAY run above working), and must NOT be forced over a backend
+    # the caller already picked - the GUI selects TkAgg before calling in.
+    if d_bare is not None:
+        probe = (
+            "import sys, matplotlib\n"
+            "pre = sys.argv[1]\n"
+            "if pre:\n"
+            "    matplotlib.use(pre)\n"
+            "sys.path.insert(0, sys.argv[2])\n"
+            "import scenario\n"
+            "scenario.figure_for_run(sys.argv[3], config=False)\n"
+            "print(matplotlib.get_backend())\n")
+        env_nd = {k: v for k, v in os.environ.items()
+                  if k not in ("DISPLAY", "WAYLAND_DISPLAY", "MPLBACKEND")}
+        args_nd = [str(HERE), str(d_bare)]
+        r_agg = subprocess.run([sys.executable, "-c", probe, ""] + args_nd,
+                               capture_output=True, text=True, timeout=300,
+                               env=env_nd)
+        truth("headless, plot_flight still selects Agg",
+              r_agg.stdout.strip().lower() == "agg",
+              r_agg.stdout.strip() or (r_agg.stderr or "")[-120:])
+        # "pdf" stands in for TkAgg here: it is non-interactive so it works
+        # with no DISPLAY, but it is not Agg, so if the guard were an
+        # unconditional matplotlib.use("Agg") this check would fail.
+        r_keep = subprocess.run([sys.executable, "-c", probe, "pdf"] + args_nd,
+                                capture_output=True, text=True, timeout=300,
+                                env=env_nd)
+        truth("  but does not stomp a backend the caller chose",
+              r_keep.stdout.strip().lower() == "pdf",
+              r_keep.stdout.strip() or (r_keep.stderr or "")[-120:])
 
     print()
     print(bar)

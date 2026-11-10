@@ -67,6 +67,7 @@ DT_NOMINAL_S = 0.002    # s, the integration step for the accumulator. Equal
 _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
                "KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF",
                "THRUST_CEILING_N", "OUTER_HZ",
+               "K_VALVE", "ACCEL_NOISE_SIGMA", "ACCEL_LPF", "GROUND_FREEZE",
                "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
                "MAX_CANT")
 
@@ -79,7 +80,40 @@ OUTER_HZ = 25.0         # Hz, how often hover_cascade_2rate updates its
 _integral = 0.0         # hover_pid's accumulator, in m*s
 _sp_prev = None         # hover_cascade: previous setpoint, for differencing
 _sp_rate = 0.0          # hover_cascade: filtered setpoint rate, m/s
+# --- VALVE TRACKER (hover_valve) -----------------------------------------
+# The inner loop that drives measured thrust to the demanded thrust by
+# moving a valve, without knowing the valve's curve. See scripts/valve.py
+# for the plant and the state-space argument.
+K_VALVE = 0.05          # valve travel per second per Newton of error. The
+                        #   loop eigenvalue is -K*gamma, so with the ball
+                        #   curve's gamma spanning 9.1..292.8 N/unit this
+                        #   one number gives a 32x spread in bandwidth -
+                        #   which is the point of the sweep, not a flaw to
+                        #   tune away. Discrete bound: K*gamma*T < 2, i.e.
+                        #   K < 2.56 at T=2ms and gamma=391.
+ACCEL_NOISE_SIGMA = 0.0 # m/s^2, 1-sigma noise on the measured acceleration.
+                        #   0 = a perfect sensor. Nonzero is how the
+                        #   does-this-survive-real-hardware question gets
+                        #   answered, since the estimate is differentiated.
+ACCEL_LPF = 1.0         # 0..1 smoothing on a_meas; 1.0 = no filter. Needed
+                        #   once ACCEL_NOISE_SIGMA is nonzero, because
+                        #   differencing velocity amplifies noise.
+GROUND_FREEZE = True    # stop integrating while the floor is holding us up.
+                        #   *** NOT OPTIONAL ON THE PAD. *** Measured on
+                        #   07_thrust_1D: resting on the floor, F = m(a+g)
+                        #   reads vehicle WEIGHT no matter what is commanded
+                        #   (0 N commanded -> 19.440 N measured, error
+                        #   +19.440). Airborne the same estimator is exact
+                        #   (30 N -> 30.000, 60 N -> 60.000). So below-weight
+                        #   demands on the ground give a permanently negative
+                        #   error and wind the valve shut.
+
 _t_prev = None          # last tick's state.t, for measuring the real interval
+_valve_t_prev = None    # the tracker's OWN clock - see _valve_tick_dt
+_valve_u = 0.0          # the tracker's integrator: the valve position, and
+                        #   at convergence an estimate of g^-1(F_cmd)
+_a_meas = 0.0           # filtered acceleration estimate, m/s^2
+_vz_prev = None         # previous vertical speed, for differencing a_meas
 _outer_t = None         # when the outer loop last ran (hover_cascade_2rate)
 _v_cmd_held = 0.0       # the outer loop's output, HELD between its updates
 
@@ -101,6 +135,26 @@ def _tick_dt(t):
     global _t_prev
     dt = DT_NOMINAL_S if _t_prev is None else t - _t_prev
     _t_prev = t
+    return dt if dt > 0.0 else DT_NOMINAL_S
+
+
+def _valve_tick_dt(t):
+    """Seconds since the VALVE TRACKER last ran. Its own clock, deliberately.
+
+    It cannot share _tick_dt, and the reason is subtle enough to be worth
+    stating. _tick_dt owns a single module-level _t_prev, and the second
+    caller in any given tick sees dt <= 0 and gets the nominal fallback. A
+    law and the tracker both calling it would therefore have ONE of them
+    silently timed wrong - and at full rate the fallback happens to equal
+    the true step, so it would look correct and only diverge under
+    --control-hz (the law gets 0.020 while the tracker gets 0.002).
+
+    Same fallback contract as _tick_dt: nominal on the first call and after a
+    reset, and a non-positive interval refused.
+    """
+    global _valve_t_prev
+    dt = DT_NOMINAL_S if _valve_t_prev is None else t - _valve_t_prev
+    _valve_t_prev = t
     return dt if dt > 0.0 else DT_NOMINAL_S
 
 
@@ -131,12 +185,17 @@ def reset_state():
     scenario.py calls this before every run.
     """
     global _integral, _sp_prev, _sp_rate, _t_prev, _outer_t, _v_cmd_held
+    global _valve_t_prev, _valve_u, _a_meas, _vz_prev
     _integral = 0.0
     _sp_prev = None
     _sp_rate = 0.0
     _t_prev = None
     _outer_t = None
     _v_cmd_held = 0.0
+    _valve_t_prev = None
+    _valve_u = 0.0
+    _a_meas = 0.0
+    _vz_prev = None
 
 
 def set_gains(**kw):
@@ -588,6 +647,132 @@ def hover_cascade_2rate(state):
     thrust = state.weight_n() + KP_V * (_v_cmd_held - state.vel[2])
 
     return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
+
+
+def measured_thrust(state, dt):
+    """Estimate the thrust actually being produced, from acceleration.
+
+        F = m * (a + g)
+
+    This is the accelerometer an airframe really carries, so it is estimated
+    rather than read off the simulator. a is differenced from vertical speed
+    because CraftState carries no acceleration field, then optionally
+    corrupted with Gaussian noise and low-passed - differencing velocity
+    amplifies noise, so the filter is needed as soon as the noise is on.
+
+    Returns (F_meas, a_meas).
+    """
+    global _a_meas, _vz_prev
+    vz = float(state.vel[2])
+    a_raw = 0.0 if _vz_prev is None else (vz - _vz_prev) / dt
+    _vz_prev = vz
+    if ACCEL_NOISE_SIGMA > 0.0:
+        a_raw += float(np.random.normal(0.0, ACCEL_NOISE_SIGMA))
+    lpf = min(1.0, max(0.0, ACCEL_LPF))
+    _a_meas += lpf * (a_raw - _a_meas)
+    g = float(np.linalg.norm(state.gravity))
+    return state.mass * (_a_meas + g), _a_meas
+
+
+def thrust_tracker(f_cmd, state, grounded=None):
+    """Drive measured thrust to f_cmd by moving a valve. Returns u in 0..1.
+
+    *** THIS FUNCTION DOES NOT KNOW IT IS A THRUST TRACKER. ***  It is a
+    generic servo: drive a measured scalar to a reference by integrating the
+    error into an actuator position. Swap the accelerometer for a load cell
+    or a chamber-pressure transducer and nothing here changes. That is why
+    it needs no model of the valve.
+
+    THE MATH, with g() the unknown valve curve and gamma = g'(u):
+
+        u̇ = K ( r - g(u) )                 the closed loop, one state
+        δ̇ = -K gamma δ                     linearised about g(u*) = r
+        Y/R = K gamma / (s + K gamma)       DC gain EXACTLY 1 for any gamma>0
+        E/R = s / (s + K gamma)             a zero at DC
+
+    So the ACCURACY is independent of the curve and only the SPEED depends on
+    it. The integrator's state converges to g^-1(r) without anyone computing
+    an inverse, which is also why it re-converges for free when the curve
+    drifts as the tank empties. A proportional law u = K*e has no state and
+    would need a standing error to hold any thrust at all.
+
+    TWO GUARDS, both measured to be load-bearing:
+
+      clamp + conditional integration   u lives in [0, 1]; integrating while
+            pinned is windup, the same lesson hover_pid teaches.
+      GROUND_FREEZE                     on the pad the floor supplies the
+            balance, so F = m(a+g) reads vehicle WEIGHT however little is
+            commanded. The error is then permanently negative and the valve
+            winds shut. Freezing while that is true is the fix; it is a
+            broken OBSERVATION, not a plant property, so no gain change
+            helps.
+
+    THE ONE REQUIREMENT, stated precisely. g must be monotonic OVER THE
+    REGION THE LOOP VISITS - not everywhere. Measured against the
+    deliberately non-monotonic "reversed" curve at a 19.44 N demand:
+
+        started shut          converged, u=0.1620, 19.440 N   (g' > 0 here)
+        started past the peak ran away to u=1.0000, 0.000 N
+
+    Same curve, same gain, same demand: only the initial condition differs.
+    Past the peak g' < 0, the feedback sign is inverted, and the integrator
+    drives the valve exactly the wrong way until it pins. The ball curve
+    from that same start converges normally, so it is the sign of the slope
+    that matters and nothing else.
+    """
+    global _valve_u
+
+    dt = _valve_tick_dt(state.t)
+    f_meas, a_meas = measured_thrust(state, dt)
+
+    # On the ground and not accelerating, the measurement carries no
+    # information about thrust below weight - so do not integrate on it.
+    if grounded is None:
+        weight = state.weight_n()
+        grounded = (GROUND_FREEZE
+                    and abs(a_meas) < 0.05
+                    and f_cmd < weight - 0.1
+                    and abs(f_meas - weight) < 0.5)
+
+    err = f_cmd - f_meas
+    step = K_VALVE * err * dt
+    pinned_low = _valve_u <= 0.0 and step < 0.0
+    pinned_high = _valve_u >= 1.0 and step > 0.0
+    if not (grounded or pinned_low or pinned_high):
+        _valve_u = min(1.0, max(0.0, _valve_u + step))
+    return _valve_u
+
+
+def valve_state():
+    """(u, a_meas) for a driver that wants to log the tracker's internals."""
+    return _valve_u, _a_meas
+
+
+def hover_valve(state):
+    """hover(), but commanding a VALVE instead of Newtons.
+
+    The outer law is unchanged and is literally the same arithmetic hover()
+    uses - a PD on altitude producing a thrust DEMAND in Newtons. The
+    difference is that the demand is then handed to thrust_tracker(), which
+    returns a valve opening, and the valve's unknown curve turns that back
+    into force. The altitude law never learns a valve exists.
+
+    Returns a valve position in 0..1, not Newtons. ValveActuator.apply()
+    interprets it, so this law only works with the valve layer enabled
+    (--valve); flown without it, 0..1 would be read as 0..1 NEWTONS and the
+    craft would never leave the ground.
+
+    The timescale rule from hover_cascade applies again: the thrust loop has
+    to be much faster than the altitude loop, or the altitude law sees a
+    lagging actuator. Here that is satisfied by the tracker running every
+    tick while the altitude dynamics are seconds long.
+    """
+    err_alt = _target_alt - state.pos[2]
+    err_vel = -state.vel[2]
+    f_cmd = state.weight_n() + KP_ALT * err_alt + KD_ALT * err_vel
+    f_cmd = max(0.0, f_cmd)          # a valve cannot pull
+    u = thrust_tracker(f_cmd, state)
+    return {"main": (u, np.array([0.0, 0.0, 1.0]))}
 
 
 def world_to_body(state, v_world):

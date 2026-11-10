@@ -221,13 +221,21 @@ def curve(position, max_thrust_n, name=None):
     elif name == "deadzone":
         frac = 0.0 if u <= _DEADZONE_U0 else (u - _DEADZONE_U0) / (1.0 - _DEADZONE_U0)
     elif name == "reversed":
-        # Rises to a peak at u=0.6 then FALLS. Normalized so full open
-        # still returns max_thrust_n, which keeps the scaling contract
-        # while breaking monotonicity in the middle.
-        frac = u if u <= 0.6 else 0.6 - 0.5 * (u - 0.6)
-        frac = max(0.0, frac) / 0.6 * 0.6
-        if u >= 1.0:
-            frac = 1.0
+        # A valve that CHOKES as it opens past halfway: rises to full
+        # thrust at u=0.5, then falls away to 40% at u=1.0. Physically this
+        # is a flow that stalls or a seat that re-seals; here it exists only
+        # to break monotonicity.
+        #
+        # The falling branch has to descend BELOW any demand the loop will
+        # be asked for, or the test is vacuous. Two failed attempts:
+        # peaking at 0.6 and bottoming at 0.4 of full left a 32% hover
+        # demand satisfied on the RISING branch at u=0.324, so the loop
+        # converged happily and the check proved nothing; bottoming at
+        # 0.4 of full (24 N on a 60 N engine) still sat above a 19.44 N
+        # demand. Now it falls all the way to zero at full open, so EVERY
+        # reachable demand has a second equilibrium above the peak where
+        # g' < 0 flips the feedback sign.
+        frac = (u / 0.5) if u <= 0.5 else (1.0 - (u - 0.5) / 0.5)
     else:
         raise ValueError(f"unknown valve curve {name!r}; "
                          f"choose from {', '.join(CURVE_NAMES)}")
@@ -513,10 +521,17 @@ def run_selftest() -> int:
             failed.append(label)
 
     print("\n[1] the curve family")
-    for name in CURVE_NAMES:
+    for name in MONOTONIC_CURVES:
         truth(f"{name}: full open gives max thrust",
               abs(curve(1.0, 60.0, name) - 60.0) < 1e-9,
               f"{curve(1.0, 60.0, name):.4f} N")
+    # reversed deliberately does NOT: it peaks mid-travel and falls away,
+    # so full open is below full thrust. That is the violation it exists for.
+    truth("reversed peaks mid-travel and falls to zero at full open",
+          curve(0.5, 60.0, "reversed") > 59.9
+          and curve(1.0, 60.0, "reversed") < 0.1,
+          f"peak {curve(0.5, 60.0, 'reversed'):.1f} N vs "
+          f"{curve(1.0, 60.0, 'reversed'):.1f} N open")
     for name in CURVE_NAMES:
         truth(f"{name}: shut gives zero", curve(0.0, 60.0, name) == 0.0)
     truth("an unknown curve name raises",
@@ -552,6 +567,25 @@ def run_selftest() -> int:
     vals = [curve(u, 60.0, "reversed") for u in np.linspace(0, 1, 101)]
     truth("reversed is NOT monotonic (the negative control)",
           any(b < a - 1e-6 for a, b in zip(vals, vals[1:])))
+    # *** AND THE FALLING BRANCH MUST BE REACHABLE. ***  A curve that is
+    # non-monotonic only where the operating point never goes is not a test.
+    # My first version peaked at 0.6 and bottomed at 0.4 of full, so a 32%
+    # hover demand was met on the rising branch and the loop converged -
+    # the check passed while proving nothing. A demand below full thrust
+    # must now have a SECOND equilibrium above the peak.
+    demand = 19.44
+    above = [u for u in np.linspace(0.5, 1.0, 101)
+             if abs(curve(u, 60.0, "reversed") - demand) < 1.0]
+    truth("  a hover-sized demand has an equilibrium PAST the peak",
+          bool(above), f"u ~ {above[0]:.3f}" if above else "none - vacuous!")
+    truth("  and the slope is negative there",
+          bool(above) and slope(above[0], 60.0, "reversed") < 0.0,
+          f"{slope(above[0], 60.0, 'reversed'):.1f} N/unit" if above else "")
+    truth("  no discontinuous jump at full open",
+          abs(curve(1.0, 60.0, "reversed")
+              - curve(0.99, 60.0, "reversed")) < 2.0,
+          f"{curve(0.99, 60.0, 'reversed'):.2f} -> "
+          f"{curve(1.0, 60.0, 'reversed'):.2f} N")
 
     print("\n[5] the curve scales, so difficulty is not engine-size")
     for m in (10.0, 60.0):

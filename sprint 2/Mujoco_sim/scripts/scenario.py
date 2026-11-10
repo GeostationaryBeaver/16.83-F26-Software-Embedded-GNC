@@ -1546,6 +1546,62 @@ def run_selftest() -> int:
     _eh.reset_state()
     truth("  reset_state clears the timestamp too", _eh._t_prev is None)
 
+    print("\n[7b] the two-rate cascade")
+    # hover_cascade runs both loops in one call. hover_cascade_2rate runs
+    # the OUTER loop at OUTER_HZ and holds its commanded rate between
+    # updates, which is how real flight software is laid out. No harness
+    # change was needed: the law decimates itself off state.t.
+    import hashlib as _hl
+    m_1r = fly("hover_cascade")
+    m_2r_off = fly("hover_cascade_2rate", ["--gains", "OUTER_HZ=0"])
+    truth("  OUTER_HZ=0 reproduces the single-rate law exactly",
+          m_1r == m_2r_off,
+          "metrics identical" if m_1r == m_2r_off else "DIFFER")
+    # Equality of metrics is weaker than equality of trajectory, so compare
+    # the CSVs: if the two code paths agree they must agree tick for tick.
+    runs = sorted(out7.glob("*/flight.csv"), key=lambda q: q.stat().st_mtime)
+    if len(runs) >= 2:
+        h = [_hl.sha256(q.read_bytes()).hexdigest() for q in runs[-2:]]
+        truth("  and byte-for-byte, not just metric-for-metric",
+              h[0] == h[1], h[0][:16])
+
+    # The rate RATIO is the thing this law exists to vary. Down to ~25 Hz
+    # the held command is fresh enough that it tracks the single-rate law;
+    # the point of the check is that a STALE outer loop is measurably worse,
+    # or the law is not doing what it claims.
+    m_25 = fly("hover_cascade_2rate", ["--gains", "OUTER_HZ=25"])
+    m_2 = fly("hover_cascade_2rate", ["--gains", "OUTER_HZ=2"])
+    truth("  25 Hz outer loop still tracks the single-rate law",
+          abs(m_25["overshoot_m"] - m_1r["overshoot_m"]) < 0.01,
+          f"{m_25['overshoot_m']:.5f} vs {m_1r['overshoot_m']:.5f} m")
+    truth("  a stale 2 Hz outer loop is clearly worse",
+          m_2["overshoot_m"] > 2 * m_1r["overshoot_m"],
+          f"{m_2['overshoot_m']:.5f} vs {m_1r['overshoot_m']:.5f} m")
+    truth("  but still completes the profile, not unstable",
+          m_2["return_err_m"] < 0.05, f"return err {m_2['return_err_m']:.5f} m")
+
+    # Scheduled on SIM TIME, not a call count. A counter would silently
+    # mean a different frequency under --control-hz, so the outer period
+    # must survive changing the inner rate.
+    m_25_slow = fly("hover_cascade_2rate",
+                    ["--gains", "OUTER_HZ=25", "--control-hz", "200"])
+    truth("  the outer period holds when the inner rate changes",
+          abs(m_25_slow["overshoot_m"] - m_25["overshoot_m"]) < 0.005,
+          f"{m_25_slow['overshoot_m']:.5f} vs {m_25['overshoot_m']:.5f} m")
+    # Degenerate case: the inner loop SLOWER than the outer period. The
+    # outer loop then simply runs every call; it must not stall or spin.
+    m_inv = fly("hover_cascade_2rate",
+                ["--gains", "OUTER_HZ=25", "--control-hz", "10"])
+    truth("  inner slower than outer degrades gracefully",
+          m_inv is not None and m_inv["overshoot_m"] < 0.10,
+          f"{m_inv['overshoot_m']:.5f} m" if m_inv else "FAILED")
+    truth("  OUTER_HZ is attributed to the 2-rate law only",
+          "OUTER_HZ" in gains_used_by("hover_cascade_2rate")
+          and "OUTER_HZ" not in gains_used_by("hover_cascade"))
+    _eh.reset_state()
+    truth("  reset_state clears the held command and outer clock",
+          _eh._outer_t is None and _eh._v_cmd_held == 0.0)
+
     print("\n[8] --video records the run without changing it")
     # The whole value of recording a run is that it IS the run. If rendering
     # perturbed the physics the video would be of something else, so this

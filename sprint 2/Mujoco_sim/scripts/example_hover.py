@@ -66,14 +66,22 @@ DT_NOMINAL_S = 0.002    # s, the integration step for the accumulator. Equal
 # error rather than a silent no-op.
 _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
                "KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF",
-               "THRUST_CEILING_N",
+               "THRUST_CEILING_N", "OUTER_HZ",
                "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
                "MAX_CANT")
+
+OUTER_HZ = 25.0         # Hz, how often hover_cascade_2rate updates its
+                        #   OUTER (position) loop. The inner rate loop runs
+                        #   on every call, so this sets the rate RATIO that
+                        #   makes it a genuine two-rate cascade. 0 means
+                        #   "every call", i.e. identical to hover_cascade.
 
 _integral = 0.0         # hover_pid's accumulator, in m*s
 _sp_prev = None         # hover_cascade: previous setpoint, for differencing
 _sp_rate = 0.0          # hover_cascade: filtered setpoint rate, m/s
 _t_prev = None          # last tick's state.t, for measuring the real interval
+_outer_t = None         # when the outer loop last ran (hover_cascade_2rate)
+_v_cmd_held = 0.0       # the outer loop's output, HELD between its updates
 
 
 def _tick_dt(t):
@@ -122,11 +130,13 @@ def reset_state():
     run left accumulated, and only the first result would be trustworthy.
     scenario.py calls this before every run.
     """
-    global _integral, _sp_prev, _sp_rate, _t_prev
+    global _integral, _sp_prev, _sp_rate, _t_prev, _outer_t, _v_cmd_held
     _integral = 0.0
     _sp_prev = None
     _sp_rate = 0.0
     _t_prev = None
+    _outer_t = None
+    _v_cmd_held = 0.0
 
 
 def set_gains(**kw):
@@ -499,6 +509,83 @@ def hover_cascade(state):
 
     # INNER LOOP: what thrust holds that rate?
     thrust = state.weight_n() + KP_V * (v_cmd - state.vel[2])
+
+    return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
+
+
+def hover_cascade_2rate(state):
+    """hover_cascade with the two loops run at genuinely DIFFERENT rates.
+
+    hover_cascade computes both loops in one call, so both run at whatever
+    rate the driver uses. This is the textbook structure instead: the outer
+    position loop runs at OUTER_HZ, its commanded rate is HELD between those
+    updates, and the inner rate loop closes on every call.
+
+        every call      u      = m*g + KP_V * (v_cmd_held - vz)
+        at OUTER_HZ     v_cmd_held = sp_rate + KP_POS_V * (sp - z)
+
+    No harness change is needed for this: the driver already calls the law
+    every physics step and CraftState carries t, so the law decimates its
+    own outer loop off state.t. That is exactly how flight software is laid
+    out - one scheduler, several tasks at different periods - and it is the
+    reason a law, not the runner, is the right place to put the rate.
+
+    WHAT IT IS FOR. Two things the single-rate version cannot show:
+
+      1. It is what real hardware does. An estimator feeding a position
+         loop at 25 Hz with a rate loop at 500 Hz is an ordinary design,
+         and a sim that cannot represent it cannot predict it.
+      2. It makes the rate RATIO a variable you can sweep. The whole
+         justification for the single-rate law is that KP_V / KP_POS_V = 25
+         gives enough timescale separation to stand in for a real one; this
+         law is how that claim gets tested rather than asserted.
+
+    MEASURED, standard profile on 07_thrust_1D at 12 kg / 60 N, against the
+    single-rate law's 0.05176 m overshoot and -0.00731 m ramp lag - see the
+    README table for the full sweep. Down to about 25 Hz the two are
+    indistinguishable, which is the real finding: it VALIDATES the cheaper
+    single-rate law at the shipped gains rather than replacing it. Below
+    that the held v_cmd goes stale between updates and the overshoot grows.
+
+    The zero-order hold is the point, and it is why _v_cmd_held is a module
+    global rather than recomputed: between outer updates the inner loop
+    chases a rate command that is deliberately out of date, which is the
+    error a real two-rate system has and a single-rate one does not.
+    """
+    global _sp_prev, _sp_rate, _outer_t, _v_cmd_held
+
+    dt = _tick_dt(state.t)
+    sp = _target_alt
+
+    # Setpoint rate, exactly as in hover_cascade. Estimated on the INNER
+    # tick because that is when a real system would sample its setpoint
+    # input; only the position loop below is decimated.
+    if _sp_prev is None:
+        _sp_prev = sp
+    raw_rate = (sp - _sp_prev) / dt
+    raw_rate = max(-V_MAX_MPS, min(V_MAX_MPS, raw_rate))
+    _sp_rate += SP_RATE_LPF * (raw_rate - _sp_rate)
+    _sp_prev = sp
+
+    # --- OUTER LOOP, at OUTER_HZ ------------------------------------------
+    # Scheduled on sim time, not a call counter, so the period is honoured
+    # whatever rate the driver runs at - including under --control-hz, where
+    # a counter would silently mean a different frequency.
+    period = (1.0 / OUTER_HZ) if OUTER_HZ else 0.0
+    due = (_outer_t is None                      # first call: run it
+           or period <= 0.0                      # OUTER_HZ=0: every call
+           or state.t - _outer_t >= period
+           or state.t < _outer_t)                # sim reset: re-baseline
+    if due:
+        _v_cmd_held = max(-V_MAX_MPS,
+                          min(V_MAX_MPS,
+                              _sp_rate + KP_POS_V * (sp - state.pos[2])))
+        _outer_t = state.t
+
+    # --- INNER LOOP, every call -------------------------------------------
+    # Note it closes on the HELD command, not a fresh one. That lag is the
+    # whole difference between this law and hover_cascade.
+    thrust = state.weight_n() + KP_V * (_v_cmd_held - state.vel[2])
 
     return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
 

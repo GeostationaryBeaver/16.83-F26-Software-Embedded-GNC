@@ -54,6 +54,7 @@ GAIN_GROUPS = (
     ("hover / hover_pid  (PD core)", ("KP_ALT", "KD_ALT")),
     ("hover_pid  (integral)",        ("KI_ALT", "I_LIMIT_N")),
     ("hover_cascade",                ("KP_POS_V", "KP_V", "V_MAX_MPS")),
+    ("2-rate cascade",               ("OUTER_HZ",)),
 )
 GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
 

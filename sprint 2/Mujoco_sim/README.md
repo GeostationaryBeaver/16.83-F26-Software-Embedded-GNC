@@ -134,7 +134,7 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── import_mesh.py           STL/OBJ -> MJCF, with sanity checks
 │   ├── thrusters.py             Thruster / ThrusterSet / CraftState  (§10)
 │   ├── fly.py                   run a scene under closed-loop control (§10)
-│   ├── example_hover.py         five control laws + gain plumbing (§14)
+│   ├── example_hover.py         six control laws + gain plumbing (§14)
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
 │   ├── gui.py                   control panel: run/compare/demo (§13)
@@ -1708,6 +1708,58 @@ accumulation — timing it inside the `if` would make the first tick after a
 saturated stretch measure the whole stretch and dump it into the integral at
 once.
 
+### `hover_cascade_2rate` — two loops, two rates, for real
+
+`hover_cascade` runs both loops in one call, so the timescale separation comes
+from the gains. `hover_cascade_2rate` is the textbook structure instead: the
+outer position loop runs at `OUTER_HZ`, its commanded rate is **held** between
+those updates, and the inner rate loop closes on every call.
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover_cascade_2rate \
+    --gains "OUTER_HZ=25"
+```
+
+**No harness change was needed.** The driver already calls the law every
+physics step and `CraftState` carries `t`, so the law decimates its own outer
+loop off `state.t` and holds `_v_cmd_held` in between. That is how flight
+software is actually laid out — one scheduler, several tasks at different
+periods — and it is why the rate belongs in the law rather than the runner.
+
+The outer loop is scheduled on **sim time, not a call count**. A counter would
+silently mean a different frequency under `--control-hz`; measured, a 25 Hz
+outer loop gives 0.05591 m of overshoot at a 500 Hz inner rate and 0.05589 m at
+200 Hz, so the period really is held.
+
+| `OUTER_HZ` | overshoot | ramp lag | hold RMS |
+|---|---|---|---|
+| every call (`0`) | 0.05176 m | −0.00731 m | 0.03175 m |
+| 200 | 0.05216 | −0.00733 | 0.03198 |
+| 100 | 0.05277 | −0.00734 | 0.03233 |
+| 50 | 0.05380 | −0.00738 | 0.03291 |
+| **25** (default) | 0.05591 | −0.00748 | 0.03408 |
+| 10 | 0.06254 | −0.00788 | 0.03776 |
+| 2 | 0.11866 | −0.01054 | 0.01559 |
+| 0.5 | 0.44876 | — | — |
+
+**The headline result is the agreement, not the difference.** `OUTER_HZ=0`
+reproduces the single-rate law **byte-for-byte** — same `flight.csv` sha256 —
+which proves the two code paths agree. And down to about 25 Hz the two-rate
+version is within 0.004 m of it, which *validates* the cheaper single-rate law
+at the shipped gains rather than replacing it. The single-rate law's
+justification was that `KP_V / KP_POS_V = 25` buys enough timescale separation
+to stand in for a real one; this is the law that lets that claim be tested
+instead of asserted.
+
+Below ~10 Hz the held command goes stale between updates and overshoot grows,
+smoothly and monotonically rather than going unstable — at 0.5 Hz it still
+completes the profile and lands, with 0.449 m of overshoot. The degenerate case
+(inner loop *slower* than the outer period, via `--control-hz 10` against
+`OUTER_HZ=25`) simply runs the outer loop every call.
+
+So: **feasible, already implemented, and worth having** — mainly because it
+turns the rate ratio into something you can sweep.
+
 ### One gain a law cannot discover
 
 `THRUST_CEILING_N` defaults to 60.0 because `hover_pid`'s anti-windup needs to
@@ -1824,4 +1876,7 @@ steps, and where each attaches:
 | **only the law's own gains** | cascade run lists no `KI_ALT`/`KP_ALT`; inert overrides flagged ✓ |
 | **rate independence** | 0.1 m/s descent honoured from 500 Hz to 10 Hz (was 0.42 at 50) ✓ |
 | **integral is rate-independent** | PID ramp lag −0.02314 → −0.02308 across 50× ✓ |
+| **two-rate cascade** | `OUTER_HZ=0` byte-identical to the single-rate law ✓ |
+| **outer period is real time** | 25 Hz outer holds across a 500→200 Hz inner rate ✓ |
+| **a stale outer loop costs** | 2 Hz → 0.119 m overshoot vs 0.052 m, still lands ✓ |
 | **selftest suites** | thrust 50/50, scenario 50/50, gui 38/38 pass ✓ |

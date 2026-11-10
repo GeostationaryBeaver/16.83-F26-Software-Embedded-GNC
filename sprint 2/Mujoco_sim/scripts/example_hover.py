@@ -68,6 +68,7 @@ _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
                "KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF",
                "THRUST_CEILING_N", "OUTER_HZ",
                "K_VALVE", "ACCEL_NOISE_SIGMA", "ACCEL_LPF", "GROUND_FREEZE",
+               "GROUND_VZ_MPS",
                "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
                "MAX_CANT")
 
@@ -107,13 +108,31 @@ GROUND_FREEZE = True    # stop integrating while the floor is holding us up.
                         #   (30 N -> 30.000, 60 N -> 60.000). So below-weight
                         #   demands on the ground give a permanently negative
                         #   error and wind the valve shut.
+GROUND_VZ_MPS = 0.02    # how still counts as "on the pad". The freeze test
+                        #   needs this: a ~= 0 with F_meas ~= weight is ALSO
+                        #   true in steady cruise, and freezing there froze
+                        #   the valve at u=0.5812 and flew a 2 m profile to
+                        #   61 m. The pad is distinguished by being
+                        #   stationary, not by being in balance.
 
 _t_prev = None          # last tick's state.t, for measuring the real interval
 _valve_t_prev = None    # the tracker's OWN clock - see _valve_tick_dt
 _valve_u = 0.0          # the tracker's integrator: the valve position, and
                         #   at convergence an estimate of g^-1(F_cmd)
 _a_meas = 0.0           # filtered acceleration estimate, m/s^2
+_f_demand = 0.0         # the Newtons the altitude law last asked for. The
+                        #   tracker does not need this - it is published so a
+                        #   driver can log DEMAND against DELIVERY, which is
+                        #   the only way to see the tracker working: the two
+                        #   curves should sit on top of each other, and where
+                        #   they part the valve has run out of authority.
+_f_meas = 0.0           # the thrust the tracker last ESTIMATED from
+                        #   acceleration - what it is actually closing on,
+                        #   as distinct from what the valve delivered.
 _vz_prev = None         # previous vertical speed, for differencing a_meas
+_grounded_hint = None   # what the DRIVER knows about contact, if anything.
+                        #   None means "nobody told me", and the tracker then
+                        #   falls back to inferring it from the measurement.
 _outer_t = None         # when the outer loop last ran (hover_cascade_2rate)
 _v_cmd_held = 0.0       # the outer loop's output, HELD between its updates
 
@@ -185,7 +204,8 @@ def reset_state():
     scenario.py calls this before every run.
     """
     global _integral, _sp_prev, _sp_rate, _t_prev, _outer_t, _v_cmd_held
-    global _valve_t_prev, _valve_u, _a_meas, _vz_prev
+    global _valve_t_prev, _valve_u, _a_meas, _vz_prev, _f_demand, _f_meas
+    global _grounded_hint
     _integral = 0.0
     _sp_prev = None
     _sp_rate = 0.0
@@ -194,8 +214,12 @@ def reset_state():
     _v_cmd_held = 0.0
     _valve_t_prev = None
     _valve_u = 0.0
+    _f_demand = 0.0
+    _f_meas = 0.0
     _a_meas = 0.0
     _vz_prev = None
+    _grounded_hint = None   # back to inferring, so a run that does not set
+                            #   it is not silently using the last run's value
 
 
 def set_gains(**kw):
@@ -705,7 +729,9 @@ def thrust_tracker(f_cmd, state, grounded=None):
             commanded. The error is then permanently negative and the valve
             winds shut. Freezing while that is true is the fix; it is a
             broken OBSERVATION, not a plant property, so no gain change
-            helps.
+            helps. It needs BOTH halves - resting AND a demand below weight
+            - and getting that wrong failed in both directions on a real
+            flight; see the comment on the guard itself.
 
     THE ONE REQUIREMENT, stated precisely. g must be monotonic OVER THE
     REGION THE LOOP VISITS - not everywhere. Measured against the
@@ -720,32 +746,84 @@ def thrust_tracker(f_cmd, state, grounded=None):
     from that same start converges normally, so it is the sign of the slope
     that matters and nothing else.
     """
-    global _valve_u
+    global _valve_u, _f_demand, _f_meas
 
     dt = _valve_tick_dt(state.t)
     f_meas, a_meas = measured_thrust(state, dt)
+    _f_demand, _f_meas = float(f_cmd), float(f_meas)
 
-    # On the ground and not accelerating, the measurement carries no
-    # information about thrust below weight - so do not integrate on it.
-    if grounded is None:
-        weight = state.weight_n()
-        grounded = (GROUND_FREEZE
-                    and abs(a_meas) < 0.05
-                    and f_cmd < weight - 0.1
-                    and abs(f_meas - weight) < 0.5)
+    # WHEN THE MEASUREMENT CARRIES NO INFORMATION, DO NOT INTEGRATE ON IT.
+    #
+    # Resting on the pad, the floor supplies whatever force the engine does
+    # not, so F = m(a+g) reads vehicle WEIGHT however little is commanded
+    # (measured: 0 N commanded -> 19.440 N read). The error is then
+    # permanently negative and the valve winds shut.
+    #
+    # But only for demands BELOW weight. Above it the engine really can
+    # accelerate the vehicle, so the measurement becomes informative again
+    # and freezing there means never launching - measured, a 48.2 N demand
+    # against a 19.44 N weight sat at u=0.0000 for the whole 30 s ASCEND
+    # phase and the craft never moved. So "resting" gates the freeze and
+    # the demand decides it; contact alone is not enough.
+    #
+    # `grounded` is taken from the driver when it knows (scenario.py reads
+    # data.ncon; an airframe has a leg switch), because the inference below
+    # CANNOT tell the pad from steady cruise: holding altitude at
+    # weight-thrust also gives a ~= 0 with F_meas ~= weight. Measured with
+    # only the inference, the tracker froze at u=0.5812 against a 0 N demand
+    # and flew a 2 m profile to 61 m. The velocity gate is what separates
+    # the two cases, since the pad is STATIONARY rather than merely in
+    # balance.
+    resting = grounded
+    if resting is None:
+        resting = _grounded_hint
+    if resting is None:
+        resting = (abs(float(state.vel[2])) < GROUND_VZ_MPS
+                   and abs(a_meas) < 0.05
+                   and abs(f_meas - state.weight_n()) < 0.5)
+    uninformative = (GROUND_FREEZE and bool(resting)
+                     and f_cmd < state.weight_n() - 0.1)
 
     err = f_cmd - f_meas
     step = K_VALVE * err * dt
     pinned_low = _valve_u <= 0.0 and step < 0.0
     pinned_high = _valve_u >= 1.0 and step > 0.0
-    if not (grounded or pinned_low or pinned_high):
+    if not (uninformative or pinned_low or pinned_high):
         _valve_u = min(1.0, max(0.0, _valve_u + step))
     return _valve_u
 
 
+# Laws that return a 0..1 VALVE OPENING rather than Newtons. A driver reads
+# this to refuse --valve on a law that returns force: 19.44 N read as an
+# opening clamps to 1.0 and flies a wide-open engine, which looks like a wild
+# controller rather than the units mismatch it is.
+VALVE_LAWS = ("hover_valve",)
+
+
+def set_grounded(flag):
+    """Tell the tracker whether the vehicle is resting on something.
+
+    A real airframe has a contact switch or a load cell on the legs; a sim
+    driver has data.ncon. Either way the information is AVAILABLE, and a
+    guess reconstructed from acceleration is strictly worse than being told:
+    the inference cannot distinguish the pad from steady cruise, because
+    both show a ~= 0 with measured thrust at vehicle weight.
+
+    Pass None to go back to inferring. Called by scenario.py every tick.
+    """
+    global _grounded_hint
+    _grounded_hint = None if flag is None else bool(flag)
+
+
 def valve_state():
-    """(u, a_meas) for a driver that wants to log the tracker's internals."""
-    return _valve_u, _a_meas
+    """What the tracker is doing, for a driver that wants to log it.
+
+    (u, a_meas, f_demand, f_meas). Reading these is NOT how the loop works -
+    the tracker needs none of them - it is how a flight becomes legible:
+    f_demand against f_meas shows the tracker converging, and u against
+    either shows the curve it inverted without being told.
+    """
+    return _valve_u, _a_meas, _f_demand, _f_meas
 
 
 def hover_valve(state):

@@ -134,9 +134,10 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── import_mesh.py           STL/OBJ -> MJCF, with sanity checks
 │   ├── thrusters.py             Thruster / ThrusterSet / CraftState  (§10)
 │   ├── fly.py                   run a scene under closed-loop control (§10)
-│   ├── example_hover.py         six control laws + gain plumbing (§14)
+│   ├── example_hover.py         seven control laws + gain plumbing (§14)
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
+│   ├── valve.py                 an unknown thrust curve, as a plant (§15)
 │   ├── gui.py                   control panel: run/compare/demo (§13)
 │   ├── sim_worker.py            the viewer process gui.py drives (§13)
 │   ├── simlink.py               JSON-over-socket between the two (§13)
@@ -1121,7 +1122,7 @@ to a timestamped directory, so two runs can be put side by side.
 ```bash
 uv run python scripts/scenario.py --controller example_hover:hover
 uv run python scripts/scenario.py --controller example_hover:hover --target 3.5
-uv run python scripts/scenario.py --selftest        # 118 numeric checks
+uv run python scripts/scenario.py --selftest        # 147 numeric checks
 ```
 
 ### The profile
@@ -1414,7 +1415,7 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 ```bash
 uv run python scripts/gui.py            # the control panel
 uv run python scripts/gui.py --demo     # bigger fonts, less clutter
-uv run python scripts/gui.py --selftest # 79 headless checks
+uv run python scripts/gui.py --selftest # 90 headless checks
 ```
 
 Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
@@ -1594,8 +1595,9 @@ at 640×480 and 23.8 at 1280×720, which is fine for these scenes.
 
 ## 14. Control laws and gains
 
-Five laws in `scripts/example_hover.py`. The three vertical ones are the
-interesting comparison:
+Seven laws in `scripts/example_hover.py`. The three that command thrust
+directly are the interesting comparison; `hover_valve` commands a valve
+instead and gets its own section (§15):
 
 | law | descent-ramp lag | step overshoot | hold RMS |
 |---|---|---|---|
@@ -1829,7 +1831,232 @@ engine is already pinned.
 
 ---
 
-## 15. Where to go next
+## 15. Controlling a valve, without knowing the curve
+
+The real vehicle does not accept a thrust command. It accepts a **valve
+position**, and the relation between position and thrust is not known in
+advance — it depends on the ball geometry, the regulator, the nozzle, and how
+much gas is left in the bottle. So every law above, which commands Newtons
+directly, is commanding something the hardware cannot be told.
+
+`hover_valve` closes that gap, and `scripts/valve.py` is the test rig that
+proves it does.
+
+```bash
+uv run python scripts/valve.py --selftest   # 61 checks on the plant alone
+```
+
+```bash
+# the default unknown: a ball valve's lens-overlap flow area
+uv run python scripts/scenario.py --controller example_hover:hover_valve \
+    --scene scenes/07_thrust_1D.xml --target 2.0 --valve --fixed-mass --isp 57.8
+
+# sweep the FAMILY of relations - one controller, six different plants
+for c in ball linear quadratic sqrt deadzone reversed; do
+  uv run python scripts/scenario.py --controller example_hover:hover_valve \
+      --scene scenes/07_thrust_1D.xml --target 2.0 --valve --valve-curve $c \
+      --fixed-mass --isp 57.8 --no-plot --label $c
+done
+```
+
+### The architecture, in one diagram
+
+```
+  target                                                   the UNKNOWN plant
+    |                                                   +---------------------+
+    v        F_cmd [N]              u [0..1]            |                     |
+  +-----+   +-------+   e   +-----------------+   u     |   F = g(u) * feed   |  F [N]
+  | PD  |-->|  sum  |------>|  K / s  (integ) |-------->|   g unknown         |----+
+  +-----+   +-------+       +-----------------+         |   feed falls w/ time|    |
+    ^           ^ -                                     +---------------------+    |
+    |           |                                                                  |
+    |           |      F_meas = m (a + g)        +---------------+                 |
+    |           +--------------------------------|  accelerometer|<----------------+
+    |                                            +---------------+                 |
+    |                                                                              |
+    +--- altitude, velocity ------------------------------------------- vehicle <--+
+```
+
+**The inner box does not know it is a thrust tracker.** It is a generic servo:
+drive a measured scalar to a reference by integrating the error into an
+actuator position. Swap the accelerometer for a load cell or a
+chamber-pressure transducer and nothing in it changes. That is exactly why it
+needs no model of the valve.
+
+### Why an integrator, and why the accuracy is free
+
+With `g()` the unknown curve and `γ = g'(u)` its slope at the operating point:
+
+```
+  u̇ = K ( r − g(u) )            the closed loop, one state
+  δ̇ = −Kγ δ                     linearised about g(u*) = r
+  Y/R = Kγ / (s + Kγ)            DC gain EXACTLY 1 for any γ > 0
+  E/R = s / (s + Kγ)              a zero at DC
+```
+
+So **accuracy does not depend on the curve and speed does.** The integrator's
+state converges to `g⁻¹(r)` without anyone computing an inverse — which is
+also why it re-converges for free when the curve drifts as the bottle empties.
+A proportional law `u = K·e` has no state and would need a standing error to
+hold any thrust at all.
+
+Discrete stability wants `0 < KγT < 2`. With an actuator lag `τ` it becomes
+second order, `ωₙ = √(Kγ/τ)` and `ζ = 1/(2√(Kγτ))`.
+
+### Measured: one controller, six plants
+
+Flown on the standard 2 m profile, `07_thrust_1D`, fixed mass, `K_VALVE=0.05`:
+
+| curve | peak | overshoot | hold RMS | **F err, steady** | converged `u` |
+|---|---|---|---|---|---|
+| `ball` | 2.0425 m | 0.0425 m | 0.0208 m | **−0.00080 N** | 0.5796 |
+| `linear` | 2.1021 m | 0.1021 m | 0.0136 m | **−0.01696 N** | 0.3240 |
+| `quadratic` | 2.0764 m | 0.0764 m | 0.0109 m | **−0.00759 N** | 0.5693 |
+| `sqrt` | 2.0632 m | 0.0632 m | 0.0137 m | **+0.00135 N** | 0.1050 |
+| `deadzone` | 2.0502 m | 0.0502 m | 0.0195 m | **+0.00390 N** | 0.5268 |
+| `reversed` | 2.0417 m | 0.0417 m | 0.0186 m | **+0.00052 N** | 0.1619 |
+
+Read the last two columns together. **The steady-state error is ~zero on every
+curve** — that is the theory above, holding. **The converged opening varies
+5.5×** (0.105 to 0.580) — each run inverted a different curve without being
+told which one. Altitude performance varies only 2.4×, so the unknown curve
+costs transient quality, not accuracy.
+
+### The one requirement, stated precisely
+
+`g` must be **monotonic over the region the loop visits** — not everywhere.
+Measured against the deliberately non-monotonic `reversed` curve at a 19.44 N
+demand:
+
+| start | result |
+|---|---|
+| shut (`u=0`) | converged, `u=0.1620`, 19.440 N |
+| past the peak | **ran away to `u=1.0`, 0.000 N** |
+
+Same curve, same gain, same demand: only the initial condition differs. Past
+the peak `g' < 0`, the feedback sign is inverted, and the integrator drives the
+valve the wrong way until it pins. On a flight from the pad `reversed` flies
+fine (the table above) because the loop only ever visits the rising branch.
+
+### Time dependence: the curve moves as the gas leaves
+
+Initial testing shows the thrust stays steady long enough to be useful, and the
+model says how long: while the regulator holds, `dP/dt = (RT/V)·ṁ` is constant,
+so the flat window is the pressure above setpoint divided by that rate. On the
+reference engine that is **12.5 s wide open and 29.5 s at the hold point** —
+both are reported, because quoting one number for "the window" is misleading
+(a hover profile mostly sits part-open).
+
+The part-open figure is quoted **by flow, not by valve position**:
+`VALVE_HOLD_POSITION` is a flow fraction, and feeding `0.425` to a position
+API lands inside the ball curve's dead zone and reports an infinite window.
+
+After dropout the feed scales the curve without reshaping it (choked flow makes
+thrust ~proportional to chamber pressure). Forcing that inside a profile with
+a small bottle:
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover_valve \
+    --scene scenes/07_thrust_1D.xml --target 2.0 --valve --valve-tank-l 12 \
+    --fixed-mass --isp 57.8
+```
+
+| | full bottle | 12 L bottle, regulator drops out |
+|---|---|---|
+| feed at end of run | 1.000 | **0.216** of nominal |
+| steady-state F err | −0.00080 N | **−0.00080 N** |
+| overshoot | 0.0425 m | 0.0425 m |
+| hold RMS | 0.0208 m | 0.0208 m |
+
+**The same valve position delivers under a quarter of its original thrust, and
+the flight is unchanged to four decimal places.** The loop has no model of the
+blowdown; the integrator simply re-converges. Measured the other way — freezing
+the valve over a 60 s blowdown — the open loop loses 47% of its thrust (19.3 N
+→ 10.4 N) where the closed loop loses 0.6%.
+
+Push it further and the bottle genuinely empties: at 8 L the valve pins wide
+open and `valve_starved_at_s` is flagged at t=20.5 s. That is propellant
+exhaustion, not a control failure — the tracker is behaving correctly by
+sitting saturated, and the run says so rather than leaving a tracking error
+looking like a tuning problem.
+
+### Two bugs worth keeping, both about the same thing
+
+The estimator `F = m(a+g)` is **exact in the air** (60 N commanded → 60.000 N
+read) and **wrong on the pad**, where the floor supplies the balance so it
+reads vehicle weight however little is commanded (0 N → 19.440 N). Below-weight
+demands on the ground therefore give a permanently negative error that winds
+the valve shut, and the fix is to stop integrating while that is true.
+
+Getting *when* to stop wrong failed in both directions, and both are now
+pinned by `scenario.py --selftest`:
+
+| version | what happened |
+|---|---|
+| infer "grounded" from the measurement | froze at `u=0.5812` **mid-climb** and flew a 2 m profile to **61 m** |
+| freeze whenever in contact | sat at `u=0.0000` for the whole 30 s ASCEND phase, **never launched** |
+
+The first is because steady cruise reads `a ≈ 0` with `F_meas ≈ weight` —
+identical to the pad. The pad is distinguished by being **stationary**, not by
+being in balance. The second is because the measurement becomes informative
+again as soon as the demand exceeds weight: at 48.2 N against a 19.44 N weight
+the engine really can accelerate the vehicle.
+
+So contact **gates** the freeze and the demand **decides** it, and the driver
+tells the law what it knows (`set_grounded`, from `data.ncon`) rather than
+leaving it to guess — a real airframe has a leg switch or a load cell, so the
+information exists.
+
+### What a valve run records
+
+Five extra CSV columns, and **only** with `--valve`, so every existing reader
+keeps working:
+
+| column | meaning |
+|---|---|
+| `valve_u` | the opening the tracker commanded. At convergence, `g⁻¹(demand)` |
+| `thrust_cmd_N` | what the altitude law asked for |
+| `thrust_meas_N` | what the tracker estimated — **the only one it sees** |
+| `thrust_act_N` | what the valve delivered — **unknown to the loop** |
+| `feed_frac` | how much of the curve's amplitude the bottle still supports |
+
+Logging the unknowable alongside the knowable is the whole point of a test rig:
+the figure gains two panels, and in them demand, estimate and delivery sit on
+top of each other while the feed fraction falls away underneath.
+
+`run.json` records the curve, feed mode, bottle size and both windows, so a
+sweep's runs can be told apart afterwards.
+
+### Flags, and the trap the GUI closes
+
+```
+--valve                 command the main engine through the valve
+--valve-curve NAME      ball | linear | quadratic | sqrt | deadzone | reversed
+--valve-feed MODE       constant | regulated | from_tank
+--valve-tank-l L        bottle volume (default: SIZED FROM THE ENGINE)
+--valve-tau S           first-order actuator lag (default 0)
+```
+
+The bottle is sized from the engine by default so the regulated window is the
+same number of *seconds* on any scene. Holding 2 L fixed on a 60 N engine gives
+a 1.2 s window instead of 29 s — a vehicle whose tank could never have flown
+the profile.
+
+**`--valve` only works with a law that returns a 0..1 opening.** Flown with
+`hover`, which returns Newtons, 19.44 is read as an opening, clamped to 1.0,
+and the engine runs flat out for the whole flight — which looks like a wild
+controller rather than the units mismatch it is. `scenario.py` refuses the
+combination by name, and the GUI disables the checkbox for laws that command
+Newtons, naming the ones that do not. The curve list and the law list are both
+**discovered** (from `valve.py` and `example_hover.VALVE_LAWS`), so neither can
+go stale.
+
+The Live tab has no valve: `sim_worker.py` does not build one, so offering it
+there would be a flag that goes nowhere.
+
+---
+
+## 16. Where to go next
 
 This project deliberately covers only gravity and collisions. The natural next
 steps, and where each attaches:

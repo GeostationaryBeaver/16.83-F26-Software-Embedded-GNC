@@ -55,6 +55,7 @@ GAIN_GROUPS = (
     ("hover_pid  (integral)",        ("KI_ALT", "I_LIMIT_N")),
     ("hover_cascade",                ("KP_POS_V", "KP_V", "V_MAX_MPS")),
     ("2-rate cascade",               ("OUTER_HZ",)),
+    ("hover_valve  (thrust tracker)", ("K_VALVE", "GROUND_VZ_MPS")),
 )
 GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
 
@@ -64,6 +65,33 @@ GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
 # the cmd builders below DROP them - they used to be passed and silently
 # ignored, which also put meaningless numbers in run.json.
 MASS_FIELDS = ("propellant", "dry_mass", "isp")
+
+# Fields that only mean anything with the valve layer on. Like MASS_FIELDS
+# these are greyed AND dropped when off, so they cannot put a curve name in
+# run.json for a run that never had a valve.
+VALVE_FIELDS = ("valve_curve", "valve_feed", "valve_tank_l", "valve_tau")
+
+# Which laws command a 0..1 valve opening rather than Newtons. Read from the
+# controller module so it cannot drift from what scenario.py enforces -
+# flying a Newtons law through the valve reads 19.44 as "wide open".
+def valve_laws():
+    try:
+        import importlib
+        return tuple(getattr(importlib.import_module(CONTROLLER_MODULE),
+                             "VALVE_LAWS", ("hover_valve",)))
+    except Exception:
+        return ("hover_valve",)
+
+
+# The curve family the rig can hide behind the valve, discovered from
+# valve.py rather than listed here, so a new curve appears with no edit.
+def valve_curves():
+    try:
+        import importlib
+        return tuple(getattr(importlib.import_module("valve"),
+                             "CURVE_NAMES", ("ball",)))
+    except Exception:
+        return ("ball",)
 POLL_MS = 50                          # queue drain / telemetry cadence
 
 
@@ -164,14 +192,22 @@ def build_scenario_cmd(params, python=None, script=None):
                       ("--gravity", "gravity"),
                       ("--gains", "gains"),
                       ("--camera", "camera"),
+                      ("--valve-curve", "valve_curve"),
+                      ("--valve-feed", "valve_feed"),
+                      ("--valve-tank-l", "valve_tank_l"),
+                      ("--valve-tau", "valve_tau"),
                       ("--label", "label")):
         if fixed and key in MASS_FIELDS:
             continue      # no tank is built, so these would be ignored
+        if key in VALVE_FIELDS and not params.get("valve"):
+            continue      # no valve is built, so these would be ignored
         v = params.get(key)
         if v not in (None, ""):
             cmd += [flag, str(v)]
     if fixed:
         cmd.append("--fixed-mass")
+    if params.get("valve"):
+        cmd.append("--valve")
     if params.get("no_plot"):
         cmd.append("--no-plot")
     if params.get("video"):
@@ -347,6 +383,11 @@ class App:
                 "gains": self.gain_spec(self.g_vars,
                                         self._used_gains(self.v_ctrl.get())),
                 "fixed_mass": bool(self.v_fixed.get()),
+                "valve": bool(self.v_valve.get()),
+                "valve_curve": self.v_vcurve.get().strip(),
+                "valve_feed": self.v_vfeed.get().strip(),
+                "valve_tank_l": self.v_vtank.get().strip(),
+                "valve_tau": self.v_vtau.get().strip(),
                 "video": bool(self.v_video.get()),
                 "all_thrusters": bool(self.v_allthr.get()),
                 "no_plot": False}
@@ -409,6 +450,49 @@ class App:
                 live = [n for n in GAIN_FIELDS if n in used]
                 hint.set(f"{law} reads: " + (", ".join(live) if live
                                              else "none of these"))
+
+    def _update_valve_fields(self):
+        """Grey the valve boxes when no valve is flying, and the checkbox
+        itself when the selected law cannot command one.
+
+        Two separate reasons, both worth showing rather than discovering:
+
+          the LAW       only laws in example_hover.VALVE_LAWS return a 0..1
+                        opening. Flying one that returns Newtons through the
+                        valve reads 19.44 as "wide open, clamped" and the
+                        engine runs flat out for the whole flight - which
+                        looks like a wild controller, not a units mismatch.
+                        scenario.py refuses it; the GUI should not offer it.
+          the CHECKBOX  with the valve off, curve / feed / bottle / lag are
+                        never read, so they are greyed AND dropped from the
+                        argv - the same treatment MASS_FIELDS gets under
+                        fixed mass, and for the same reason: a flag that is
+                        passed and ignored still lands in run.json.
+        """
+        if not hasattr(self, "cb_valve"):
+            return
+        law = self.v_ctrl.get()
+        laws = valve_laws()
+        can = law in laws
+        try:
+            self.cb_valve.configure(state="normal" if can else "disabled")
+        except Exception:
+            pass
+        if not can and self.v_valve.get():
+            self.v_valve.set(0)       # cannot silently fly an invalid combo
+        on = can and bool(self.v_valve.get())
+        self._set_enabled(self.valve_widgets, on)
+        if hasattr(self, "v_valvehint"):
+            if not can:
+                self.v_valvehint.set(
+                    f"{law} commands Newtons directly.\n"
+                    f"valve laws: {', '.join(laws)}")
+            elif on:
+                self.v_valvehint.set(
+                    "the law sets a 0..1 opening;\n"
+                    "an unknown curve makes the force")
+            else:
+                self.v_valvehint.set("")
 
     def _update_mass_fields(self):
         """Grey propellant / dry mass / Isp when flying fixed mass.
@@ -529,13 +613,59 @@ class App:
                 ent.grid(row=1, column=col, sticky="w", padx=(0, 6))
                 self.g_vars[name] = var
                 self.g_widgets[name] = (lbl, ent)
+        # The valve layer, in its own labelled box because it changes what
+        # the controller's numbers MEAN: with it on, the main engine is
+        # commanded as a 0..1 opening and an unknown curve turns that into
+        # Newtons. Only laws that return an opening can be flown this way,
+        # and the checkbox disables itself for the others rather than
+        # letting a run fail in the driver.
+        vbox = ttk.Labelframe(self.tab_run, text="valve layer  (the "
+                              "controller is NOT told the thrust curve)",
+                              padding=(8, 2, 8, 4))
+        vbox.pack(fill="x", padx=8, pady=(2, 0))
+        self.v_valve = tk.IntVar(value=0)
+        self.cb_valve = ttk.Checkbutton(
+            vbox, text="command a valve", variable=self.v_valve,
+            command=self._update_valve_fields)
+        self.cb_valve.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+        self.v_vcurve = tk.StringVar(value="")
+        self.v_vfeed = tk.StringVar(value="")
+        self.v_vtank = tk.StringVar(value="")
+        self.v_vtau = tk.StringVar(value="")
+
+        def vfield(col, text, var, values=None, width=10):
+            lbl = ttk.Label(vbox, text=text)
+            lbl.grid(row=0, column=col, sticky="w", padx=(0, 8))
+            if values is None:
+                w = ttk.Entry(vbox, textvariable=var, width=width)
+            else:
+                w = ttk.Combobox(vbox, textvariable=var, values=values,
+                                 state="readonly", width=width)
+            w.grid(row=1, column=col, sticky="w", padx=(0, 8))
+            return lbl, w
+
+        # Curves discovered from valve.py, so a new one needs no edit here.
+        # "" means "use valve.py's own default", like every other blank box.
+        self.valve_widgets = [
+            vfield(1, "curve", self.v_vcurve, ("",) + valve_curves(), 11),
+            vfield(2, "feed", self.v_vfeed,
+                   ("", "constant", "regulated", "from_tank"), 11),
+            vfield(3, "bottle [L]", self.v_vtank),
+            vfield(4, "lag tau [s]", self.v_vtau),
+        ]
+        self.v_valvehint = tk.StringVar(value="")
+        ttk.Label(vbox, textvariable=self.v_valvehint, foreground="#606060"
+                  ).grid(row=0, column=5, rowspan=2, sticky="w", padx=(6, 0))
+
         self.v_gainhint = tk.StringVar(value="")
         ttk.Label(gbox, textvariable=self.v_gainhint, foreground="#606060"
                   ).grid(row=0, column=len(GAIN_GROUPS), sticky="nw",
                          padx=(4, 0))
         self.v_ctrl.trace_add("write", lambda *_: self._update_gain_fields())
+        self.v_ctrl.trace_add("write", lambda *_: self._update_valve_fields())
         self._update_gain_fields()
         self._update_mass_fields()
+        self._update_valve_fields()
 
         bar = ttk.Frame(self.tab_run, padding=8)
         bar.pack(fill="x")
@@ -1503,6 +1633,40 @@ def run_selftest() -> int:
     truth("LineReader catches BlockingIOError only",
           "except BlockingIOError:" in lsrc
           and "except Exception:\n            pass" not in lsrc)
+
+    print("\n[2e] the valve layer controls")
+    vbase = {**base, "valve": True, "valve_curve": "sqrt",
+             "valve_feed": "regulated", "valve_tank_l": "12",
+             "valve_tau": "0.01", "controller": "hover_valve"}
+    cv = build_scenario_cmd(vbase, python="PY", script="S")
+    truth("--valve is passed when the box is checked", "--valve" in cv)
+    for flag, val in (("--valve-curve", "sqrt"), ("--valve-feed", "regulated"),
+                      ("--valve-tank-l", "12"), ("--valve-tau", "0.01")):
+        truth(f"  {flag} is passed",
+              flag in cv and cv[cv.index(flag) + 1] == val)
+    # OFF, the four settings must be DROPPED, not merely ignored. Passed and
+    # ignored is how a fixed-mass run came to record a 4 kg tank in
+    # run.json, and the same trap applies to a curve name.
+    coff = build_scenario_cmd({**vbase, "valve": False},
+                              python="PY", script="S")
+    truth("  with the valve off, --valve is absent", "--valve" not in coff)
+    truth("    and so is every valve setting, not just ignored",
+          not any(a.startswith("--valve") for a in coff),
+          " ".join(a for a in coff if a.startswith("--valve")) or "none")
+    truth("  VALVE_FIELDS names match the params() keys",
+          set(VALVE_FIELDS) <= set(vbase))
+    # The Live tab has no valve: sim_worker.py does not build one, so
+    # offering it there would be a flag that goes nowhere.
+    wv = build_worker_cmd(vbase, 1, python="PY", script="S")
+    truth("  the live worker is never given valve flags",
+          not any(a.startswith("--valve") for a in wv))
+    # Discovery, not a hand-kept list - the same rule as find_scenes.
+    truth("the curve family is read from valve.py",
+          set(valve_curves()) >= {"ball", "linear", "reversed"},
+          ", ".join(valve_curves()))
+    truth("the valve laws are read from the controller module",
+          "hover_valve" in valve_laws() and "hover" not in valve_laws(),
+          ", ".join(valve_laws()))
 
     print("\n[8] the interactive figure view")
     # The toolbar is the whole point: pan, box-zoom and Home are what make a

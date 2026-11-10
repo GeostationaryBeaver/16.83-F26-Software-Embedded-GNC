@@ -194,7 +194,7 @@ def main() -> int:
 # THE CONTROL LOOP
 # =======================================================================
 def control_tick(mujoco, model, data, thrusters, body_id, controller,
-                 logger, mass=None):
+                 logger, mass=None, valve=None):
     """One closed-loop tick: read state -> decide -> command.
 
     This is the whole idea, and it is only four lines:
@@ -213,13 +213,24 @@ def control_tick(mujoco, model, data, thrusters, body_id, controller,
     disturbance. The alternative is mujoco.set_mjcb_control, which MuJoCo
     calls inside mj_step - necessary if you use the RK4 integrator and
     want the law evaluated at substeps too.
+
+    `valve`, a ValveActuator, changes what the controller's numbers MEAN:
+    the main engine's command becomes a valve opening in 0..1 and the valve
+    converts it to Newtons through a curve the law is never told. Everything
+    else - the RCS nozzles - stays in Newtons. Passing the valve to a law
+    that returns Newtons would read 19.44 as "1.0, clamped" and fly a
+    wide-open engine; the drivers guard against that by name, see
+    scenario.py's --valve handling.
     """
     from thrusters import CraftState
     state = CraftState.from_data(model, data, body_id, mass)
     if controller is not None:
         cmds = controller(state)
         if cmds:
-            thrusters.apply(data, cmds)
+            if valve is not None:
+                valve.apply(data, cmds, thrusters)
+            else:
+                thrusters.apply(data, cmds)
     if logger is not None:
         logger.record(state, thrusters.magnitudes(data))
     return state

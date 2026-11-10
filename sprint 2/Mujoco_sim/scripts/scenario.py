@@ -62,6 +62,11 @@ HOLD_AT_GROUND_S = 3.0    # s, sitting on the floor again before the run ends
 ARRIVE_TOL_M     = 0.05   # m, half-width of the "close enough" band
 SETTLE_TOL_MPS   = 0.05   # m/s, must also be this slow to count as arrived
 PHASE_TIMEOUT_S  = 30.0   # s, give up on a phase that never arrives
+GROUND_VZ_MPS    = 0.02   # m/s, how still counts as resting on the pad when
+                          #   telling a control law about contact. Paired
+                          #   with data.ncon > 0: touching alone is true in a
+                          #   bounce, slow alone is true at the top of a
+                          #   climb, and only both together mean resting.
 
 PHASES = ("GROUND_SIT", "ASCEND", "HOLD_TARGET", "DESCEND", "GROUND_HOLD")
 STAMP_FMT = "%Y-%m-%d_%H%M%S"   # matches the 03 - Checks house convention
@@ -280,7 +285,7 @@ class Profile:
         return self.setpoint
 
 
-def make_logger(ThrustLogger, names):
+def make_logger(ThrustLogger, names, valve=False):
     """A ThrustLogger that also records the setpoint, acceleration and phase.
 
     Subclassed rather than rewritten so the existing column order and CSV
@@ -300,22 +305,46 @@ def make_logger(ThrustLogger, names):
     And both applied thrust (<name>_N, from the parent) and raw command
     (ctrl_<name>) are kept, because they differ whenever the actuator
     saturates - that difference is the saturation.
+
+    valve=True appends five more columns, and ONLY then, so a normal run's
+    CSV stays byte-identical and the existing readers keep working:
+
+      valve_u        the opening the tracker commanded, 0..1. At convergence
+                     this is g^-1(demand) - the inverse of a curve nobody
+                     computed.
+      thrust_cmd_N   what the altitude law asked for.
+      thrust_meas_N  what the tracker ESTIMATED from acceleration. This is
+                     the signal the loop actually closes on, and it is not
+                     the same as the delivery: on the pad it reads vehicle
+                     weight however little is commanded.
+      thrust_act_N   what the valve actually delivered, which the controller
+                     never sees. Logging the unknowable alongside the
+                     knowable is the whole point of a test rig.
+      feed_frac      how much of the curve's amplitude the feed still
+                     supports, 1.0 while the regulator holds.
     """
 
     class ScenarioLogger(ThrustLogger):
         @property
         def header(self):
-            return (super().header
+            cols = (super().header
                     + ["setpoint_m", "accel_mps2", "qacc_mps2", "phase"]
                     + [f"ctrl_{n}" for n in self.names]
                     + ["mass_kg", "propellant_kg"])
+            if valve:
+                cols += ["valve_u", "thrust_cmd_N", "thrust_meas_N",
+                         "thrust_act_N", "feed_frac"]
+            return cols
 
         def record_tick(self, state, magnitudes, setpoint, accel, qacc,
-                        phase, ctrls, mass_kg, propellant_kg):
+                        phase, ctrls, mass_kg, propellant_kg, valve_row=None):
             super().record(state, magnitudes)
             self.rows[-1].extend([setpoint, accel, qacc, phase]
                                  + [float(c) for c in ctrls]
                                  + [mass_kg, propellant_kg])
+            if valve:
+                self.rows[-1].extend([float(x) for x in
+                                      (valve_row or (0.0,) * 5)])
 
         def save(self, path):
             """Like the parent, but tolerant of the non-numeric phase column.
@@ -339,7 +368,7 @@ def make_logger(ThrustLogger, names):
 
 
 def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust,
-            tank=None):
+            tank=None, valve=None):
     """Reduce the flight to the numbers worth comparing between controllers."""
     ix = {c: i for i, c in enumerate(cols)}
     t = [r[ix["time_s"]] for r in rows]
@@ -398,6 +427,39 @@ def metrics(rows, cols, prof, target, z_ground, descent_rate, max_thrust,
         # tank thinks it burned. A mismatch means a write went missing.
         out["mass_bookkeeping_err_kg"] = (abs((mk[0] - mk[-1]) - tank.used_kg)
                                           if mk else None)
+    if valve is not None and "thrust_cmd_N" in ix:
+        # How well the tracker did its ONE job: hold measured thrust to the
+        # demand. Judged in the air only - on the pad the estimator reads
+        # vehicle weight however little is commanded, so a ground sample
+        # would score a broken observation as a tracking error.
+        cmd = [r[ix["thrust_cmd_N"]] for r in rows]
+        mea = [r[ix["thrust_meas_N"]] for r in rows]
+        act = [r[ix["thrust_act_N"]] for r in rows]
+        u = [r[ix["valve_u"]] for r in rows]
+        air = [i for i, p in enumerate(ph)
+               if p in ("ASCEND", "HOLD_TARGET", "DESCEND")]
+        errs = [cmd[i] - mea[i] for i in air]
+        out["valve_curve"] = valve.curve_name
+        out["valve_feed_mode"] = valve.feed_mode
+        out["thrust_err_rms_N"] = ((sum(e * e for e in errs) / len(errs)) ** 0.5
+                                   if errs else None)
+        out["thrust_err_max_N"] = max((abs(e) for e in errs), default=None)
+        # The last HOLD_TARGET sample: the steady-state error the integrator
+        # is supposed to drive to zero whatever the curve. This is the number
+        # that should be curve-INDEPENDENT; the settling time is not.
+        hold_i = [i for i, p in enumerate(ph) if p == "HOLD_TARGET"]
+        out["thrust_err_final_N"] = (cmd[hold_i[-1]] - mea[hold_i[-1]]
+                                     if hold_i else None)
+        out["valve_u_final"] = u[hold_i[-1]] if hold_i else None
+        out["valve_travel_total"] = valve.travel_total
+        out["valve_pinned_s"] = valve.pinned_s
+        out["valve_starved_at_s"] = valve.starved_at_s
+        out["feed_frac_final"] = (rows[-1][ix["feed_frac"]] if rows else None)
+        # Delivery vs estimate. The controller never sees this; it is here
+        # to show that closing on an ESTIMATE still delivers the force.
+        out["delivery_err_rms_N"] = (
+            (sum((act[i] - mea[i]) ** 2 for i in air) / len(air)) ** 0.5
+            if air else None)
     return out
 
 
@@ -519,7 +581,7 @@ def config_lines(controller, scene, gains, overridden, profile, mass_note,
 
 def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
                 names, show_mass=False, all_thrusters=False,
-                config=None, save=True):
+                config=None, save=True, show_valve=False):
     """One stacked figure, shared time axis, phases shaded.
 
     Returns (path, fig). path is None when save=False, fig is None when it
@@ -542,6 +604,12 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     config, from config_lines(), adds a text panel down the right-hand side
     naming the law, its gains and the headline metrics, so the figure says
     what produced it.
+
+    show_valve=True adds two more rows for a --valve run: the thrust loop
+    (demand, estimate and actual delivery on one axis) and the valve itself
+    (opening and feed fraction). Those are the only panels where the test
+    rig's point is visible - the controller closes on the ESTIMATE, and the
+    delivery it never sees has to follow anyway.
     """
     import matplotlib
     if matplotlib.get_backend().lower() in ("agg", "template"):
@@ -557,7 +625,12 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
     else:
         plotted, hidden = active_thrusters(rows, cols, names)
 
-    n_panels = 6 if show_mass else 5
+    # Panels are counted, not hard-coded, because --valve adds two and
+    # variable mass adds one and they combine: 5, 6, 7 or 8 rows.
+    n_panels = 5 + (1 if show_mass else 0) + (2 if show_valve else 0)
+    i_mass = 5 if show_mass else None
+    i_thr = 5 + (1 if show_mass else 0) if show_valve else None
+    i_vlv = i_thr + 1 if show_valve else None
     if config:
         # A narrow second COLUMN rather than another row in the stack: the
         # text is about twenty short lines, and a full-width panel would
@@ -642,12 +715,57 @@ def plot_flight(path, rows, cols, prof, target, z_ground, descent_rate,
                              boxstyle="round,pad=0.25"))
 
     if show_mass:
-        ax[5].plot(t, col("mass_kg"), color="#1f5fa8", lw=1.6,
-                   label="total mass")
-        ax[5].plot(t, col("propellant_kg"), color="#c44", lw=1.4, ls="--",
-                   label="propellant remaining")
-        ax[5].set_ylabel("mass [kg]")
-        ax[5].legend(loc="upper right", fontsize=8)
+        ax[i_mass].plot(t, col("mass_kg"), color="#1f5fa8", lw=1.6,
+                        label="total mass")
+        ax[i_mass].plot(t, col("propellant_kg"), color="#c44", lw=1.4, ls="--",
+                        label="propellant remaining")
+        ax[i_mass].set_ylabel("mass [kg]")
+        ax[i_mass].legend(loc="upper right", fontsize=8)
+
+    if show_valve and "thrust_cmd_N" in ix:
+        # THE PANEL THAT SHOWS THE IDEA. Three traces on one axis:
+        #   demand    what the altitude law asked for
+        #   estimate  what the tracker measured - the only one it sees
+        #   delivered what the valve actually produced, which it does not
+        # demand vs estimate is the tracking error the loop is closing; a
+        # gap between estimate and delivered is the estimator being wrong,
+        # which on the pad it certainly is (it reads vehicle weight).
+        a = ax[i_thr]
+        a.plot(t, col("thrust_cmd_N"), "--", color="#c44", lw=1.5,
+               label="demand (the altitude law)", zorder=4)
+        a.plot(t, col("thrust_meas_N"), color="#1f5fa8", lw=1.3,
+               label="estimated (what the loop sees)", zorder=3)
+        a.plot(t, col("thrust_act_N"), color="#1f8a5f", lw=1.1, alpha=0.8,
+               label="delivered (unknown to the loop)", zorder=2)
+        a.set_ylabel("thrust loop [N]")
+        # Shorter labels than the comment above, because at fontsize 7.5 the
+        # explanatory versions ran past the panel's right edge and clipped.
+        a.legend(loc="upper right", fontsize=7.5, framealpha=0.85)
+
+        a = ax[i_vlv]
+        a.plot(t, col("valve_u"), color="#8a5fbf", lw=1.5,
+               label="valve opening u (the integrator)")
+        a.set_ylabel("valve opening [0..1]")
+        a.set_ylim(-0.05, 1.05)
+        a.legend(loc="upper left", fontsize=7.5)
+        # The feed on a twin axis, since it is a fraction on a different
+        # meaning: u is commanded, feed is what the bottle can still support.
+        ff = col("feed_frac")
+        if min(ff, default=1.0) < 1.0 - 1e-9:
+            a2 = a.twinx()
+            a2.plot(t, ff, color="#d08a00", lw=1.2, ls=":",
+                    label="feed fraction (blowdown)")
+            a2.set_ylabel("feed fraction", color="#d08a00")
+            a2.set_ylim(0.0, 1.05)
+            a2.tick_params(axis="y", labelcolor="#d08a00")
+            a2.legend(loc="lower left", fontsize=7.5)
+        else:
+            a.text(0.005, 0.03, "feed flat at 1.00 for the whole run "
+                                "(regulator never dropped out)",
+                   transform=a.transAxes, fontsize=7.5, color="#333",
+                   ha="left", va="bottom",
+                   bbox=dict(facecolor="white", alpha=0.75, edgecolor="none",
+                             boxstyle="round,pad=0.25"))
 
     ax[-1].set_xlabel("time [s]")
 
@@ -745,7 +863,14 @@ def load_run(path):
     prof = meta.get("profile") or {}
     # Thruster names come from the CSV's own header, so a run flown with a
     # different scene still plots without being told what was on it.
-    names = [c[:-2] for c in cols if c.endswith("_N")]
+    #
+    # A thruster column is <name>_N AND has a matching ctrl_<name>. That
+    # second half matters: a --valve run adds thrust_cmd_N, thrust_meas_N
+    # and thrust_act_N, which match the suffix but are not thrusters, and
+    # taking them as names asked for a ctrl_thrust_cmd column that does not
+    # exist (KeyError in the plotter, on a run whose own PNG was fine).
+    names = [c[:-2] for c in cols
+             if c.endswith("_N") and f"ctrl_{c[:-2]}" in cols]
 
     # The config caption, rebuilt so an interactive figure carries the same
     # provenance as the PNG. gains_used_by lives in this module, so the
@@ -787,6 +912,10 @@ def load_run(path):
         "z_ground": meta.get("ground_height_m", 0.0),
         "descent_rate": prof.get("descent_rate_mps", 0.0),
         "show_mass": meta.get("propellant") is not None,
+        # From the CSV's own header, not from run.json: the columns are what
+        # the panels need, and a run.json that went missing must not silently
+        # drop two panels that the data can still fill.
+        "show_valve": "valve_u" in cols,
         "config": config,
         "meta": meta,
         "name": path.name,
@@ -805,6 +934,7 @@ def figure_for_run(path, all_thrusters=False, config=True):
         None, run["rows"], run["cols"], None,
         run["target"], run["z_ground"], run["descent_rate"], run["names"],
         show_mass=run["show_mass"], all_thrusters=all_thrusters,
+        show_valve=run["show_valve"],
         config=run["config"] if config else None, save=False)
     return fig, run
 
@@ -948,6 +1078,30 @@ def main() -> int:
     p.add_argument("--fixed-mass", action="store_true",
                    help="disable the propellant model and fly at the "
                         "scene's constant mass, for comparison")
+    p.add_argument("--valve", action="store_true",
+                   help="command the main engine through a valve whose "
+                        "thrust curve the controller is not told. Requires "
+                        "a law that returns a 0..1 opening, e.g. "
+                        "example_hover:hover_valve")
+    p.add_argument("--valve-curve", default=None, metavar="NAME",
+                   help="which unknown relation to hide behind the valve: "
+                        "ball, linear, quadratic, sqrt, deadzone, reversed. "
+                        "Sweep it to test a FAMILY of plants against one "
+                        "controller")
+    p.add_argument("--valve-feed", default=None, metavar="MODE",
+                   help="constant | regulated | from_tank. 'regulated' "
+                        "holds the curve flat until the bottle drops below "
+                        "the regulator setpoint, then scales it - the "
+                        "time dependence as pressure leaves the system")
+    p.add_argument("--valve-tau", type=float, default=None, metavar="S",
+                   help="first-order valve actuator lag, s (default 0: the "
+                        "real ~1 ms lag is below the physics step)")
+    p.add_argument("--valve-tank-l", type=float, default=None, metavar="L",
+                   help="gas bottle volume, L. The default is SIZED FROM "
+                        "THE ENGINE so the regulated window is the same "
+                        "number of seconds on any scene. Pass a small "
+                        "value to make the regulator drop out inside a "
+                        "profile and see the loop absorb the blowdown")
     p.add_argument("--selftest", action="store_true",
                    help="verify the profile machine numerically and exit")
     args = p.parse_args()
@@ -1074,6 +1228,20 @@ def main() -> int:
                      if mod is not None and hasattr(mod, "current_gains")
                      else None)
 
+    # How the driver reads the tracker's internals, if the law publishes
+    # them. A law without valve_state() still flies - it just logs zeros -
+    # so this is optional in the same way set_gains is.
+    _vs = getattr(mod, "valve_state", None) if mod else None
+    valve_reader = _vs if callable(_vs) else (lambda: (0.0, 0.0, 0.0, 0.0))
+
+    # And how it TELLS the law about contact. The sim knows (data.ncon), a
+    # real airframe knows (a leg switch or a load cell), and a guess
+    # reconstructed from acceleration cannot tell the pad from steady
+    # cruise - both read a ~= 0 at vehicle weight. Measured: inferring it
+    # froze the valve at u=0.5812 mid-climb and flew a 2 m profile to 61 m.
+    _sg = getattr(mod, "set_grounded", None) if mod else None
+    ground_teller = _sg if callable(_sg) else (lambda flag: None)
+
     dt = float(model.opt.timestep)
     qi, vi = vertical_indices(model, mujoco, body_id)
 
@@ -1090,11 +1258,46 @@ def main() -> int:
             propellant_kg=args.propellant if args.propellant is not None else PROPELLANT_KG,
             isp_s=args.isp if args.isp is not None else ISP_S)
 
+    # The valve layer. Built after the tank because it borrows the tank's
+    # Isp for its blowdown mdot - the gas it spends has to match the impulse
+    # it delivers, and inventing a second Isp would let the two disagree.
+    valve = None
+    if args.valve:
+        import valve as valve_mod
+        law = args.controller.split(":")[-1]
+        # A law that returns NEWTONS, flown through the valve, has its 19.44
+        # read as a valve opening, clamped to 1.0, and the engine sits wide
+        # open for the whole flight. The failure looks like a wild controller
+        # rather than a units mismatch, so refuse it by name instead.
+        wants_valve = getattr(mod, "VALVE_LAWS", ("hover_valve",))
+        if law not in wants_valve:
+            print(f"error: --valve needs a law that returns a 0..1 valve "
+                  f"opening, and {law!r} returns Newtons.\n"
+                  f"  Laws in {mod_name!r} built for the valve: "
+                  f"{', '.join(wants_valve)}\n"
+                  f"  Without --valve, {law!r} flies normally.",
+                  file=sys.stderr)
+            return 1
+        try:
+            valve = valve_mod.ValveActuator(
+                model, body_id,
+                max_thrust_n=thrusters[valve_mod.VALVE_THRUSTER].max_thrust_n,
+                curve_name=args.valve_curve,
+                feed_mode=args.valve_feed,
+                tau_s=0.0 if args.valve_tau is None else args.valve_tau,
+                tank_volume_l=args.valve_tank_l,
+                isp_s=(tank.isp_s if tank is not None
+                       else (args.isp if args.isp is not None else None)))
+        except (KeyError, ValueError) as e:
+            print(f"error: --valve: {e}", file=sys.stderr)
+            return 1
+
     z_rest = ground_height(model, data, mujoco, body_id)
     place_on_ground(model, data, mujoco, body_id, z_rest)
 
     prof = Profile(z_rest, args.target, args.descent_rate, dt)
-    logger = make_logger(ThrustLogger, thrusters.names)
+    logger = make_logger(ThrustLogger, thrusters.names,
+                         valve=valve is not None)
     ctrl_every = max(1, round((1.0 / args.control_hz) / dt)) if args.control_hz else 1
 
     print(f"scene       {scene.name}")
@@ -1106,6 +1309,8 @@ def main() -> int:
     else:
         print(f"mass        {float(model.body_mass[body_id]):.3f} kg, fixed "
               f"(--fixed-mass)")
+    if valve is not None:
+        print(valve.describe())
     if wanted_gains:
         print("gains       " + "  ".join(f"{k}={v}" for k, v in
                                           wanted_gains.items()))
@@ -1181,11 +1386,43 @@ def main() -> int:
             setpoint = prof.update(data.time, z, vz)
             setter(setpoint)
 
+            # Contact, measured rather than inferred. Both conditions are
+            # needed: ncon alone is true for a glancing touch during a
+            # bounce, and a slow vz alone is true at the top of a climb.
+            # Resting means touching AND not moving.
+            if valve is not None:
+                ground_teller(data.ncon > 0 and abs(vz) < GROUND_VZ_MPS)
+
             if step_i % ctrl_every == 0:
                 state = control_tick(mujoco, model, data, thrusters, body_id,
-                                     controller, None)
+                                     controller, None, valve=valve)
             else:
                 state = CraftState.from_data(model, data, body_id)
+
+            # *** ORDER MATTERS HERE, three ways. ***
+            #
+            # 1. The valve advances at PHYSICS rate, like the tank: its lag
+            #    and its blowdown are plant, not control. The zero-order hold
+            #    belongs on the POSITION the controller commanded, not on the
+            #    force, so the thrust follows the falling feed smoothly
+            #    instead of stair-stepping at the control rate.
+            # 2. refresh() must run BEFORE tank.update(), because that reads
+            #    np.sum(np.abs(data.ctrl)) *as Newtons*. On a non-control tick
+            #    data.ctrl would otherwise still hold the last conversion,
+            #    and on any tick a raw 0..1 opening left there would
+            #    under-report the burn by a factor of max_thrust (~60x).
+            # 3. refresh() must run AFTER update(), so the force written is
+            #    the one for the position and feed the vehicle has NOW.
+            if valve is not None:
+                if tank is not None:
+                    # One source of truth for how much gas is left: in
+                    # from_tank mode the curve is scaled by the sim's own
+                    # tank rather than by a second blowdown model.
+                    valve.set_tank_fraction(tank.fraction_remaining)
+                valve.update(data, dt)
+                valve.refresh(data, thrusters)
+                u_valve, _a_valve, f_demand, f_valve = valve_reader()
+                valve.note_starved(data.time, f_demand)
 
             # Propellant depletion runs at PHYSICS rate, not control rate: mass
             # leaves the vehicle continuously while the thrust is applied, not
@@ -1198,7 +1435,10 @@ def main() -> int:
             logger.record_tick(state, thrusters.magnitudes(data), setpoint, accel,
                                float(data.qacc[vi]), last_phase, list(data.ctrl),
                                float(model.body_mass[body_id]),
-                               tank.propellant_kg if tank is not None else 0.0)
+                               tank.propellant_kg if tank is not None else 0.0,
+                               valve_row=None if valve is None else
+                               (u_valve, f_demand, f_valve,
+                                valve.last_thrust_n, valve.feed_fraction()))
             vz_prev = vz
 
             if prof.phase != last_phase:
@@ -1239,7 +1479,7 @@ def main() -> int:
 
     main_max = thrusters["main"].max_thrust_n if "main" in thrusters.names else 0.0
     m = metrics(logger.rows, cols, prof, args.target, z_rest,
-                args.descent_rate, main_max, tank)
+                args.descent_rate, main_max, tank, valve)
 
     meta = {
         "scene": scene.name, "controller": args.controller,
@@ -1261,6 +1501,29 @@ def main() -> int:
             "dry_mass_kg": tank.dry_mass_kg,
             "propellant_initial_kg": tank.propellant_initial_kg,
             "isp_s": tank.isp_s,
+        },
+        # Recorded so a sweep's runs can be told apart afterwards: the whole
+        # point of the rig is that ONE controller meets a family of plants,
+        # and without this a run cannot say which member it flew.
+        "valve": None if valve is None else {
+            "curve": valve.curve_name,
+            "feed_mode": valve.feed_mode,
+            "max_thrust_n": valve.max_thrust_n,
+            "tau_s": valve.tau_s,
+            "tank_volume_l": valve.tank_volume_m3 * 1e3,
+            "tank_sized_from_engine": valve.tank_scaled,
+            "reg_setpoint_psig": valve.p_set_psig,
+            # Two windows, because they are different numbers and quoting
+            # one as "the" window is how I previously compared 29.5 s
+            # against 12.5 s and called it a discrepancy. Wide open burns
+            # fastest; the part-open hold point is where a flight sits.
+            #
+            # The part-open figure is quoted by FLOW, not by valve position:
+            # VALVE_HOLD_POSITION is a flow fraction, and feeding 0.425 to
+            # regulated_window_s() on the ball curve lands in the dead zone
+            # and reports `inf`, which a real run did.
+            "regulated_window_s": valve.regulated_window_s(),
+            "regulated_window_at_hold_s": valve.window_at_flow(),
         },
         "phase_boundaries": [{"t": t, "from": a, "to": b}
                              for t, a, b in prof.boundaries],
@@ -1310,6 +1573,7 @@ def main() -> int:
                     args.target, z_rest, args.descent_rate, thrusters.names,
                     show_mass=tank is not None,
                     all_thrusters=args.all_thrusters,
+                    show_valve=valve is not None,
                     config=None if args.no_config_panel else _cfg)
         _, _hidden = active_thrusters(logger.rows, cols, thrusters.names)
         if _hidden and not args.all_thrusters:
@@ -2048,6 +2312,183 @@ def run_selftest() -> int:
         truth("  but does not stomp a backend the caller chose",
               r_keep.stdout.strip().lower() == "pdf",
               r_keep.stdout.strip() or (r_keep.stderr or "")[-120:])
+
+    print("\n[12] the valve layer, flown through the real driver")
+    # These are the checks the standalone valve suite CANNOT make: valve.py
+    # tests the plant with no sim, and every bug found while wiring this up
+    # was an interaction bug that only a flight exposes.
+    out12 = ROOT / "out" / "_selftest_valve"
+
+    def valve_dir(extra=(), plot=False, law="hover_valve", fixed_mass=True):
+        argv = [sys.executable, str(HERE / "scenario.py"),
+                "--controller", f"example_hover:{law}",
+                "--scene", "scenes/07_thrust_1D.xml", "--target", "2.0",
+                "--isp", "57.8", "--valve", "--outdir", str(out12)]
+        if fixed_mass:
+            argv.append("--fixed-mass")
+        if not plot:
+            argv.append("--no-plot")
+        argv += list(extra)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None, r
+        return max(out12.glob("*/"), key=lambda q: q.stat().st_mtime), r
+
+    d_v, r_v = valve_dir()
+    truth("a --valve run completes the profile", d_v is not None,
+          "" if d_v else (r_v.stderr or "")[-200:])
+    if d_v is not None:
+        mv = json.loads((d_v / "run.json").read_text())
+        xv = mv["metrics"]
+        # *** THE TWO BUGS THIS WIRING ACTUALLY HAD. *** Both were freeze
+        # logic, both flew, and neither was visible in valve.py's suite.
+        #
+        # 1. Inferring "grounded" from the measurement froze the valve at
+        #    u=0.5812 mid-climb, because steady cruise reads a ~= 0 with
+        #    F_meas ~= weight exactly like the pad does. The craft flew to
+        #    61 m on a 2 m profile.
+        truth("  does not run away (the cruise-looks-like-the-pad bug)",
+              xv["peak_altitude_m"] < 3.0, f"peak {xv['peak_altitude_m']:.4f} m")
+        # 2. Freezing on contact ALONE never launched: a 48.2 N demand
+        #    against a 19.44 N weight sat at u=0.0000 for the whole 30 s
+        #    ASCEND phase. The freeze needs the demand to be BELOW weight.
+        truth("  does leave the ground (the never-launches bug)",
+              xv["peak_altitude_m"] > 1.9 and not xv["timeouts"],
+              f"peak {xv['peak_altitude_m']:.4f} m, timeouts {xv['timeouts']}")
+        truth("  and tracks the profile as well as a direct-thrust law",
+              abs(xv["overshoot_m"]) < 0.15 and xv["hold_rms_err_m"] < 0.05,
+              f"overshoot {xv['overshoot_m']:+.4f} m, "
+              f"hold RMS {xv['hold_rms_err_m']:.5f} m")
+        # The tracker's own job: zero steady-state thrust error. This is the
+        # claim the state-space analysis makes - DC gain is exactly 1 for
+        # ANY positive slope, so accuracy does not depend on the curve.
+        truth("  steady-state thrust error is ~zero",
+              abs(xv["thrust_err_final_N"]) < 0.05,
+              f"{xv['thrust_err_final_N']:+.5f} N at the end of the hold")
+        truth("  the valve converged part-open, not pinned",
+              0.0 < xv["valve_u_final"] < 1.0 and xv["valve_pinned_s"] == 0.0,
+              f"u={xv['valve_u_final']:.4f}, pinned {xv['valve_pinned_s']:g}s")
+        truth("  nothing starved on a full bottle",
+              xv["valve_starved_at_s"] is None)
+        # run.json must SAY which plant was flown, or a sweep's runs cannot
+        # be told apart afterwards.
+        truth("  run.json records the curve and the feed",
+              mv["valve"]["curve"] == "ball"
+              and mv["valve"]["feed_mode"] == "regulated"
+              and mv["valve"]["tank_sized_from_engine"] is True)
+        # The part-open window is quoted by FLOW. Quoted by POSITION,
+        # VALVE_HOLD_POSITION=0.425 lands in the ball curve's dead zone and
+        # a real run reported `inf` for it.
+        truth("  both regulated windows are finite numbers",
+              0.0 < mv["valve"]["regulated_window_s"] < 1e6
+              and 0.0 < mv["valve"]["regulated_window_at_hold_s"] < 1e6,
+              f"{mv['valve']['regulated_window_s']:.1f}s open, "
+              f"{mv['valve']['regulated_window_at_hold_s']:.1f}s at hold")
+        truth("  and the hold point lasts longer than wide open",
+              mv["valve"]["regulated_window_at_hold_s"]
+              > mv["valve"]["regulated_window_s"])
+
+        # The CSV columns, and the bug in reading them back.
+        import csv as _csvmod
+        with open(d_v / "flight.csv", newline="") as fh:
+            vcols = next(_csvmod.reader(fh))
+        for c in ("valve_u", "thrust_cmd_N", "thrust_meas_N",
+                  "thrust_act_N", "feed_frac"):
+            truth(f"  flight.csv carries {c}", c in vcols)
+        # thrust_cmd_N ends in _N but is NOT a thruster. Taking it as one
+        # asked the plotter for a ctrl_thrust_cmd column that does not
+        # exist - a KeyError rebuilding a run whose own PNG was fine.
+        rv = load_run(d_v)
+        truth("  load_run does not mistake thrust_*_N for thrusters",
+              "thrust_cmd" not in rv["names"] and "main" in rv["names"],
+              ", ".join(rv["names"]))
+        truth("  and notices the valve panels are wanted",
+              rv["show_valve"] is True)
+
+        # Propellant accounting. data.ctrl has to hold NEWTONS before
+        # PropellantTank.update() reads it, because that reads
+        # np.sum(np.abs(data.ctrl)) as Newtons. A raw 0..1 opening left
+        # there would under-report the burn by a factor of max_thrust.
+        d_vt, r_vt = valve_dir(["--dry-mass", "10", "--propellant", "2"],
+                               fixed_mass=False)
+        truth("  a valve run with a tank completes", d_vt is not None,
+              "" if d_vt else (r_vt.stderr or "")[-200:])
+        if d_vt is not None:
+            xt = json.loads((d_vt / "run.json").read_text())["metrics"]
+            truth("    mass bookkeeping still balances",
+                  xt["mass_bookkeeping_err_kg"] < 1e-9,
+                  f"{xt['mass_bookkeeping_err_kg']:.2e} kg")
+            # The scale check: ~19.4 N for ~30 s at Isp 57.8 burns ~1 kg.
+            # Reading a 0..1 opening as Newtons instead would burn ~60x
+            # less, so this interval catches the ordering bug by magnitude.
+            truth("    propellant burned is the right ORDER, not 1/60th",
+                  0.4 < xt["propellant_used_kg"] < 2.0,
+                  f"{xt['propellant_used_kg']:.4f} kg over "
+                  f"{xt['total_duration_s']:.1f}s")
+
+    # A law that returns NEWTONS must be REFUSED, not flown: 19.44 read as
+    # an opening clamps to 1.0 and the engine sits wide open all flight,
+    # which looks like a wild controller rather than a units mismatch.
+    d_bad, r_bad = valve_dir(law="hover")
+    truth("  --valve refuses a law that returns Newtons",
+          d_bad is None and "returns Newtons" in (r_bad.stderr or ""),
+          (r_bad.stderr or "").strip().splitlines()[0][:70] if r_bad.stderr else "")
+
+    # The curve FAMILY. This is what the rig is for: one controller, a
+    # family of unknown plants, and the accuracy claim has to hold on all
+    # of them while the transient is allowed to differ.
+    fam = {}
+    for cname in ("linear", "sqrt", "quadratic"):
+        d_c, _ = valve_dir(["--valve-curve", cname])
+        if d_c is not None:
+            fam[cname] = json.loads((d_c / "run.json").read_text())["metrics"]
+    truth("  every curve in the family flies the profile",
+          len(fam) == 3 and all(not x["timeouts"] for x in fam.values()),
+          ", ".join(f"{k} peak {v['peak_altitude_m']:.3f}"
+                    for k, v in fam.items()))
+    if len(fam) == 3:
+        truth("    steady-state error is ~zero on ALL of them",
+              all(abs(x["thrust_err_final_N"]) < 0.05 for x in fam.values()),
+              ", ".join(f"{k} {v['thrust_err_final_N']:+.5f}N"
+                        for k, v in fam.items()))
+        # The openings must DIFFER - that is the proof each run inverted a
+        # different curve without being told which. Identical openings
+        # would mean the curve was not actually being varied.
+        us = [x["valve_u_final"] for x in fam.values()]
+        truth("    but each inverted a DIFFERENT curve",
+              max(us) / max(min(us), 1e-9) > 1.5,
+              ", ".join(f"{k} u={v['valve_u_final']:.4f}"
+                        for k, v in fam.items()))
+
+    # The time dependence. A small bottle drops the regulator out mid-flight
+    # and the SAME valve position then delivers a fraction of the thrust;
+    # the integrator has to absorb that with no model of it.
+    d_bd, _ = valve_dir(["--valve-tank-l", "12"])
+    if d_bd is not None:
+        xb = json.loads((d_bd / "run.json").read_text())["metrics"]
+        truth("  a small bottle really does drop the regulator out",
+              xb["feed_frac_final"] < 0.5,
+              f"feed down to {xb['feed_frac_final']:.3f} of nominal")
+        truth("    and the loop absorbs the blowdown",
+              abs(xb["thrust_err_final_N"]) < 0.05,
+              f"{xb['thrust_err_final_N']:+.5f} N with the feed at "
+              f"{xb['feed_frac_final']:.3f}")
+        truth("    with the profile unharmed",
+              abs(xb["overshoot_m"]) < 0.15 and not xb["timeouts"],
+              f"overshoot {xb['overshoot_m']:+.4f} m")
+
+    # A --valve run must not disturb a normal one: the extra columns appear
+    # ONLY with the valve, so everything that reads flight.csv keeps working.
+    d_nov, _ = fly_dir("hover")
+    if d_nov is not None:
+        import csv as _csvmod
+        with open(d_nov / "flight.csv", newline="") as fh:
+            ncols = next(_csvmod.reader(fh))
+        truth("  a run WITHOUT --valve has no valve columns",
+              not any(c.startswith(("valve_", "thrust_", "feed_"))
+                      for c in ncols))
+        truth("    and rebuilds with no valve panels",
+              load_run(d_nov)["show_valve"] is False)
 
     print()
     print(bar)

@@ -344,6 +344,36 @@ class ValveActuator:
     def p_tank_psig(self):
         return (self.p_tank_pa - AMBIENT_PA) / PSI_TO_PA
 
+    @property
+    def p_set_psig(self):
+        return (self.p_set_pa - AMBIENT_PA) / PSI_TO_PA
+
+    def window_at_flow(self, flow_fraction=VALVE_HOLD_POSITION):
+        """The regulated window at a fraction of FULL-OPEN FLOW.
+
+        The window depends only on mass flow, never on how the valve was
+        positioned to get it, so this is the honest way to quote the
+        part-open figure for any curve - including one with a dead zone,
+        where the position that gives 42.5% of full flow is not 0.425.
+
+        VALVE_HOLD_POSITION is a FLOW fraction despite the name. Passing it
+        to regulated_window_s(), which takes a POSITION, puts 0.425 inside
+        the ball curve's dead zone and reports an infinite window - a real
+        run did exactly that before this existed.
+        """
+        frac = float(np.clip(flow_fraction, 0.0, 1.0))
+        return self._window_for_thrust(self.max_thrust_n * frac)
+
+    def _window_for_thrust(self, thrust):
+        """Seconds of flat feed while producing this many Newtons."""
+        if thrust <= 0.0 or not self.isp_s:
+            return float("inf")
+        mdot = thrust / (self.isp_s * 9.80665)
+        rate = (GAS_R_J_KGK * GAS_TEMP_K / self.tank_volume_m3) * mdot
+        if rate <= 0.0:
+            return float("inf")
+        return max(0.0, (self.p_tank_initial_pa - self.p_set_pa) / rate)
+
     def regulated_window_s(self, position=1.0):
         """How long the feed stays flat at this opening, in seconds.
 
@@ -352,15 +382,13 @@ class ValveActuator:
         the setpoint divided by that rate. Reported by describe() and
         asserted by the selftest, because "steady long enough to be useful"
         is a claim that should fail loudly if a parameter changes.
+
+        Takes a valve POSITION. A position inside a dead zone passes no gas
+        and the window is infinite, which is correct and is also why the
+        part-open figure is quoted with window_at_flow() instead.
         """
-        thrust = curve(position, self.max_thrust_n, self.curve_name)
-        if thrust <= 0.0 or not self.isp_s:
-            return float("inf")
-        mdot = thrust / (self.isp_s * 9.80665)
-        rate = (GAS_R_J_KGK * GAS_TEMP_K / self.tank_volume_m3) * mdot
-        if rate <= 0.0:
-            return float("inf")
-        return max(0.0, (self.p_tank_initial_pa - self.p_set_pa) / rate)
+        return self._window_for_thrust(
+            curve(position, self.max_thrust_n, self.curve_name))
 
     @property
     def regulated(self):
@@ -406,13 +434,38 @@ class ValveActuator:
                 value, direction = cmd
             if name == VALVE_THRUSTER:
                 self.commanded = float(np.clip(float(value), 0.0, 1.0))
+                # The force is for the position the valve is AT, not the one
+                # just commanded - with tau > 0 those differ, and crediting
+                # the command would be modelling a valve with no lag.
                 newtons = self.thrust_for(self.position)
                 out[name] = newtons
                 converted[name] = (newtons, direction) if direction is not None else newtons
             else:
                 converted[name] = cmd
         applied = thrusters.apply(data, converted)
-        self.last_thrust_n = float(out.get(VALVE_THRUSTER, 0.0))
+        self.last_thrust_n = float(applied.get(VALVE_THRUSTER, 0.0))
+        return applied
+
+    def refresh(self, data, thrusters):
+        """Re-write data.ctrl from the valve's CURRENT state, no new command.
+
+        The control law may run at 50 Hz while the physics runs at 500 Hz,
+        and the blowdown moves on every physics tick. Without this, the
+        Newtons written at the last control tick would be held for the whole
+        decimation interval and the thrust would stair-step down instead of
+        falling smoothly - the zero-order hold belongs on the valve POSITION
+        (which is what the controller commands) and not on the force (which
+        is what the plant delivers).
+
+        Also the hook that keeps propellant accounting honest: data.ctrl has
+        to hold Newtons before PropellantTank.update() reads it, because that
+        reads np.sum(np.abs(data.ctrl)) AS Newtons. A 0..1 valve opening left
+        sitting there would under-report the burn by a factor of max_thrust.
+        """
+        t = thrusters[VALVE_THRUSTER]
+        newtons = self.thrust_for(self.position)
+        applied = t.set(self._model, data, newtons)
+        self.last_thrust_n = float(applied)
         return applied
 
     def update(self, data, dt):
@@ -490,7 +543,8 @@ class ValveActuator:
                     f"{self.p_tank_psig:.0f} psig / "
                     f"{self.tank_volume_m3 * 1e3:.2f} L"
                     + ("  (sized from the engine)" if self.tank_scaled else "")
-                    + f"   flat ~{self.regulated_window_s():.0f} s at full open")
+                    + f"   flat ~{self.regulated_window_s():.0f} s wide open,"
+                    + f" ~{self.window_at_flow():.0f} s at the hold point")
         else:
             feed = self.feed_mode
         return (f"valve       {self.curve_name!r}, 0..1 -> 0..{self.max_thrust_n:.1f} N"

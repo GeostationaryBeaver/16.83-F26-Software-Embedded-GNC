@@ -2027,6 +2027,104 @@ top of each other while the feed fraction falls away underneath.
 `run.json` records the curve, feed mode, bottle size and both windows, so a
 sweep's runs can be told apart afterwards.
 
+### What each valve gain actually tunes
+
+`hover_valve` reads `KP_ALT` and `KD_ALT` like every other hover law, plus
+five of its own. They are not five tuning knobs — only the first one is.
+
+**`K_VALVE` = 0.05** — valve travel per second per Newton of error. The
+integrator gain in `u̇ = K(r − F_meas)`, and **the only real tuning knob
+here.**
+
+It sets **bandwidth, not accuracy.** The loop eigenvalue is `−Kγ`, so
+`τ = 1/(Kγ)` — and `γ` belongs to the curve, not to you:
+
+| curve | `γ` range (N/unit) | spread | `τ` at K=0.05 |
+|---|---|---|---|
+| `linear` | 60.0 – 60.0 | 1× | 0.333 s everywhere |
+| `deadzone` | 42.9 – 85.7 | 2× | 0.233 – 0.466 s |
+| `ball` | 9.1 – 294.1 | **32×** | 0.068 – 2.194 s |
+| `sqrt` | 30.0 – 1897.4 | **63×** | 0.011 – 0.667 s |
+| `quadratic` | 0.1 – 119.9 | **1999×** | 0.167 s – minutes |
+
+**You tune `K`; the plant picks your bandwidth.** One number cannot give a
+uniform response across a nonlinear curve, and that is the finding, not a
+defect. In flight on `ball`:
+
+| `K_VALVE` | overshoot | hold RMS | F err RMS | F err steady |
+|---|---|---|---|---|
+| 0.01 | 0.1481 m | 0.0068 m | 7.945 N | +0.02414 N |
+| **0.05** | 0.0425 m | 0.0208 m | 3.774 N | −0.00080 N |
+| 0.2 | 0.0451 m | 0.0228 m | 1.900 N | −0.00033 N |
+| 1.0 | 0.0457 m | 0.0233 m | **0.886 N** | −0.00007 N |
+
+Raising `K` buys **transient** speed — error RMS falls 9× — while the steady
+error is already tiny at every `K`, because `E/R = s/(s+Kγ)` has its zero at
+DC regardless. The ceiling is discrete stability `KγT < 2` evaluated at the
+curve's STEEPEST point: `K < 3.400` on `ball`, `K < 16.667` on `linear`, at
+T = 2 ms. 0.05 sits two orders of magnitude inside that, deliberately,
+because `γ` is not known in advance.
+
+**`ACCEL_NOISE_SIGMA` = 0.0 and `ACCEL_LPF` = 1.0** — not tuning. They
+**corrupt the loop's input** so the does-this-survive-real-hardware question
+can be answered. `F_meas = m(a+g)`, and `a` is differenced from velocity,
+which amplifies noise.
+
+| σ (m/s²) | LPF | overshoot | hold RMS | F err RMS | **valve travel** |
+|---|---|---|---|---|---|
+| 0.0 | 1.0 | 0.0425 m | 0.0208 m | 3.774 N | **0.831** |
+| 0.5 | 1.0 (none) | 0.0343 m | 0.0160 m | 7.117 N | **7.907** |
+| 0.5 | 0.1 | 0.0434 m | 0.0241 m | 4.061 N | **2.466** |
+| 2.0 | 1.0 (none) | 0.0481 m | 0.0229 m | 24.539 N | **29.688** |
+| 2.0 | 0.05 | 0.1108 m | 0.0468 m | 5.333 N | **6.032** |
+
+The travel column is the one that matters for hardware. **Unfiltered, σ = 2.0
+makes the valve travel 29.7 units instead of 0.831 — 36× the actuator wear
+for a flight that still looks fine on altitude.** The integrator averages the
+noise out of the trajectory; the valve physically chatters doing it.
+
+`ACCEL_LPF` is first-order smoothing (1.0 = none, smaller = heavier) and buys
+that back — 0.05 cuts σ = 2.0's travel from 29.7 to 6.0 — at the cost of
+phase lag inside the loop: overshoot 0.048 → 0.111 m, hold RMS doubled. **The
+real trade is actuator wear against phase margin**, and it is the one decision
+here that needs a sensor spec to settle.
+
+**`GROUND_FREEZE` = True and `GROUND_VZ_MPS` = 0.02** — not tuning either.
+They repair a **broken measurement**, per the section above: the estimator is
+exact in the air and reads vehicle weight on the pad.
+
+Benched with the valve starting part-open at `u = 0.58`, resting, commanded
+5 N against a 19.44 N weight:
+
+| | result |
+|---|---|
+| `GROUND_FREEZE=True` | `u` held at **0.5800** |
+| `GROUND_FREEZE=False` | winds to **0.0000** |
+| `True`, demand 48 N (above weight) | opens to **1.0000** |
+
+That last row is the half that is easy to miss: above weight the engine really
+can accelerate the vehicle, so the reading is informative again and freezing
+there means never launching.
+
+`GROUND_VZ_MPS` is only consulted **when nobody tells the law about contact.**
+`scenario.py` calls `set_grounded(data.ncon > 0 and |vz| < 0.02)`, so a normal
+run bypasses this gate entirely; it is for a driver with no contact signal:
+
+| climbing at 1 m/s, demand 5 N | |
+|---|---|
+| `GROUND_VZ_MPS=0.02` | moving → integrates → `u` 0.58 → **0.0000** (right) |
+| `GROUND_VZ_MPS=5.00` | 1 m/s counts as "still" → **freezes at 0.5800** |
+
+The second row is the 61 m runaway reproduced on the bench. Set the gate too
+wide and steady cruise is mistaken for the pad.
+
+**One caveat on the standard profile.** During `GROUND_SIT` the setpoint sits
+exactly at the craft, so the PD asks for exactly weight (19.440 N) and the
+"demand below weight" half of the guard is never true — the freeze is dormant,
+and sweeping both ground gains over that profile gives byte-identical runs. It
+arms when the demand is genuinely below weight: a target below the craft, or a
+descent command.
+
 ### Flags, and the trap the GUI closes
 
 ```

@@ -1801,6 +1801,32 @@ def run_selftest() -> int:
     truth("ANTI_WINDUP='0' parses as False", _eh.ANTI_WINDUP is False)
     _eh.set_gains(ANTI_WINDUP="true")
     truth("ANTI_WINDUP='true' parses as True", _eh.ANTI_WINDUP is True)
+    # EVERY flag gain, not just the first one anybody thought of. The bug:
+    # GROUND_FREEZE was added to _GAIN_NAMES but the coercion special-cased
+    # ANTI_WINDUP by name, so `--gain GROUND_FREEZE=False` died with
+    # "could not convert string to float: 'False'". The gain was listed,
+    # documented and settable in name only. Derived from _BOOL_GAINS so the
+    # next flag gain is covered the moment it is added to that tuple.
+    for _bg in _eh._BOOL_GAINS:
+        _was = getattr(_eh, _bg)
+        try:
+            _eh.set_gains(**{_bg: "False"})
+            _ok = getattr(_eh, _bg) is False
+            _eh.set_gains(**{_bg: "True"})
+            _ok = _ok and getattr(_eh, _bg) is True
+            truth(f"  {_bg} accepts True/False from the CLI", _ok)
+        except (TypeError, ValueError) as e:
+            truth(f"  {_bg} accepts True/False from the CLI", False,
+                  f"{type(e).__name__}: {e}")
+        _eh.set_gains(**{_bg: _was})
+    # A flag gain must not be left out of _BOOL_GAINS: float() on "False"
+    # raises, so the symptom is a crash, but only for whoever tries to set
+    # it. Checked by TYPE, which is what distinguishes the two coercions.
+    _flags = tuple(n for n in _eh._GAIN_NAMES
+                   if isinstance(getattr(_eh, n, None), bool))
+    truth("every boolean-valued gain is listed in _BOOL_GAINS",
+          set(_flags) == set(_eh._BOOL_GAINS),
+          f"bool-valued {_flags}, declared {_eh._BOOL_GAINS}")
     _eh._integral = 5.0
     _eh.set_gains(KP_ALT=_kp0)
     truth("set_gains clears the integrator", _eh._integral == 0.0)

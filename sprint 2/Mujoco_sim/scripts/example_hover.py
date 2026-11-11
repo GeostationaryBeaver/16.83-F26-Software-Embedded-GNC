@@ -72,6 +72,14 @@ _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
                "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
                "MAX_CANT")
 
+# The gains that are FLAGS, not numbers. set_gains() sends these through
+# _as_bool and everything else through float(). Listed rather than
+# special-cased one at a time: GROUND_FREEZE was added to _GAIN_NAMES but
+# not to the coercion, so `--gain GROUND_FREEZE=False` died with
+# "could not convert string to float: 'False'" - the gain existed, was
+# documented and was settable in name only.
+_BOOL_GAINS = ("ANTI_WINDUP", "GROUND_FREEZE")
+
 OUTER_HZ = 25.0         # Hz, how often hover_cascade_2rate updates its
                         #   OUTER (position) loop. The inner rate loop runs
                         #   on every call, so this sets the rate RATIO that
@@ -242,7 +250,7 @@ def set_gains(**kw):
             raise KeyError(
                 f"unknown gain {name!r}; settable gains are "
                 f"{', '.join(_GAIN_NAMES)}")
-        globals()[name] = (_as_bool(value) if name == "ANTI_WINDUP"
+        globals()[name] = (_as_bool(value) if name in _BOOL_GAINS
                            else float(value))
     reset_state()
 

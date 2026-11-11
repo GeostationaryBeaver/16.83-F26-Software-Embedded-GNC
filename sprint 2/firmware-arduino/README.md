@@ -57,7 +57,7 @@ The dashboard's **Mode** picker sets `cmd_t.mode`; `cmd_t.setpoint` means whatev
 
 One law serves all of them: `demand = valve_hover + kp*(sp_z - z) + kd*(sp_vz - vz)`. Hover is that setpoint standing still, a rate command is the same setpoint moving. Because rate tracking keeps the altitude term, a descent that falls behind is corrected rather than drifting, and mode switches are bumpless — the setpoint re-latches to wherever the vehicle is.
 
-Tuning, in `src/control/gains.h`: change `ACTIVE_GAINS` to the set you want and re-upload; that one line is the only edit. `GAINS_FLIGHT` holds the known-good gains, `GAINS_BENCH` is a half-authority set for a first power-on. The gains that flew are echoed in telemetry (`kp`, `kd`) and recorded in the CSV, so a run always says which set produced it.
+Tuning, in `src/control/gains.h`: change `ACTIVE_GAINS` to the set you want and re-upload; that one line is the only edit. `GAINS_FLIGHT` holds the known-good gains, `GAINS_BENCH` is a half-authority set for a first power-on. **`ACTIVE_GAINS` is `GAINS_BENCH`** until the loop has flown once on a tether. The gains that flew are echoed in telemetry (`kp`, `kd`) and recorded in the CSV, so a run always says which set produced it.
 
 `valve_hover` matters more than either gain. A PD has no integral term, so the vehicle settles with a constant offset of `(true hover opening - valve_hover) / kp` — at `kp = 18`, 5.6 cm per 1 % of feedforward error. A hover that sits consistently low wants a higher `valve_hover`, not a higher `kp`.
 

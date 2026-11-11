@@ -81,7 +81,10 @@ static const gain_set_t GAINS_BENCH = {
 };
 
 // ---- Pick one -------------------------------------------------------------
-#define ACTIVE_GAINS GAINS_FLIGHT
+// GAINS_BENCH until the loop has flown: this law has never driven the valve, so
+// a first power-on should be the half-authority set. Switch to GAINS_FLIGHT once
+// a tethered run has shown the sign and the mounting axis are right.
+#define ACTIVE_GAINS GAINS_BENCH
 
 // ---- Estimator trust ------------------------------------------------------
 // The loop closes on the Kalman filter's z, which only stays true while the

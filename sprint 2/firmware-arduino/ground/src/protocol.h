@@ -10,8 +10,8 @@
 
 // Fill these in with each board's MAC address. To read a board's MAC:
 //   python -m esptool --chip esp32s3 read-mac
-#define HOPPER_MAC  {0xE8, 0xF6, 0x0A, 0xBE, 0x45, 0x04}
-#define GROUND_MAC  {0xE8, 0xF6, 0x0A, 0xD4, 0x09, 0x68}
+#define HOPPER_MAC  {0xE8, 0xF6, 0x0A, 0xD5, 0x12, 0x9C}
+#define GROUND_MAC  {0xE8, 0xF6, 0x0A, 0xD4, 0xD7, 0x24}
 
 #define RADIO_CHANNEL 1
 
@@ -24,7 +24,7 @@ typedef enum {
 // Hopper state. A reboot always comes up SAFE.
 typedef enum {
     STATE_SAFE = 0,      // valve shut
-    STATE_ARMED = 1,     // valve follows the controller (today: cmd_t.valve_pct)
+    STATE_ARMED = 1,     // valve follows the controller (see control/controller.h)
     STATE_FAILSAFE = 2,  // valve shut, latched until the ground disarms and arms again
 } flight_state_t;
 
@@ -33,6 +33,26 @@ typedef enum {
     REASON_LINK = 1,   // no command for 150 ms
     REASON_ESTOP = 2,
 } failsafe_reason_t;
+
+// What the controller does with cmd_t.setpoint while ARMED. MODE_MANUAL is 0, so a
+// command from a sender that never sets the field behaves exactly as it did before.
+typedef enum {
+    MODE_MANUAL = 0,    // valve_pct straight through, no feedback
+    MODE_HOVER = 1,     // hold setpoint metres above the pad
+    MODE_VELOCITY = 2,  // track setpoint m/s climb rate (negative = descend)
+    MODE_LAND = 3,      // descend at the gain set's land_rate, then shut at land_cutoff
+} control_mode_t;
+
+// telemetry_data_t.ctrl_flags bits
+#define CTRL_SAT_HIGH  0x01  // demand hit the gain set's valve_max
+#define CTRL_SAT_LOW   0x02  // demand hit valve_min
+#define CTRL_SP_RAMP   0x04  // altitude setpoint is still chasing the commanded one
+#define CTRL_NO_EST    0x08  // no trusted altitude: loop inhibited, valve shut
+#define CTRL_GND_SHUT  0x10  // went below land_cutoff on the way down: valve latched shut
+
+// Command envelope. The hopper clamps setpoint into these and ignores NaN.
+#define SP_Z_MAX   1.00f  // m. The VL53L0X runs out of range about here
+#define SP_VZ_MAX  0.50f  // m/s, either direction
 
 // Calibrations, set from the ground and kept in the hopper's flash
 typedef enum {
@@ -92,6 +112,15 @@ typedef struct __attribute__((packed)) {
     // Diagnostics
     uint8_t flags;         // FLAG_* bits
     uint16_t i2c_errors;   // I2C read errors since boot
+
+    // Controller. Enough to tune the loop from a recording alone.
+    uint8_t mode;          // control_mode_t actually run, after the unknown-mode fallback
+    uint8_t ctrl_flags;    // CTRL_* bits
+    float sp_z;            // altitude setpoint used (m), NaN in MANUAL
+    float sp_vz;           // climb-rate setpoint used (m/s)
+    float demand;          // controller output before clamping and rounding (%)
+    float kp;              // gains in use, so a recording says which gains flew
+    float kd;
 } telemetry_data_t;
 
 typedef struct __attribute__((packed)) {
@@ -112,4 +141,6 @@ typedef struct __attribute__((packed)) {
     uint8_t tx_power;   // hopper radio power (dBm, 2-20), 0 = full
     uint32_t seq;       // increments by 1 per command
     uint32_t time_us;   // sender's clock, echoed in telemetry
+    uint8_t mode;       // control_mode_t
+    float setpoint;     // MODE_HOVER: metres above the pad. MODE_VELOCITY: m/s, up positive
 } cmd_t;

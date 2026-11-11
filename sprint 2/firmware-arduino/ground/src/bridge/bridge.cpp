@@ -52,6 +52,10 @@ static void usb_to_hopper() {
       cmd->estop = 1;
       cmd->arm = 0;
       cmd->valve_pct = 0;
+      // Without this a closed-loop mode would ignore valve_pct = 0 and keep commanding
+      // its own opening. The hopper's FAILSAFE shuts the valve anyway, but the E-stop
+      // path should not depend on that to mean "shut".
+      cmd->mode = MODE_MANUAL;
     }
     radio_send(pkt, len);
   }

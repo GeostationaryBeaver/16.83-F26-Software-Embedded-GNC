@@ -170,10 +170,31 @@
         <button class="estop" id="estop" disabled>E-stop</button>
       </div>
       <div class="row" style="margin-top:10px">
+        <span class="label k">Mode</span>
+        <select id="mode" class="grow" disabled>
+          <option value="0">Manual valve</option>
+          <option value="1">Hover at altitude</option>
+          <option value="2">Climb / descend at rate</option>
+          <option value="3">Land</option>
+        </select>
+      </div>
+      <div class="row" id="row-valve">
         <span class="label k">Valve</span>
         <input type="range" id="valve-slider" min="0" max="100" step="1" value="0" disabled>
         <span class="mono" id="valve-cmd" style="width:40px;text-align:right">0 %</span>
       </div>
+      <div class="row" id="row-hover" style="display:none">
+        <span class="label k">Hold</span>
+        <input type="number" id="hover-ft" value="2" min="0" max="3.28" step="0.1">
+        <span class="label">ft</span>
+        <span class="mono" id="hover-m" style="width:56px;text-align:right">—</span>
+      </div>
+      <div class="row" id="row-rate" style="display:none">
+        <span class="label k">Rate</span>
+        <input type="range" id="rate-slider" min="-0.5" max="0.5" step="0.01" value="-0.1">
+        <span class="mono" id="rate-cmd" style="width:64px;text-align:right">-0.10 m/s</span>
+      </div>
+      <div class="hint" id="mode-hint"></div>
       <div class="row">
         <span class="label k">Radio</span>
         <select id="txpow" class="grow" disabled>
@@ -222,10 +243,16 @@
 // ---- Protocol: must match firmware-arduino/hopper/src/protocol.h (and ground's copy) ----
 const MSG_TELEMETRY = 1;
 const MSG_CMD = 2;
-const TELEMETRY_LEN = 99;  // type u8, seq u32, time_ms u32, then telemetry_data_t (90 bytes)
-const CMD_LEN = 17;
+const TELEMETRY_LEN = 121;  // type u8, seq u32, time_ms u32, then telemetry_data_t (112 bytes)
+const CMD_LEN = 22;
 const STATES = ["SAFE", "ARMED", "FAILSAFE"];
 const REASONS = ["none", "link lost", "E-stop"];
+const MODE_MANUAL = 0, MODE_HOVER = 1, MODE_VELOCITY = 2, MODE_LAND = 3;
+const MODES = ["MANUAL", "HOVER", "VELOCITY", "LAND"];
+const CTRL_FLAGS = [[0x01, "SAT HIGH"], [0x02, "SAT LOW"], [0x04, "SP RAMP"],
+  [0x08, "NO EST"], [0x10, "GND SHUT"]];
+const SP_Z_MAX = 1.00, SP_VZ_MAX = 0.50;  // must match protocol.h
+const FT_PER_M = 3.280839895;
 const CAL_NONE = 0, CAL_ZERO = 1, CAL_SPAN = 2, CAL_LASER = 3, CAL_CLEAR = 4;
 const HEALTH = [[0x01, "LASER"], [0x02, "IMU"], [0x04, "TEMP"], [0x08, "PRESSURE"], [0x10, "SERVO PWR"]];
 const FLAG_DUAL_I2C = 0x01;
@@ -251,6 +278,8 @@ function decodeTelemetry(p) {
     maxGapMs: v.getUint16(79, true), rssi: v.getInt8(81), txPower: p[82],
     laserOffsetM: f(83), ptZeroMa: f(87), ptSpan: f(91), calAck: p[95],
     flags: p[96], i2cErrors: v.getUint16(97, true),
+    mode: p[99], ctrlFlags: p[100],
+    spZ: f(101), spVz: f(105), demand: f(109), kp: f(113), kd: f(117),
   };
 }
 
@@ -269,6 +298,8 @@ function encodeCmd(c, seq) {
   p[8] = c.txPower;
   v.setUint32(9, seq >>> 0, true);
   v.setUint32(13, nowUs(), true);
+  p[17] = c.mode;
+  v.setFloat32(18, c.setpoint, true);
   return p;
 }
 
@@ -308,7 +339,11 @@ function feed(bytes) {
 const RAD2DEG = 180 / Math.PI;
 const CHANNELS = [
   { name: "Altitude z", unit: "m", get: t => t.z, d: 3 },
+  { name: "Setpoint z", unit: "m", get: t => t.spZ, d: 3 },
+  { name: "Altitude error", unit: "m", get: t => t.spZ - t.z, d: 3 },
   { name: "Velocity v_z", unit: "m/s", get: t => t.vz, d: 3 },
+  { name: "Setpoint v_z", unit: "m/s", get: t => t.spVz, d: 3 },
+  { name: "Valve demand", unit: "%", get: t => t.demand, d: 1 },
   { name: "Accel bias", unit: "m/s²", get: t => t.accelBias, d: 3 },
   { name: "Laser z", unit: "m", get: t => t.laserZ, d: 3 },
   { name: "Accel x", unit: "m/s²", get: t => t.accel[0], d: 2 },
@@ -327,7 +362,7 @@ const CHANNELS = [
   { name: "Round trip", unit: "ms", get: t => t.rttMs, d: 1 },
   { name: "I2C errors", unit: "", get: t => t.i2cErrors, d: 0 },
 ];
-const DEFAULT_PLOTS = ["Altitude z", "Laser z", "Pressure", "Accel z"];
+const DEFAULT_PLOTS = ["Altitude z", "Setpoint z", "Valve demand", "Velocity v_z"];
 
 // ---- Telemetry state ----
 const WINDOW_MS = 10000;
@@ -372,7 +407,7 @@ function onChanges(a, b) {
   if (a.state !== b.state) {
     const why = b.state === 2 ? ` (${REASONS[b.reason] ?? b.reason})` : "";
     log(`Hopper ${STATES[b.state] ?? b.state}${why}`, b.state === 2);
-    if (b.state === 2) { cmd.arm = false; cmd.valvePct = 0; updateControls(); }
+    if (b.state === 2) { cmd.arm = false; cmd.valvePct = 0; setMode(MODE_MANUAL); updateControls(); }
   }
   for (const [bit, name] of HEALTH) {
     if ((a.health ^ b.health) & bit) log(`${name} ${b.health & bit ? "OK" : "LOST"}`, !(b.health & bit));
@@ -381,7 +416,8 @@ function onChanges(a, b) {
 }
 
 // ---- Commands ----
-const cmd = { arm: false, estop: false, valvePct: 0, txPower: 0, calOp: CAL_NONE, calSeq: 0, calValue: 0 };
+const cmd = { arm: false, estop: false, valvePct: 0, txPower: 0, calOp: CAL_NONE, calSeq: 0, calValue: 0,
+  mode: MODE_MANUAL, setpoint: 0 };
 let cmdSeq = 0, writing = false;
 
 function sendCmd() {
@@ -404,12 +440,14 @@ function calibrate(op, value, description) {
 const CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "health", "flags",
   "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
   "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
-  "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors"];
+  "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
+  "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd"];
 function csvRow(t) {
   return [Date.now(), t.seq, t.timeMs, t.state, t.reason, t.valvePct, t.health, t.flags,
     t.z, t.vz, t.accelBias, t.laserZ, ...t.accel, ...t.gyro, t.tempC, t.ptMa, t.psi, t.servoV,
     t.failsafes, t.cmdSeq, t.rttMs, t.maxGapMs, t.rssi, t.txPower, t.laserOffsetM, t.ptZeroMa,
-    t.ptSpan, t.calAck, t.i2cErrors].map(x => Number.isNaN(x) ? "" : x).join(",");
+    t.ptSpan, t.calAck, t.i2cErrors,
+    t.mode, t.ctrlFlags, t.spZ, t.spVz, t.demand, t.kp, t.kd].map(x => Number.isNaN(x) ? "" : x).join(",");
 }
 function toggleRecording() {
   if (!recording) {
@@ -441,7 +479,8 @@ async function connect() {
     // resets an ESP32's USB-Serial/JTAG port, or reboots the Nano into its bootloader.
     await port.setSignals({ dataTerminalReady: true, requestToSend: false });
     writer = port.writable.getWriter();
-    Object.assign(cmd, { arm: false, estop: false, valvePct: 0, calOp: CAL_NONE });
+    Object.assign(cmd, { arm: false, estop: false, valvePct: 0, calOp: CAL_NONE,
+      mode: MODE_MANUAL, setpoint: 0 });
     setConnected(true);
     log("Connected to ground ESP");
     readLoop();
@@ -485,11 +524,30 @@ function log(msg, isError) {
   $("log").prepend(li);
 }
 
-const CONTROLS = ["arm", "estop", "valve-slider", "txpow", "cal-zero", "cal-span", "cal-laser", "cal-clear", "record"];
+const CONTROLS = ["arm", "estop", "mode", "valve-slider", "rate-slider", "hover-ft", "txpow", "cal-zero", "cal-span", "cal-laser", "cal-clear", "record"];
 function setConnected(on) {
   $("connect").textContent = on ? "Disconnect" : "Connect";
   $("connect").classList.toggle("primary", !on);
   CONTROLS.forEach(id => $(id).disabled = !on);
+  updateControls();
+}
+
+const MODE_HINTS = [
+  "The valve follows the slider directly. No feedback.",
+  "The hopper ramps its setpoint to this altitude and holds it.",
+  "The hopper tracks this climb rate. Negative descends.",
+  "The hopper descends at its built-in land rate and shuts the valve at touchdown.",
+];
+
+function setMode(mode) {
+  cmd.mode = mode;
+  // Each mode reads cmd.setpoint differently, so set it from that mode's own control
+  // rather than leaving the previous mode's number in place: switching hover -> rate
+  // would otherwise command 0.6 m/s because the hover field said 0.6 m.
+  if (mode === MODE_HOVER) cmd.setpoint = +$("hover-ft").value / FT_PER_M;
+  else if (mode === MODE_VELOCITY) cmd.setpoint = +$("rate-slider").value;
+  else cmd.setpoint = 0;
+  if (mode !== MODE_MANUAL) cmd.valvePct = 0;
   updateControls();
 }
 
@@ -501,10 +559,18 @@ function updateControls() {
   $("estop").classList.toggle("on", cmd.estop);
   $("valve-slider").value = cmd.valvePct;
   $("valve-cmd").textContent = cmd.valvePct + " %";
+  $("mode").value = cmd.mode;
+  $("row-valve").style.display = cmd.mode === MODE_MANUAL ? "" : "none";
+  $("row-hover").style.display = cmd.mode === MODE_HOVER ? "" : "none";
+  $("row-rate").style.display = cmd.mode === MODE_VELOCITY ? "" : "none";
+  $("hover-m").textContent = (+$("hover-ft").value / FT_PER_M).toFixed(3) + " m";
+  $("rate-cmd").textContent = (+$("rate-slider").value).toFixed(2) + " m/s";
+  $("mode-hint").textContent = MODE_HINTS[cmd.mode] ?? "";
 }
 
 function estop() {
   cmd.estop = true; cmd.arm = false; cmd.valvePct = 0;
+  cmd.mode = MODE_MANUAL; cmd.setpoint = 0;
   updateControls();
   log("E-STOP", true);
 }
@@ -513,9 +579,11 @@ $("connect").onclick = () => port ? disconnect() : connect();
 $("record").onclick = toggleRecording;
 $("arm").onclick = () => {
   cmd.arm = !cmd.arm;
-  if (!cmd.arm) cmd.valvePct = 0;
+  // Disarming drops back to manual: re-arming should never pick straight back up on a
+  // closed-loop setpoint the operator set some time ago.
+  if (!cmd.arm) { cmd.valvePct = 0; setMode(MODE_MANUAL); }
   updateControls();
-  log(cmd.arm ? "Arm requested" : "Disarm");
+  log(cmd.arm ? `Arm requested (${MODES[cmd.mode]})` : "Disarm");
 };
 $("estop").onclick = () => {
   if (cmd.estop) { cmd.estop = false; updateControls(); log("E-stop released"); }
@@ -523,6 +591,21 @@ $("estop").onclick = () => {
 };
 document.addEventListener("keydown", e => { if (e.key === "Escape" && port && !cmd.estop) estop(); });
 $("valve-slider").oninput = e => { cmd.valvePct = +e.target.value; updateControls(); };
+$("mode").onchange = e => {
+  setMode(+e.target.value);
+  log(`Mode ${MODES[cmd.mode]}` + (cmd.mode === MODE_HOVER ? ` at ${cmd.setpoint.toFixed(3)} m`
+    : cmd.mode === MODE_VELOCITY ? ` at ${cmd.setpoint.toFixed(2)} m/s` : ""));
+};
+$("hover-ft").oninput = () => {
+  const m = Math.min(Math.max(+$("hover-ft").value / FT_PER_M, 0), SP_Z_MAX);
+  if (cmd.mode === MODE_HOVER) cmd.setpoint = m;
+  updateControls();
+};
+$("rate-slider").oninput = () => {
+  const r = Math.min(Math.max(+$("rate-slider").value, -SP_VZ_MAX), SP_VZ_MAX);
+  if (cmd.mode === MODE_VELOCITY) cmd.setpoint = r;
+  updateControls();
+};
 $("txpow").onchange = e => {
   cmd.txPower = +e.target.value;
   log("Hopper radio power " + (cmd.txPower ? cmd.txPower + " dBm" : "full"));
@@ -561,6 +644,13 @@ $("health").append(i2cChip);
 // Readout of every field
 const fmt = (x, d) => Number.isFinite(x) ? x.toFixed(d) : "—";
 const READOUT = [
+  ["Controller"],
+  ["mode", t => `${MODES[t.mode] ?? t.mode}${t.ctrlFlags ? " · " + CTRL_FLAGS.filter(([b]) => t.ctrlFlags & b).map(([, n]) => n).join(" ") : ""}`],
+  ["setpoint z", t => fmt(t.spZ, 3) + " m" + (Number.isFinite(t.spZ) ? `  (${fmt(t.spZ * FT_PER_M, 2)} ft)` : "")],
+  ["setpoint v_z", t => fmt(t.spVz, 3) + " m/s"],
+  ["error", t => fmt(t.spZ - t.z, 3) + " m"],
+  ["demand", t => fmt(t.demand, 1) + " %"],
+  ["gains", t => `kp ${fmt(t.kp, 2)}  kd ${fmt(t.kd, 2)}`],
   ["Altitude filter"],
   ["z", t => fmt(t.z, 3) + " m"],
   ["v_z", t => fmt(t.vz, 3) + " m/s"],

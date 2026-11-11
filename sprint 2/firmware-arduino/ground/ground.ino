@@ -10,6 +10,7 @@
 #include "src/drivers/lights.h"
 #include "src/usb/usb_link.h"
 #include "src/bridge/bridge.h"
+#include <WiFi.h>
 
 #define LAMP_TEST_MS 500
 

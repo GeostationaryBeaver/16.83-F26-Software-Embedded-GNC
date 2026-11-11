@@ -24,9 +24,12 @@ void usb_link_init() {
 
 bool usb_link_send(const uint8_t *packet, uint8_t len) {
   if (len < 1 || len > USB_MAX_PACKET_LEN) return false;
-  // Not availableForWrite(): the USB buffer is only 64 bytes, smaller than one frame.
-  // write() returns 0 straight away when nothing has the port open.
-  if (!Serial) return false;
+  // No `if (!Serial)` guard here. On this core in TinyUSB mode USBCDC raises its
+  // connected flag only when the host asserts DTR *and* RTS, and the dashboard has to
+  // leave RTS low (RTS high reboots the Nano into its bootloader). The guard was
+  // therefore always false and silently dropped every frame. write() already returns 0
+  // when nothing has the port open, which the return value below reports.
+  // Not availableForWrite() either: the USB buffer is 64 bytes, smaller than a frame.
   uint8_t frame[3 + USB_MAX_PACKET_LEN + 1];
   frame[0] = SYNC0;
   frame[1] = SYNC1;

@@ -134,7 +134,7 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── import_mesh.py           STL/OBJ -> MJCF, with sanity checks
 │   ├── thrusters.py             Thruster / ThrusterSet / CraftState  (§10)
 │   ├── fly.py                   run a scene under closed-loop control (§10)
-│   ├── example_hover.py         seven control laws + gain plumbing (§14)
+│   ├── example_hover.py         eight control laws + gain plumbing (§14)
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
 │   ├── valve.py                 an unknown thrust curve, as a plant (§15)
@@ -1122,7 +1122,7 @@ to a timestamped directory, so two runs can be put side by side.
 ```bash
 uv run python scripts/scenario.py --controller example_hover:hover
 uv run python scripts/scenario.py --controller example_hover:hover --target 3.5
-uv run python scripts/scenario.py --selftest        # 147 numeric checks
+uv run python scripts/scenario.py --selftest        # 166 numeric checks
 ```
 
 ### The profile
@@ -1595,9 +1595,10 @@ at 640×480 and 23.8 at 1280×720, which is fine for these scenes.
 
 ## 14. Control laws and gains
 
-Seven laws in `scripts/example_hover.py`. The three that command thrust
-directly are the interesting comparison; `hover_valve` commands a valve
-instead and gets its own section (§15):
+Eight laws in `scripts/example_hover.py`. The three that command thrust
+directly are the interesting comparison; `hover_valve` and
+`hover_cascade_valve` command a valve instead and get their own section
+(§15):
 
 | law | descent-ramp lag | step overshoot | hold RMS |
 |---|---|---|---|
@@ -2027,10 +2028,88 @@ top of each other while the feed fraction falls away underneath.
 `run.json` records the curve, feed mode, bottle size and both windows, so a
 sweep's runs can be told apart afterwards.
 
+### Under the cascade: a three-loop stack
+
+`hover_valve` puts the tracker under `hover`'s single-loop PD.
+**`hover_cascade_valve` puts it under the cascade**, which makes three nested
+loops, each closing on a different measurement:
+
+```
+  OUTER   position -> rate     v_cmd = sp_rate + KP_POS_V*(sp − z)     [m/s]
+  MIDDLE  rate -> thrust       F_cmd = m*g + KP_V*(v_cmd − vz)        [N]
+  INNER   thrust -> valve      u̇     = K_VALVE*(F_cmd − F_meas)      [1/s]
+```
+
+The demand comes from `_cascade_demand()`, which **is** `hover_cascade`'s own
+arithmetic rather than a copy of it — two copies of a control law is how the
+copies stop agreeing. A selftest pins that the direct law's numbers are
+unchanged by the extraction (overshoot 0.05176 m, lag −0.00731 m).
+
+**Why bother.** The cascade beats the PD on a descent ramp *structurally*: the
+thing it tracks IS a velocity, so holding a constant rate needs no accumulated
+error. That argument is about the outer loops, so it ought to survive a valve
+underneath — and the point of this law is to check rather than assume:
+
+| law | commands | descent lag | overshoot | hold RMS |
+|---|---|---|---|---|
+| `hover` | thrust | −0.12177 m | 0.0457 m | 0.0233 m |
+| `hover_valve` | **valve** | −0.12173 m | 0.0425 m | 0.0208 m |
+| `hover_cascade` | thrust | −0.00731 m | 0.0518 m | 0.0318 m |
+| `hover_cascade_valve` | **valve** | **−0.00722 m** | 0.0499 m | 0.0298 m |
+
+**The valve is transparent to the loops above it.** Each valve law lands within
+1.2% of its direct equivalent, and cascading still buys 17× either way. That
+is the state-space result showing up in a flight: the tracker's DC gain is
+exactly 1, so the outer loops get the thrust they asked for and cannot tell
+how it was produced.
+
+Across the curve family, with the lag advantage intact on every one:
+
+| curve | descent lag | overshoot | F err, steady | converged `u` |
+|---|---|---|---|---|
+| `ball` | −0.00722 m | 0.0499 m | −0.00278 N | 0.5797 |
+| `linear` | −0.00707 m | 0.0536 m | −0.00764 N | 0.3237 |
+| `quadratic` | −0.00707 m | 0.0498 m | −0.00812 N | 0.5692 |
+| `sqrt` | −0.00711 m | 0.0496 m | −0.00809 N | 0.1052 |
+| `deadzone` | −0.00709 m | 0.0483 m | −0.00817 N | 0.5270 |
+| `reversed` | −0.00713 m | 0.0484 m | −0.00616 N | 0.1623 |
+
+Lag spans 2% while the converged opening still varies 5.5× — six different
+plants, one controller, same trajectory.
+
+**The weak link is the INNER separation, and it is curve-dependent.** Three
+loops need two separations. Middle-vs-outer is bought by gain stiffness
+(`KP_V`=15 against `KP_POS_V`=0.6, a 25× ratio). Inner-vs-middle is bought by
+`1/(Kγ)` being faster than `1/KP_V` — and `γ` belongs to the curve. Starve it
+deliberately:
+
+| `K_VALVE` | descent lag | overshoot |
+|---|---|---|
+| 0.005 | −0.00774 m | **0.2018 m** |
+| 0.01 | −0.00700 m | 0.0607 m |
+| **0.05** | −0.00722 m | 0.0499 m |
+| 0.5 | −0.00731 m | 0.0517 m |
+
+At 0.005 the thrust loop is slower than the rate loop above it, the cascade's
+assumption inverts, and **overshoot quadruples while the descent lag stays
+good.** That signature — overshoot bad, lag fine — is how you tell an inner
+timescale problem from a mistuned outer loop: raise `K_VALVE`, do not retune
+the cascade. At the other end, `K_VALVE`=0.5 reproduces direct
+`hover_cascade` to four decimals (overshoot 0.0517 vs 0.0518, lag −0.00731 vs
+−0.00731), which is the separation-of-timescales argument closing: a fast
+enough tracker is indistinguishable from commanding thrust.
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover_cascade_valve \
+    --scene scenes/07_thrust_1D.xml --target 2.0 --valve --fixed-mass --isp 57.8
+```
+
 ### What each valve gain actually tunes
 
-`hover_valve` reads `KP_ALT` and `KD_ALT` like every other hover law, plus
-five of its own. They are not five tuning knobs — only the first one is.
+`hover_valve` reads `KP_ALT` and `KD_ALT` like every other hover law;
+`hover_cascade_valve` reads `KP_POS_V`, `KP_V` and `V_MAX_MPS` instead. Both
+add the same five below — and they are not five tuning knobs, only the first
+one is.
 
 **`K_VALVE` = 0.05** — valve travel per second per Newton of error. The
 integrator gain in `u̇ = K(r − F_meas)`, and **the only real tuning knob

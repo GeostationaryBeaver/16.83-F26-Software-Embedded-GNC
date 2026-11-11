@@ -565,6 +565,18 @@ def hover_cascade(state):
     the measured interval, peak descent is -0.13 m/s at every rate from
     500 Hz to 10 Hz.
     """
+    return {"main": (_cascade_demand(state), np.array([0.0, 0.0, 1.0]))}
+
+
+def _cascade_demand(state):
+    """The cascade's thrust demand in Newtons. Shared by two laws.
+
+    Factored out of hover_cascade so hover_cascade_valve can reuse the exact
+    same outer/inner arithmetic rather than keep a second copy of it - two
+    copies of a control law is how the copies stop agreeing. Everything the
+    docstring above says about rates, the setpoint-rate feedforward and the
+    V_MAX_MPS clamp applies here, because this IS that code.
+    """
     global _sp_prev, _sp_rate
 
     # The REAL interval since this law last ran, not the nominal timestep.
@@ -599,9 +611,7 @@ def hover_cascade(state):
     v_cmd = max(-V_MAX_MPS, min(V_MAX_MPS, v_cmd))
 
     # INNER LOOP: what thrust holds that rate?
-    thrust = state.weight_n() + KP_V * (v_cmd - state.vel[2])
-
-    return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
+    return state.weight_n() + KP_V * (v_cmd - state.vel[2])
 
 
 def hover_cascade_2rate(state):
@@ -805,7 +815,7 @@ def thrust_tracker(f_cmd, state, grounded=None):
 # this to refuse --valve on a law that returns force: 19.44 N read as an
 # opening clamps to 1.0 and flies a wide-open engine, which looks like a wild
 # controller rather than the units mismatch it is.
-VALVE_LAWS = ("hover_valve",)
+VALVE_LAWS = ("hover_valve", "hover_cascade_valve")
 
 
 def set_grounded(flag):
@@ -857,6 +867,52 @@ def hover_valve(state):
     err_vel = -state.vel[2]
     f_cmd = state.weight_n() + KP_ALT * err_alt + KD_ALT * err_vel
     f_cmd = max(0.0, f_cmd)          # a valve cannot pull
+    u = thrust_tracker(f_cmd, state)
+    return {"main": (u, np.array([0.0, 0.0, 1.0]))}
+
+
+def hover_cascade_valve(state):
+    """hover_cascade, but commanding a VALVE instead of Newtons.
+
+    *** THIS IS A THREE-LOOP CASCADE. *** hover_valve puts the tracker under
+    hover's single-loop PD; this puts it under the cascade, so there are now
+    three nested loops, each closing on a different measurement:
+
+        OUTER   position -> rate       v_cmd = sp_rate + KP_POS_V*(sp - z)
+        MIDDLE  rate -> thrust         F_cmd = m*g + KP_V*(v_cmd - vz)
+        INNER   thrust -> valve        u̇    = K_VALVE*(F_cmd - F_meas)
+
+    Each loop treats the one inside it as fast enough to be instantaneous,
+    and that is a real requirement, not a formality - see the timescales
+    note below. The demand comes from _cascade_demand(), which IS
+    hover_cascade's own arithmetic rather than a copy of it, so the two laws
+    cannot drift apart.
+
+    WHY BOTHER, given hover_valve already flies. The cascade's advantage is
+    structural: tracking a constant-rate descent needs no accumulated error,
+    because the thing being tracked IS a velocity. Measured descent-ramp lag
+    with direct thrust commands - PD -0.12177 m, cascade -0.00731 m, a 17x
+    improvement - and that argument is about the OUTER loops, so it should
+    survive putting a valve underneath. The point of this law is to check
+    that it does, rather than assume it.
+
+    TIMESCALES, which is the one thing that could break. Three loops need
+    two separations, and both are satisfied here by gain stiffness rather
+    than by timers:
+
+        middle vs outer   KP_V=15 against KP_POS_V=0.6, a 25x ratio
+        inner vs middle   the tracker's 1/(K*gamma) is 0.068..2.19 s on the
+                          ball curve, against the rate loop's ~1/KP_V
+
+    That second one is the weak link, and it is curve-dependent: where gamma
+    is small the thrust loop is SLOWER than the rate loop above it, which
+    inverts the cascade's assumption. If this law is worse than hover_valve
+    on some curve, that is where to look - raising K_VALVE is the fix, not
+    retuning the outer loops.
+
+    Returns a valve position in 0..1, not Newtons, so it needs --valve.
+    """
+    f_cmd = max(0.0, _cascade_demand(state))   # a valve cannot pull
     u = thrust_tracker(f_cmd, state)
     return {"main": (u, np.array([0.0, 0.0, 1.0]))}
 

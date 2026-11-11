@@ -2516,6 +2516,140 @@ def run_selftest() -> int:
         truth("    and rebuilds with no valve panels",
               load_run(d_nov)["show_valve"] is False)
 
+    print("\n[13] the valve under the CASCADE: a three-loop stack")
+    # hover_cascade_valve puts the thrust tracker under the cascade instead
+    # of under hover's single-loop PD, so there are three nested loops:
+    # position -> rate -> thrust -> valve. The claim being tested is that
+    # the cascade's advantage is STRUCTURAL and therefore survives having a
+    # valve underneath it.
+    #
+    # First: the refactor that made this possible must not have changed
+    # hover_cascade. _cascade_demand() IS its body now, so the direct law's
+    # numbers have to be exactly what they were.
+    def direct_dir(law, extra=()):
+        """A thrust-commanding run on the SAME profile valve_dir uses.
+
+        fly_dir() flies --target 1.0; every valve run above flies 2.0. The
+        whole of this section compares a valve law against its direct
+        equivalent, so they have to be the same flight.
+        """
+        argv = [sys.executable, str(HERE / "scenario.py"),
+                "--controller", f"example_hover:{law}",
+                "--scene", "scenes/07_thrust_1D.xml", "--target", "2.0",
+                "--fixed-mass", "--no-plot", "--outdir", str(out12)]
+        argv += list(extra)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None, r
+        return max(out12.glob("*/"), key=lambda q: q.stat().st_mtime), r
+
+    d_casc, _ = direct_dir("hover_cascade")
+    if d_casc is not None:
+        xc = json.loads((d_casc / "run.json").read_text())["metrics"]
+        # _cascade_demand() IS hover_cascade's body now, so the direct law's
+        # numbers must be exactly what they were before the refactor.
+        ok("hover_cascade is unchanged by the refactor (overshoot)",
+           xc["overshoot_m"], 0.05176, 1e-4, " m")
+        ok("  and its descent lag", xc["descent_lag_mean_m"],
+           -0.00731, 1e-4, " m")
+
+    d_cv, r_cv = valve_dir(law="hover_cascade_valve")
+    truth("a cascade+valve run completes the profile", d_cv is not None,
+          "" if d_cv else (r_cv.stderr or "")[-200:])
+    if d_cv is not None and d_casc is not None:
+        xv = json.loads((d_cv / "run.json").read_text())["metrics"]
+        # THE HEADLINE. The cascade beats the PD on a descent ramp because
+        # the thing it tracks IS a velocity, so no error has to accumulate.
+        # That argument is about the OUTER loops, so a valve underneath
+        # must not cost it. Measured: -0.00722 m through the valve against
+        # -0.00731 m commanding thrust directly.
+        truth("  the cascade's descent-lag advantage survives the valve",
+              abs(xv["descent_lag_mean_m"]) < 0.02,
+              f"{xv['descent_lag_mean_m']:+.5f} m vs "
+              f"{xc['descent_lag_mean_m']:+.5f} m direct")
+        truth("    and matches the direct law to within 5%",
+              abs(xv["descent_lag_mean_m"] - xc["descent_lag_mean_m"])
+              < 0.05 * abs(xc["descent_lag_mean_m"]),
+              f"{xv['descent_lag_mean_m']:+.5f} vs "
+              f"{xc['descent_lag_mean_m']:+.5f} m")
+        # And it must be the CASCADE's lag, not the PD's - a 17x difference,
+        # so this cannot pass by accident if the law silently used hover().
+        d_pdv, _ = valve_dir(law="hover_valve")
+        if d_pdv is not None:
+            xp = json.loads((d_pdv / "run.json").read_text())["metrics"]
+            truth("    an order of magnitude better than the PD+valve",
+                  abs(xv["descent_lag_mean_m"]) < 0.2 * abs(
+                      xp["descent_lag_mean_m"]),
+                  f"{xv['descent_lag_mean_m']:+.5f} vs "
+                  f"{xp['descent_lag_mean_m']:+.5f} m "
+                  f"({abs(xp['descent_lag_mean_m'] / xv['descent_lag_mean_m']):.0f}x)")
+        truth("  and the tracker still zeroes the thrust error",
+              abs(xv["thrust_err_final_N"]) < 0.05,
+              f"{xv['thrust_err_final_N']:+.5f} N")
+        truth("  run.json names the cascade valve law",
+              json.loads((d_cv / "run.json").read_text())["controller"]
+              .endswith("hover_cascade_valve"))
+
+    # Gain attribution: the union of the cascade's gains and the tracker's,
+    # and crucially NOT KP_ALT/KD_ALT - listing those would say the law reads
+    # a PD gain it never touches, which is how a sweep becomes unreadable.
+    gcv = gains_used_by("hover_cascade_valve")
+    truth("  it reads the cascade's gains",
+          {"KP_POS_V", "KP_V", "V_MAX_MPS"} <= gcv,
+          ", ".join(sorted(n for n in gcv if n.startswith(("KP", "V_")))))
+    truth("    and the tracker's",
+          {"K_VALVE", "GROUND_FREEZE"} <= gcv)
+    truth("    but NOT the single-loop PD's",
+          not ({"KP_ALT", "KD_ALT"} & gcv),
+          ", ".join(sorted(gcv & {"KP_ALT", "KD_ALT"})) or "neither")
+
+    # The timescale separation, which is the one thing three loops can break
+    # that two cannot. Starve the INNER loop and the failure has to show up
+    # in overshoot (the rate loop chasing a thrust that arrives late), while
+    # the descent lag - an outer-loop property - stays good. That signature
+    # is what tells you to raise K_VALVE rather than retune the cascade.
+    d_slow, _ = valve_dir(["--gain", "K_VALVE=0.005"],
+                          law="hover_cascade_valve")
+    if d_slow is not None and d_cv is not None:
+        xs = json.loads((d_slow / "run.json").read_text())["metrics"]
+        truth("  a too-slow thrust loop inverts the cascade's assumption",
+              xs["overshoot_m"] > 3 * xv["overshoot_m"],
+              f"overshoot {xs['overshoot_m']:.4f} m at K_VALVE=0.005 "
+              f"vs {xv['overshoot_m']:.4f} m at 0.05")
+        truth("    and it shows in OVERSHOOT, not in the descent lag",
+              abs(xs["descent_lag_mean_m"]) < 0.02,
+              f"lag still {xs['descent_lag_mean_m']:+.5f} m")
+    # The other end: a fast enough tracker is indistinguishable from
+    # commanding thrust directly, which is the separation-of-timescales
+    # argument closing.
+    d_fast, _ = valve_dir(["--gain", "K_VALVE=0.5"],
+                          law="hover_cascade_valve")
+    if d_fast is not None and d_casc is not None:
+        xf = json.loads((d_fast / "run.json").read_text())["metrics"]
+        truth("  a fast tracker converges on the direct cascade",
+              abs(xf["overshoot_m"] - xc["overshoot_m"]) < 0.005
+              and abs(xf["descent_lag_mean_m"]
+                      - xc["descent_lag_mean_m"]) < 0.001,
+              f"overshoot {xf['overshoot_m']:.4f} vs {xc['overshoot_m']:.4f}, "
+              f"lag {xf['descent_lag_mean_m']:+.5f} vs "
+              f"{xc['descent_lag_mean_m']:+.5f}")
+
+    # Every curve, since three loops need the separation to hold for each
+    # one and gamma is what sets the inner loop's speed.
+    cfam = {}
+    for cname in ("linear", "sqrt", "deadzone"):
+        d_c, _ = valve_dir(["--valve-curve", cname], law="hover_cascade_valve")
+        if d_c is not None:
+            cfam[cname] = json.loads((d_c / "run.json").read_text())["metrics"]
+    truth("  the three-loop stack flies every curve tried",
+          len(cfam) == 3 and all(not x["timeouts"] for x in cfam.values()),
+          ", ".join(f"{k} {v['descent_lag_mean_m']:+.5f}m"
+                    for k, v in cfam.items()))
+    if len(cfam) == 3:
+        lags = [abs(x["descent_lag_mean_m"]) for x in cfam.values()]
+        truth("    with the lag advantage intact on all of them",
+              max(lags) < 0.02, f"worst {max(lags):.5f} m")
+
     print()
     print(bar)
     total = passed + len(failed)

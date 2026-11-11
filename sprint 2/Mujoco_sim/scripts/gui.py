@@ -51,11 +51,16 @@ CONTROLLER_MODULE = "example_hover"   # where control laws are looked up
 # out - so a law you write later gets the right boxes with no edit here, and
 # a stale group name can never disable a gain that is really in use.
 GAIN_GROUPS = (
-    ("hover / hover_pid  (PD core)", ("KP_ALT", "KD_ALT")),
-    ("hover_pid  (integral)",        ("KI_ALT", "I_LIMIT_N")),
-    ("hover_cascade",                ("KP_POS_V", "KP_V", "V_MAX_MPS")),
-    ("2-rate cascade",               ("OUTER_HZ",)),
-    ("hover_valve  (thrust tracker)", ("K_VALVE", "GROUND_VZ_MPS")),
+    ("PD core  (hover, hover_pid, hover_valve)", ("KP_ALT", "KD_ALT")),
+    ("integral  (hover_pid)",                    ("KI_ALT", "I_LIMIT_N")),
+    # Three laws share the cascade's outer/inner gains now, because
+    # hover_cascade_valve calls _cascade_demand() rather than keeping its
+    # own copy. The label says so; what is actually GREYED is still derived
+    # from each law's own code, so this text cannot disable the wrong box.
+    ("cascade  (+2rate, +valve)",
+     ("KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF")),
+    ("2-rate only",               ("OUTER_HZ",)),
+    ("thrust tracker  (both valve laws)", ("K_VALVE", "GROUND_VZ_MPS")),
 )
 GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
 
@@ -492,7 +497,16 @@ class App:
                     "the law sets a 0..1 opening;\n"
                     "an unknown curve makes the force")
             else:
-                self.v_valvehint.set("")
+                # A valve law selected with the box UNTICKED is the one
+                # combination that fails silently rather than loudly: the
+                # law returns 0..1, nothing converts it, and 0.58 is read
+                # as 0.58 NEWTONS against a 19 N weight - so the craft sits
+                # on the pad and the run looks like a broken controller.
+                # scenario.py cannot refuse this one (a law returning
+                # Newtons is the normal case), so say it here.
+                self.v_valvehint.set(
+                    f"{law} returns a 0..1 opening —\n"
+                    f"tick the box, or it is read as NEWTONS")
 
     def _update_mass_fields(self):
         """Grey propellant / dry mass / Isp when flying fixed mass.
@@ -1667,6 +1681,53 @@ def run_selftest() -> int:
     truth("the valve laws are read from the controller module",
           "hover_valve" in valve_laws() and "hover" not in valve_laws(),
           ", ".join(valve_laws()))
+    # BOTH valve laws, discovered. hover_cascade_valve needed no GUI edit to
+    # appear in the dropdown or to be accepted by the checkbox, which is the
+    # payoff for discovering instead of listing - but assert it, because a
+    # list creeping back in would pass every other check here.
+    truth("  both valve laws are offered",
+          {"hover_valve", "hover_cascade_valve"} <= set(valve_laws()),
+          ", ".join(valve_laws()))
+    truth("  and a new law appears in the dropdown with no edit",
+          "hover_cascade_valve" in find_controllers())
+    # Gain boxes for the cascade+valve law: the cascade's gains and the
+    # tracker's, and NOT the single-loop PD's. Derived from the law's own
+    # code, so this also proves _cascade_demand() is attributed through.
+    gcv = gains_used_by("hover_cascade_valve")
+    truth("  cascade+valve enables the cascade and tracker boxes",
+          {"KP_POS_V", "KP_V", "V_MAX_MPS", "K_VALVE"} <= gcv,
+          ", ".join(sorted(gcv & set(GAIN_FIELDS))))
+    truth("    and greys the PD-only boxes",
+          not ({"KP_ALT", "KD_ALT", "KI_ALT", "OUTER_HZ"} & gcv),
+          ", ".join(sorted(gcv & {"KP_ALT", "KD_ALT", "KI_ALT", "OUTER_HZ"}))
+          or "all four greyed")
+    # Every gain a valve law reads must have a box, or the GUI cannot set it.
+    # Three are deliberately boxless and are named here rather than left to
+    # a silent set-difference: GROUND_FREEZE is a flag not a number,
+    # DT_NOMINAL_S is a fallback constant, and ACCEL_* are bench knobs for
+    # the does-this-survive-real-hardware sweep. Anything ELSE missing a box
+    # is a gain the GUI quietly cannot reach.
+    _boxless = {"GROUND_FREEZE", "DT_NOMINAL_S",
+                "ACCEL_NOISE_SIGMA", "ACCEL_LPF"}
+    for law in valve_laws():
+        missing = gains_used_by(law) - set(GAIN_FIELDS) - _boxless
+        truth(f"  every tunable gain {law} reads has a widget", not missing,
+              ", ".join(sorted(missing)) or "none missing")
+    # The group LABELS must not name a law that does not read them. They are
+    # cosmetic - greying is derived - but a label saying "hover_cascade" when
+    # three laws share those gains is a lie a reader acts on.
+    _cascade_group = next(nm for title, nm in GAIN_GROUPS
+                          if "cascade" in title.lower()
+                          and "2-rate" not in title.lower())
+    truth("  the cascade group's gains really are shared by three laws",
+          all(set(_cascade_group) <= gains_used_by(l)
+              for l in ("hover_cascade", "hover_cascade_2rate",
+                        "hover_cascade_valve")),
+          ", ".join(_cascade_group))
+    _trk_group = next(nm for title, nm in GAIN_GROUPS if "tracker" in title)
+    truth("    and the tracker group's by both valve laws",
+          all(set(_trk_group) <= gains_used_by(l) for l in valve_laws()),
+          ", ".join(_trk_group))
 
     print("\n[8] the interactive figure view")
     # The toolbar is the whole point: pan, box-zoom and Home are what make a

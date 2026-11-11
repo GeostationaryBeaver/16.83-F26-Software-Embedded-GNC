@@ -1415,7 +1415,7 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 ```bash
 uv run python scripts/gui.py            # the control panel
 uv run python scripts/gui.py --demo     # bigger fonts, less clutter
-uv run python scripts/gui.py --selftest # 90 headless checks
+uv run python scripts/gui.py --selftest # 98 headless checks
 ```
 
 Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
@@ -1617,9 +1617,13 @@ uv run python scripts/scenario.py --controller example_hover:hover_cascade \
     --gain KP_V=20 --gain KP_POS_V=0.5
 ```
 
-In the GUI the gain boxes sit in three labelled groups — `hover / hover_pid
-(PD core)`, `hover_pid (integral)` and `hover_cascade` — on the Run tab and
-again on the Live tab. **A blank box means "use the controller's default"**, so
+In the GUI the gain boxes sit in five labelled groups — `PD core`,
+`integral`, `cascade`, `2-rate only` and `thrust tracker` — on the Run tab
+and again on the Live tab. The labels name which laws share each group, since
+several do: all three cascade laws read `KP_POS_V` / `KP_V` / `V_MAX_MPS` /
+`SP_RATE_LPF`, and both valve laws read `K_VALVE` / `GROUND_VZ_MPS`.
+
+**A blank box means "use the controller's default"**, so
 the GUI never has to mirror the constants: it carries only what you
 deliberately override. Gains are applied at launch, not live: retuning
 mid-flight would raise the question of what happens to an integrator
@@ -2035,10 +2039,43 @@ sweep's runs can be told apart afterwards.
 loops, each closing on a different measurement:
 
 ```
+     THREE NESTED LOOPS, each closing on a different measurement
+                     sp_rate             m*g
+                        |                  |
+                        |  v_cmd [m/s]     |  F_cmd [N]            u [0..1]              the UNKNOWN plant
+         +----------+   v       +------+   v       +-------------+   +--------------------+   +---------+
+sp-->(+)-| KP_POS_V |->(+)->(+)-| KP_V |->(+)->(+)-| K_VALVE / s |-->| F = g(u) * feed(t) |-->| vehicle |
+     | - +----------+       | - +------+       | - +-------------+   +--------------------+   +---------+
+      |                      |                  |  INNER (thrust -> valve):  F_meas = m*(a+g), from the accelerometer
+      |                      |                  '<---------------------------------------------------|
+      |                      |                                                                       |
+      |                      |  MIDDLE (rate -> thrust):  vz                                         |
+      |                      '<----------------------------------------------------------------------|
+      |  OUTER (position -> rate):  z                                                                |
+      '<---------------------------------------------------------------------------------------------|
+```
+
+In equations, innermost last:
+
+```
   OUTER   position -> rate     v_cmd = sp_rate + KP_POS_V*(sp − z)     [m/s]
   MIDDLE  rate -> thrust       F_cmd = m*g + KP_V*(v_cmd − vz)        [N]
   INNER   thrust -> valve      u̇     = K_VALVE*(F_cmd − F_meas)      [1/s]
 ```
+
+Read the three return lines bottom to top and the nesting is the picture:
+**`z` closes the outer loop, `vz` the middle one, `F_meas` the inner one.**
+Each loop treats the one inside it as fast enough to be instantaneous, which
+is a real requirement and not a formality — see the `K_VALVE` sweep below,
+where starving the innermost loop breaks the middle one's assumption.
+
+Two details the picture makes concrete. **`sp_rate` and `m*g` enter as
+feedforwards, not corrections** — they are what the loop would command if
+there were no error at all, so the feedback terms only have to clean up what
+is left; that is why the cascade tracks a ramp with no integrator. And the
+rightmost box is the only one whose contents are unknown: **`g` is never
+measured and `feed(t)` falls as the bottle empties**, yet nothing to the left
+of it contains a model of either.
 
 The demand comes from `_cascade_demand()`, which **is** `hover_cascade`'s own
 arithmetic rather than a copy of it — two copies of a control law is how the
@@ -2230,6 +2267,15 @@ go stale.
 
 The Live tab has no valve: `sim_worker.py` does not build one, so offering it
 there would be a flag that goes nowhere.
+
+One case `scenario.py` **cannot** refuse is a valve law flown *without*
+`--valve`: a law returning Newtons is the normal case, so nothing looks wrong
+until the flight does nothing. Measured — `hover_cascade_valve` without the
+flag returns 0.58, that is read as 0.58 **newtons** against a 19.4 N weight,
+and the craft sits on the pad for the whole run with `TIMED OUT in: ASCEND`
+as the only clue. The GUI says so instead: selecting a valve law with the box
+unticked puts *"returns a 0..1 opening — tick the box, or it is read as
+NEWTONS"* beside it.
 
 ---
 

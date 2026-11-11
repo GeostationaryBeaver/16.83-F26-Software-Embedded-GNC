@@ -27,14 +27,16 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-                               QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFrame, QGridLayout,
+                               QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
+                               QVBoxLayout, QWidget)
 
 import link as linkmod
 import style as S
 from protocol import (CAL_CLEAR, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO, FLAG_DUAL_I2C, HEALTH,
-                      REASONS, STATES, board_mac)
+                      MODE_HOVER, MODE_LAND, MODE_MANUAL, MODE_VELOCITY, MODES, REASONS, SP_VZ_MAX,
+                      SP_Z_MAX, STATES, board_mac, ctrl_flag_names, mode_name)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = SCRIPT_DIR / "recordings"
@@ -44,12 +46,28 @@ UI_PERIOD_MS = 33     # ~30 Hz redraw
 LIVE_AGE_S = 0.5      # telemetry older than this = "No telemetry"
 SIDE_WIDTH = 360
 TX_POWERS = [("Full power", 0), ("20 dBm", 20), ("15 dBm", 15), ("10 dBm", 10), ("5 dBm", 5), ("2 dBm", 2)]
+FT_PER_M = 3.280839895
+
+# The Mode picker. Each mode reads Command.setpoint differently; the hint says how.
+MODE_CHOICES = [
+    (MODE_MANUAL, "Manual valve", "The valve follows the slider directly. No feedback."),
+    (MODE_HOVER, "Hover at altitude",
+     "The hopper ramps its setpoint to this height and holds it."),
+    (MODE_VELOCITY, "Climb / descend at rate",
+     "The hopper tracks this climb rate. Negative descends."),
+    (MODE_LAND, "Land",
+     "The hopper descends at the gain set's land_rate, then shuts the valve at land_cutoff."),
+]
 
 RAD2DEG = 180 / math.pi
 # Anything here can be picked in a plot. (name, unit, getter, decimals)
 CHANNELS = [
     ("Altitude z", "m", lambda t: t.z, 3),
+    ("Setpoint z", "m", lambda t: t.sp_z, 3),
+    ("Altitude error", "m", lambda t: t.sp_z - t.z, 3),
     ("Velocity v_z", "m/s", lambda t: t.vz, 3),
+    ("Setpoint v_z", "m/s", lambda t: t.sp_vz, 3),
+    ("Valve demand", "%", lambda t: t.demand, 1),
     ("Accel bias", "m/s²", lambda t: t.accel_bias, 3),
     ("Laser z", "m", lambda t: t.laser_z, 3),
     ("Accel x", "m/s²", lambda t: t.accel[0], 2),
@@ -68,12 +86,13 @@ CHANNELS = [
     ("Round trip", "ms", lambda t: t.rtt_ms, 1),
     ("I2C errors", "", lambda t: t.i2c_errors, 0),
 ]
-DEFAULT_PLOTS = ["Altitude z", "Laser z", "Pressure", "Accel z"]
+DEFAULT_PLOTS = ["Altitude z", "Setpoint z", "Valve demand", "Velocity v_z"]
 
 CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "health", "flags",
             "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
             "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
-            "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors"]
+            "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
+            "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd"]
 
 
 def fmt(x, d):
@@ -92,7 +111,8 @@ def csv_row(t):
     vals = [int(time.time() * 1000), t.seq, t.time_ms, t.state, t.reason, t.valve_pct, t.health, t.flags,
             t.z, t.vz, t.accel_bias, t.laser_z, *t.accel, *t.gyro, t.temp_c, t.pt_ma, t.psi, t.servo_v,
             t.failsafes, t.cmd_seq, t.rtt_ms, t.max_gap_ms, t.rssi, t.tx_power, t.laser_offset_m,
-            t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors]
+            t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors,
+            t.mode, t.ctrl_flags, t.sp_z, t.sp_vz, t.demand, t.kp, t.kd]
     return ["" if isinstance(v, float) and math.isnan(v) else v for v in vals]
 
 
@@ -107,6 +127,15 @@ def readout_rows(win):
         ("IMU", None),
         ("accel", lambda t: "  ".join(fmt(x, 2) for x in t.accel) + " m/s²"),
         ("gyro", lambda t: "  ".join(fmt(x * RAD2DEG, 1) for x in t.gyro) + " °/s"),
+        ("Controller", None),
+        ("mode", lambda t: mode_name(t.mode) + (" · " + ctrl_flag_names(t.ctrl_flags)
+                                                if t.ctrl_flags else "")),
+        ("setpoint z", lambda t: fmt(t.sp_z, 3) + " m"
+            + (f"  ({fmt(t.sp_z * FT_PER_M, 2)} ft)" if math.isfinite(t.sp_z) else "")),
+        ("setpoint v_z", lambda t: fmt(t.sp_vz, 3) + " m/s"),
+        ("error", lambda t: fmt(t.sp_z - t.z, 3) + " m"),
+        ("demand", lambda t: fmt(t.demand, 1) + " %"),
+        ("gains", lambda t: f"kp {fmt(t.kp, 1)}  kd {fmt(t.kd, 1)}"),
         ("Valve + feed", None),
         ("state", lambda t: f"{state_name(t.state)} · last FAILSAFE {reason_name(t.reason)}"),
         ("valve", lambda t: f"{t.valve_pct} %"),
@@ -379,20 +408,74 @@ class GroundStation(QMainWindow):
         row.addWidget(self.estop_btn)
         body.addLayout(row)
         body.addSpacing(2)
+
+        # Mode, then one row per mode's own setpoint control. Only the active mode's row is
+        # shown, so the number on screen is always the one being sent.
         row = QHBoxLayout()
         row.setSpacing(8)
-        k = caps("Valve")
+        k = caps("Mode")
         k.setFixedWidth(64)
         row.addWidget(k)
+        self.mode_box = QComboBox()
+        for mode, name, _ in MODE_CHOICES:
+            self.mode_box.addItem(name, mode)
+        self.mode_box.currentIndexChanged.connect(self.set_mode)
+        row.addWidget(self.mode_box, 1)
+        body.addLayout(row)
+
+        self.valve_row = QHBoxLayout()
+        self.valve_row.setSpacing(8)
+        k = caps("Valve")
+        k.setFixedWidth(64)
+        self.valve_row.addWidget(k)
         self.valve_slider = QSlider(Qt.Horizontal, minimum=0, maximum=100)
         self.valve_slider.setCursor(Qt.PointingHandCursor)
         self.valve_slider.valueChanged.connect(self.set_valve)
-        row.addWidget(self.valve_slider, 1)
+        self.valve_row.addWidget(self.valve_slider, 1)
         self.valve_label = label("0 %", size=12)
         self.valve_label.setFixedWidth(44)
         self.valve_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row.addWidget(self.valve_label)
-        body.addLayout(row)
+        self.valve_row.addWidget(self.valve_label)
+        body.addLayout(self.valve_row)
+
+        # Hover height is entered in feet, because the pad height is quoted in feet, and
+        # converted here. SP_Z_MAX is the metric limit the hopper enforces.
+        self.hover_row = QHBoxLayout()
+        self.hover_row.setSpacing(8)
+        k = caps("Hold")
+        k.setFixedWidth(64)
+        self.hover_row.addWidget(k)
+        self.hover_ft = QDoubleSpinBox(minimum=0.0, maximum=SP_Z_MAX * FT_PER_M, value=2.0,
+                                       singleStep=0.1, decimals=2)
+        self.hover_ft.setFixedWidth(84)
+        self.hover_ft.valueChanged.connect(self.set_hover)
+        self.hover_row.addWidget(self.hover_ft)
+        self.hover_row.addWidget(caps("ft"))
+        self.hover_label = label("—", size=12)
+        self.hover_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.hover_row.addWidget(self.hover_label, 1)
+        body.addLayout(self.hover_row)
+
+        self.rate_row = QHBoxLayout()
+        self.rate_row.setSpacing(8)
+        k = caps("Rate")
+        k.setFixedWidth(64)
+        self.rate_row.addWidget(k)
+        # QSlider is integer-only: work in cm/s and scale to m/s on the way out.
+        self.rate_slider = QSlider(Qt.Horizontal, minimum=int(-SP_VZ_MAX * 100),
+                                   maximum=int(SP_VZ_MAX * 100), value=-10)
+        self.rate_slider.setCursor(Qt.PointingHandCursor)
+        self.rate_slider.valueChanged.connect(self.set_rate)
+        self.rate_row.addWidget(self.rate_slider, 1)
+        self.rate_label = label("-0.10 m/s", size=12)
+        self.rate_label.setFixedWidth(68)
+        self.rate_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.rate_row.addWidget(self.rate_label)
+        body.addLayout(self.rate_row)
+
+        self.mode_hint = hint("")
+        body.addWidget(self.mode_hint)
+
         row = QHBoxLayout()
         row.setSpacing(8)
         k = caps("Radio")
@@ -566,7 +649,11 @@ class GroundStation(QMainWindow):
             self.log(f"Can't open {device}: {e}", True)
             return
         self.link.set_command(arm=False, estop=False, valve_pct=0, cal_op=CAL_NONE,
+                              mode=MODE_MANUAL, setpoint=0.0,
                               tx_power=self.txpow.currentData())
+        self.mode_box.blockSignals(True)
+        self.mode_box.setCurrentIndex(0)
+        self.mode_box.blockSignals(False)
         self.latest, self.last_seq, self.lost, self.cal_synced = None, None, 0, False
         self.set_connected(True)
         self.log(f"Connected to the ground board on {device}")
@@ -584,10 +671,18 @@ class GroundStation(QMainWindow):
         self.connect_btn.setText("DISCONNECT" if on else "CONNECT")
         S.set_variant(self.connect_btn, None if on else "primary")
         self.port_box.setEnabled(not on)
-        for w in [self.arm_btn, self.estop_btn, self.valve_slider, self.txpow, self.cal_zero, self.span_psi,
-                  self.cal_span, self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn]:
+        for w in [self.arm_btn, self.estop_btn, self.mode_box, self.valve_slider, self.hover_ft,
+                  self.rate_slider, self.txpow, self.cal_zero, self.span_psi, self.cal_span,
+                  self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn]:
             w.setEnabled(on)
         self.update_controls()
+
+    @staticmethod
+    def _show_row(row, visible):
+        for i in range(row.count()):
+            w = row.itemAt(i).widget()
+            if w:
+                w.setVisible(visible)
 
     def update_controls(self):
         c = self.link.command() if self.link else None
@@ -602,13 +697,24 @@ class GroundStation(QMainWindow):
         self.valve_slider.setValue(valve)
         self.valve_slider.blockSignals(False)
         self.valve_label.setText(f"{valve} %")
+
+        mode = self.mode()
+        self.mode_box.blockSignals(True)
+        self.mode_box.setCurrentIndex([m for m, _, _ in MODE_CHOICES].index(mode))
+        self.mode_box.blockSignals(False)
+        self._show_row(self.valve_row, mode == MODE_MANUAL)
+        self._show_row(self.hover_row, mode == MODE_HOVER)
+        self._show_row(self.rate_row, mode == MODE_VELOCITY)
+        self.hover_label.setText(f"{self.hover_ft.value() / FT_PER_M:.3f} m")
+        self.mode_hint.setText(next(h for m, _, h in MODE_CHOICES if m == mode))
+
         self.cal_status.setText("SENDING…" if c and c.cal_op != CAL_NONE else "")
 
     def toggle_arm(self):
         arm = not self.link.command().arm
         self.link.set_command(arm=arm, **({} if arm else {"valve_pct": 0}))
         self.update_controls()
-        self.log("Arm requested" if arm else "Disarm")
+        self.log(f"Arm requested ({mode_name(self.mode())})" if arm else "Disarm")
 
     def estop(self):
         if not self.link or self.link.command().estop:
@@ -629,6 +735,42 @@ class GroundStation(QMainWindow):
         if self.link:
             self.link.set_command(valve_pct=pct)
         self.valve_label.setText(f"{pct} %")
+
+    def mode(self):
+        return self.mode_box.currentData()
+
+    def set_mode(self):
+        """Mode changed. Each mode reads setpoint differently, so take it from that mode's own
+        control rather than leaving the previous mode's number in place: switching hover ->
+        rate would otherwise send a height as a climb rate."""
+        mode = self.mode()
+        if mode == MODE_HOVER:
+            setpoint = self.hover_ft.value() / FT_PER_M
+        elif mode == MODE_VELOCITY:
+            setpoint = self.rate_slider.value() / 100.0
+        else:
+            setpoint = 0.0
+        changes = {"mode": mode, "setpoint": setpoint}
+        if mode != MODE_MANUAL:
+            changes["valve_pct"] = 0  # the controller owns the valve now
+        if self.link:
+            self.link.set_command(**changes)
+        self.update_controls()
+        detail = (f" at {setpoint:.3f} m" if mode == MODE_HOVER else
+                  f" at {setpoint:+.2f} m/s" if mode == MODE_VELOCITY else "")
+        self.log(f"Mode {mode_name(mode)}{detail}")
+
+    def set_hover(self, ft):
+        m = ft / FT_PER_M
+        self.hover_label.setText(f"{m:.3f} m")
+        if self.link and self.mode() == MODE_HOVER:
+            self.link.set_command(setpoint=m)
+
+    def set_rate(self, cm_s):
+        rate = cm_s / 100.0
+        self.rate_label.setText(f"{rate:+.2f} m/s")
+        if self.link and self.mode() == MODE_VELOCITY:
+            self.link.set_command(setpoint=rate)
 
     def set_tx_power(self):
         dbm = self.txpow.currentData()
@@ -697,7 +839,10 @@ class GroundStation(QMainWindow):
             why = f" ({reason_name(b.reason)})" if b.state == 2 else ""
             self.log(f"Hopper {state_name(b.state)}{why}", b.state == 2)
             if b.state == 2:
-                self.link.set_command(arm=False, valve_pct=0)
+                self.link.set_command(arm=False, valve_pct=0, mode=MODE_MANUAL, setpoint=0.0)
+                self.mode_box.blockSignals(True)
+                self.mode_box.setCurrentIndex(0)
+                self.mode_box.blockSignals(False)
                 self.update_controls()
         for bit, name in HEALTH:
             if (a.health ^ b.health) & bit:

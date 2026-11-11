@@ -1,10 +1,22 @@
 // Control loop: reads the sensors, takes commands from the ground, runs the safety state
 // machine and the altitude Kalman filter, and sends telemetry.
+//
+// This file is the plumbing; it holds no control law. The law lives in controller.cpp and
+// its numbers in gains.h, and the three files meet in exactly two places:
+//
+//   valve_demand()  - the hook safety.cpp calls while ARMED. It forwards to
+//                     controller_update() and returns the opening it asks for.
+//   send_telemetry() - copies controller_last() into the packet.
+//
+// So: to retune, edit gains.h only. To change the control architecture, replace
+// controller.cpp (keeping controller.h's five functions) and leave this file alone.
+// safety.cpp stays the only code that moves the valve, whatever the law is.
 #include <Arduino.h>
 #include <atomic>
 #include <math.h>
 #include "control.h"
 #include "altitude_kf.h"
+#include "controller.h"
 #include "safety.h"
 #include "sensors.h"
 #include "../calibration/calibration.h"
@@ -45,15 +57,25 @@ void control_on_command(const cmd_t *cmd) {
   xQueueOverwrite(s_cmd_mailbox, cmd);
 }
 
-// ======================= GNC CONTROLLER GOES HERE =======================
-// Called every loop while ARMED. Return the valve opening, 0-100 %.
-// Today it is manual: the ground's valve_pct command. GNC: replace the body with the
-// controller, using s_kf (z, vz) and the sensors. Keep it fast: no delay(), no blocking
-// reads. FAILSAFE and the E-stop override it.
+// ======================= THE CONTROLLER SEAM =======================
+// safety.cpp calls this every tick while ARMED, and nothing else moves the valve.
+// The law and its gains are not here: see controller.cpp and gains.h.
+//
+//   Retune:               edit gains.h (ACTIVE_GAINS), re-upload. Nothing else.
+//   New control law:      rewrite controller.cpp behind controller.h. Not this file.
+//   New sensor feedback:  add it to sensors_t, pass it in below.
+//
+// s_est_ok and s_dt_s are set by control_task() just before safety_update(), because the
+// law needs to know whether z can be trusted and how long since it last ran, and this
+// signature (fixed by safety.h) carries neither.
+static bool s_est_ok = false;
+static float s_dt_s = CONTROL_PERIOD_MS / 1000.0f;
+
 static uint8_t valve_demand(uint32_t now_ms) {
   (void)now_ms;
-  return s_cmd.valve_pct;
+  return controller_update(&s_kf, &s_cmd, s_est_ok, s_dt_s)->valve_pct;
 }
+// ===================== END OF THE CONTROLLER SEAM =====================
 
 static void take_command(const sensors_t *sn) {
   if (xQueueReceive(s_cmd_mailbox, &s_cmd, 0) != pdTRUE) return;
@@ -106,6 +128,19 @@ static void send_telemetry(const sensors_t *sn, float laser_z) {
 
   d.flags = i2c_bus_dual() ? FLAG_DUAL_I2C : 0;
   d.i2c_errors = sn->i2c_errors;
+
+  // Controller. From controller_last(), not a fresh update(): the law must run exactly
+  // once per tick (it integrates its setpoint), so telemetry reports what safety.cpp was
+  // given rather than asking again. While not ARMED this is the idle output: zeros.
+  const controller_out_t *c = controller_last();
+  const gain_set_t *g = controller_gains();
+  d.mode = c->mode;
+  d.ctrl_flags = c->flags;
+  d.sp_z = c->sp_z;
+  d.sp_vz = c->sp_vz;
+  d.demand = c->demand;
+  d.kp = g->kp;
+  d.kd = g->kd;
   telemetry_push(&d);
 }
 
@@ -113,6 +148,8 @@ static void control_task(void *arg) {
   TickType_t last_wake = xTaskGetTickCount();
   uint32_t last_imu_us = micros();
   uint32_t gap_window_ms = millis();
+  uint32_t last_tick_ms = millis();
+  uint32_t last_laser_ms = 0;  // 0 = the laser has never corrected the filter
   bool link_up = false;
   while (true) {
     uint32_t now = millis();
@@ -147,7 +184,19 @@ static void control_task(void *arg) {
     }
     bool laser_reading = sn->laser_ok && sn->laser_in_range;
     float laser_z = laser_reading ? calibration_height_mm(sn->laser_raw_mm) / 1000.0f : NAN;
-    if (sn->laser_new && laser_reading) altitude_kf_update(&s_kf, laser_z);
+    if (sn->laser_new && laser_reading) {
+      altitude_kf_update(&s_kf, laser_z);
+      last_laser_ms = now ? now : 1;
+    }
+
+    // ---- what the controller needs, which safety.h's signature can't carry ----
+    // The filter's z only stays true while the laser keeps correcting it; with no laser it
+    // coasts on the IMU and drifts without bound, so a closed-loop hold on it would fly
+    // away quietly. gains.h sets how long a dropout may last.
+    s_est_ok = last_laser_ms && (now - last_laser_ms) < EST_LASER_TIMEOUT_MS;
+    s_dt_s = (now - last_tick_ms) / 1000.0f;
+    if (s_dt_s <= 0.0f || s_dt_s > 0.1f) s_dt_s = CONTROL_PERIOD_MS / 1000.0f;
+    last_tick_ms = now;
 
     // ---- safety and valve ----
     safety_inputs_t in = {
@@ -156,6 +205,9 @@ static void control_task(void *arg) {
       .arm = s_cmd.arm != 0,
       .estop = s_cmd.estop != 0,
     };
+    // Not ARMED, so valve_demand() will not be called: re-latch the setpoint to where the
+    // vehicle actually is, or the next arm starts with a stale error and steps the valve.
+    if (safety_state() != STATE_ARMED) controller_idle(&s_kf);
     safety_update(now, &in, valve_demand);
 
     send_telemetry(sn, laser_z);
@@ -170,6 +222,10 @@ void control_start() {
                 calibration_pt_zero_ma(), calibration_pt_span(), calibration_laser_offset_mm());
   sensors_init();
   altitude_kf_init(&s_kf, 0.0f);  // starts on the ground
+  controller_init();
+  Serial.printf("controller: gains \"%s\", kp %.1f, kd %.1f, hover %.0f%%\n",
+                controller_gains()->name, controller_gains()->kp, controller_gains()->kd,
+                controller_gains()->valve_hover);
 
   xTaskCreatePinnedToCore(control_task, "control", 8192, NULL,
                           CONTROL_PRIORITY, NULL, CONTROL_CORE);

@@ -90,13 +90,15 @@ QFrame#bar QPushButton[variant="rec-on"], QFrame#bar QPushButton[variant="rec-on
   background: {BAD}; border-color: {BAD}; color: #fff; }}
 
 /* Inputs */
-QSpinBox, QComboBox {{
+QSpinBox, QDoubleSpinBox, QComboBox {{
   font-family: "JetBrains Mono", "SF Mono", Menlo; font-size: 12px; color: {INK};
   background: {BG}; border: 1px solid {INK}; border-radius: 0; padding: 6px 8px;
 }}
-QSpinBox:disabled, QComboBox:disabled {{ color: {FAINT}; border-color: {HAIR}; }}
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{ color: {FAINT}; border-color: {HAIR}; }}
+QDoubleSpinBox[variant="edited"] {{ border: 2px solid {WARN}; padding: 5px 7px; }}
 /* Hide the arrows here, not with NoButtons: with a style sheet, NoButtons collapses the editor to 1 px */
-QSpinBox::up-button, QSpinBox::down-button {{ width: 0; height: 0; border: none; }}
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+  width: 0; height: 0; border: none; }}
 QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox QAbstractItemView {{
   background: {BG}; color: {INK}; border: 1px solid {INK}; outline: none;

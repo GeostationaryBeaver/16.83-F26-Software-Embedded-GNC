@@ -21,3 +21,4 @@ int calibration_height_mm(uint16_t raw_mm);
 float calibration_pt_zero_ma();
 float calibration_pt_span();
 int16_t calibration_laser_offset_mm();
+float calibration_pt_full_psi();  // pressure transmitter full scale in use (CAL_PTRANGE)

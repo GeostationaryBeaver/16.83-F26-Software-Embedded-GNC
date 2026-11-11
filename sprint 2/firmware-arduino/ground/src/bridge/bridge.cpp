@@ -2,12 +2,11 @@
 #include <string.h>
 #include "bridge.h"
 #include "../protocol.h"
-#include "../drivers/estop.h"
 #include "../drivers/lights.h"
 #include "../drivers/radio.h"
 #include "../usb/usb_link.h"
 
-#define RX_QUEUE_LEN 16        // ~150 ms of telemetry at 100 Hz
+#define RX_QUEUE_LEN 16        // ~320 ms of telemetry at 50 Hz
 #define LINK_TIMEOUT_MS 150    // same as the hopper's failsafe
 #define FAILSAFE_BLINK_MS 125
 
@@ -46,15 +45,7 @@ static void hopper_to_usb(uint32_t now) {
 static void usb_to_hopper() {
   uint8_t pkt[USB_MAX_PACKET_LEN];
   int len;
-  while ((len = usb_link_receive(pkt)) > 0) {
-    if (pkt[0] == MSG_CMD && len == sizeof(cmd_t) && estop_open()) {
-      cmd_t *cmd = (cmd_t *)pkt;
-      cmd->estop = 1;
-      cmd->arm = 0;
-      cmd->valve_pct = 0;
-    }
-    radio_send(pkt, len);
-  }
+  while ((len = usb_link_receive(pkt)) > 0) radio_send(pkt, len);
 }
 
 // Green = hearing the hopper. Red solid = hopper ARMED, red blinking = hopper FAILSAFE.

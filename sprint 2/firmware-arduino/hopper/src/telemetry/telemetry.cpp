@@ -28,9 +28,23 @@ bool telemetry_push(const telemetry_data_t *data) {
   return true;
 }
 
+// Gains reports, from the control loop. Length 1: the newest wins.
+static QueueHandle_t volatile s_gains_mailbox = NULL;
+
+void telemetry_send_gains(const gains_packet_t *pkt) {
+  // The control loop starts before telemetry_init(): nothing to send through yet
+  if (s_gains_mailbox) xQueueOverwrite(s_gains_mailbox, pkt);
+}
+
 static void telemetry_task(void *arg) {
   uint32_t seq = 0;
   while (true) {
+    gains_packet_t gains;
+    if (xQueueReceive(s_gains_mailbox, &gains, 0) == pdTRUE) {
+      gains.type = MSG_GAINS;
+      radio_send(&gains, sizeof(gains));
+    }
+
     uint32_t tail = s_tail.load(std::memory_order_relaxed);
     uint32_t head = s_head.load(std::memory_order_acquire);
     while (tail != head) {
@@ -47,9 +61,9 @@ static void telemetry_task(void *arg) {
 }
 
 void telemetry_init(telemetry_cmd_handler_t cmd_handler) {
+  s_gains_mailbox = xQueueCreate(1, sizeof(gains_packet_t));
   const uint8_t ground_mac[6] = GROUND_MAC;
-  esp_err_t err = radio_init(ground_mac, cmd_handler);
-  if (err != ESP_OK) Serial.printf("telemetry: radio init failed (%s)\n", esp_err_to_name(err));
+  radio_init(ground_mac, cmd_handler);
   xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL,
                           TELEMETRY_PRIORITY, NULL, TELEMETRY_CORE);
 }

@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Arduino Control Loop Instructions</title>
+<style>
+  @page { size: letter; margin: 18mm 16mm; }
+
+  :root {
+    --ink: #16191d;
+    --soft: #4a5157;
+    --faint: #767d84;
+    --rule: #d4d8dc;
+    --hair: #e6e9ec;
+    --wash: #f5f6f8;
+    --accent: #1b4f72;
+    --warn: #8a4b1a;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: "Segoe UI", -apple-system, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: var(--sans);
+    font-size: 9.6pt;
+    line-height: 1.5;
+    color: var(--ink);
+    margin: 0;
+  }
+
+  /* ---- title block ---- */
+  .title { border-bottom: 2px solid var(--ink); padding-bottom: 7pt; margin-bottom: 13pt; }
+  h1 { font-size: 19pt; line-height: 1.15; margin: 0 0 3pt; letter-spacing: -0.2pt; }
+  .sub { color: var(--soft); font-size: 9pt; }
+  .meta { color: var(--faint); font-size: 8pt; margin-top: 5pt; font-family: var(--mono); }
+
+  /* ---- headings ---- */
+  h2 {
+    font-size: 11pt; margin: 15pt 0 6pt; padding-bottom: 2.5pt;
+    border-bottom: 1px solid var(--rule);
+    break-after: avoid; page-break-after: avoid;
+  }
+  h2 .n { color: var(--accent); font-family: var(--mono); font-size: 10pt; margin-right: 5pt; }
+  h3 {
+    font-size: 9.4pt; margin: 11pt 0 4pt; color: var(--accent);
+    break-after: avoid; page-break-after: avoid;
+  }
+  p { margin: 0 0 6pt; }
+  a { color: var(--accent); }
+
+  /* ---- type helpers ---- */
+  code { font-family: var(--mono); font-size: 8.6pt; background: var(--wash); padding: 0.5pt 2.5pt; border-radius: 2px; }
+  pre {
+    font-family: var(--mono); font-size: 8.3pt; line-height: 1.45;
+    background: var(--wash); border: 1px solid var(--hair); border-left: 2.5pt solid var(--accent);
+    padding: 6pt 8pt; margin: 6pt 0; overflow: visible; white-space: pre-wrap;
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  pre .c { color: var(--faint); }
+  .eq { text-align: center; font-size: 10pt; padding: 8pt; margin: 7pt 0; }
+
+  /* ---- tables ---- */
+  table { width: 100%; border-collapse: collapse; margin: 6pt 0 8pt; font-size: 8.8pt; }
+  th {
+    text-align: left; font-size: 7.4pt; text-transform: uppercase; letter-spacing: 0.5pt;
+    color: var(--faint); font-weight: 600; border-bottom: 1px solid var(--rule);
+    padding: 0 6pt 3pt 0; vertical-align: bottom;
+  }
+  td { padding: 3.5pt 6pt 3.5pt 0; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+  td.m, th.m { font-family: var(--mono); font-size: 8.2pt; white-space: nowrap; }
+  .num { text-align: right; }
+
+  /* ---- callouts ---- */
+  .box {
+    border: 1px solid var(--rule); background: var(--wash);
+    padding: 7pt 9pt; margin: 8pt 0; break-inside: avoid; page-break-inside: avoid;
+  }
+  .box.warn { border-left: 2.5pt solid var(--warn); }
+  .box.key { border-left: 2.5pt solid var(--accent); }
+  .box h4 {
+    margin: 0 0 3pt; font-size: 8pt; text-transform: uppercase; letter-spacing: 0.5pt;
+  }
+  .box.warn h4 { color: var(--warn); }
+  .box.key h4 { color: var(--accent); }
+  .box p:last-child, .box ul:last-child { margin-bottom: 0; }
+
+  ul, ol { margin: 0 0 6pt; padding-left: 15pt; }
+  li { margin-bottom: 2.5pt; }
+  ol.steps { counter-reset: s; list-style: none; padding-left: 0; }
+  ol.steps > li {
+    counter-increment: s; position: relative; padding-left: 18pt; margin-bottom: 5pt;
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  ol.steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 0.5pt;
+    font-family: var(--mono); font-size: 7.6pt; font-weight: 700; color: #fff;
+    background: var(--accent); width: 12pt; height: 12pt; border-radius: 50%;
+    text-align: center; line-height: 12pt;
+  }
+
+  .tag {
+    font-family: var(--mono); font-size: 7.2pt; padding: 0.5pt 3pt; border-radius: 2px;
+    background: var(--accent); color: #fff; vertical-align: 1pt;
+  }
+  .tag.w { background: var(--warn); }
+  .break { break-before: page; page-break-before: page; }
+  footer { margin-top: 14pt; padding-top: 5pt; border-top: 1px solid var(--rule); color: var(--faint); font-size: 7.6pt; }
+</style>
+</head>
+<body>
+
+<div class="title">
+  <h1>Arduino Control Loop Instructions</h1>
+  <div class="sub">Closed-loop altitude and descent-rate control for the cold-gas hopper on the vertical test stand</div>
+  <div class="meta">16.83 F26 · sprint 2/firmware-arduino · 2026-11-09</div>
+</div>
+
+<p>The hopper firmware now accepts guidance commands — <em>hover at 2 ft</em>, <em>descend at 0.1 m/s</em> — instead of
+only a manual valve percentage. This document covers what changed, which parameters to set before the first armed
+run, and how commands travel from the laptop to the vehicle.</p>
+
+<div class="box warn">
+  <h4>Status</h4>
+  <p>This firmware has <strong>not been compiled or flown</strong> — no Arduino toolchain was available on the
+  machine where it was written. The control law was verified in a 1-DOF simulation, and every packet byte offset was
+  checked programmatically against the dashboard decoder, but the build itself is unverified. Treat the first
+  power-on as a bring-up, not a test point.</p>
+</div>
+
+<h2><span class="n">1</span>What changed</h2>
+
+<table>
+  <thead><tr><th style="width:38%">File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td class="m">control/gains.h</td><td><span class="tag">new</span> All tuning lives here. The only file to edit between test runs.</td></tr>
+    <tr><td class="m">control/controller.h/.cpp</td><td><span class="tag">new</span> The control law for every closed-loop mode.</td></tr>
+    <tr><td class="m">control/control.cpp</td><td><code>valve_demand()</code> now calls the controller; tracks loop <code>dt</code> and laser freshness.</td></tr>
+    <tr><td class="m">protocol.h <span style="font-family:var(--sans)">(both copies)</span></td><td>Commands gained <code>mode</code> + <code>setpoint</code>; telemetry gained seven controller fields.</td></tr>
+    <tr><td class="m">ground/bridge/bridge.cpp</td><td>The E-stop override now also forces <code>MODE_MANUAL</code>.</td></tr>
+    <tr><td class="m">ground_station/index.html</td><td>Mode picker, new plots, controller readout, extra CSV columns.</td></tr>
+  </tbody>
+</table>
+
+<p>Unchanged on purpose: <code>safety.cpp</code> is still the only module that moves the valve, the SAFE / ARMED /
+FAILSAFE machine is untouched, and <code>MODE_MANUAL</code> is enum value <code>0</code> — so a sender that never
+sets the new fields behaves exactly as before.</p>
+
+<div class="box warn">
+  <h4>Packets grew — flash all three together</h4>
+  <p>Telemetry went 99 → 121 bytes and commands 17 → 22. The hopper, the ground ESP and the dashboard must all be
+  updated in the same sitting. A mismatch is not subtle: the dashboard rejects every packet and logs a length
+  warning, and the hopper ignores commands of the wrong size and drops to FAILSAFE after 150 ms.</p>
+</div>
+
+<h2><span class="n">2</span>How the control loop works</h2>
+
+<p>One equation serves every mode — a PD tracking a setpoint that is allowed to move:</p>
+
+<div class="eq"><code>demand = valve_hover + kp·(sp_z − z) + kd·(sp_vz − vz)</code></div>
+
+<p>Hovering is that setpoint standing still. A rate command is the same setpoint moving at a constant speed. Because
+rate tracking keeps the altitude term, a descent that falls behind gets corrected rather than drifting further out,
+and switching modes is bumpless: the setpoint re-latches to wherever the vehicle actually is.</p>
+
+<table>
+  <thead><tr><th style="width:17%">Mode</th><th style="width:26%">Setpoint means</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td class="m">MANUAL</td><td>—</td><td>Valve follows <code>valve_pct</code> directly. No feedback.</td></tr>
+    <tr><td class="m">HOVER</td><td>metres above the pad</td><td>Ramps the setpoint at <code>sp_rate</code> to the commanded height, then holds. The dashboard takes feet and converts.</td></tr>
+    <tr><td class="m">VELOCITY</td><td>m/s, up positive</td><td>Tracks a climb rate. <code>−0.1</code> descends at 0.1 m/s.</td></tr>
+    <tr><td class="m">LAND</td><td>—</td><td>Descends at <code>land_rate</code>, then latches the valve shut below <code>land_cutoff</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>Three safeguards built into the loop</h3>
+<ul>
+  <li><strong>Altitude hold requires the laser.</strong> The Kalman filter's <code>z</code> only stays true while the
+  rangefinder keeps correcting it; without it the filter coasts on the IMU and drifts without bound. After 300 ms
+  with no laser update (<code>EST_LASER_TIMEOUT_MS</code>) the loop is inhibited and the valve shut, flagged
+  <code>CTRL_NO_EST</code>. Holding altitude on a free-running estimate would quietly fly away.</li>
+  <li><strong>Touchdown latches.</strong> Without the latch the vehicle settles at the cutoff, the error grows, the
+  valve reopens, and it limit-cycles a few centimetres over the pad.</li>
+  <li><strong>Setpoint re-latch.</strong> Disarm, FAILSAFE and E-stop all drop back to Manual, so re-arming can never
+  pick straight back up on a stale setpoint. In simulation this turned what would have been an 83 % saturated slam
+  into a smooth 70 % near feedforward.</li>
+</ul>
+
+<h2 class="break"><span class="n">3</span>Parameters to adjust</h2>
+
+<div class="box warn">
+  <h4>Check this before you arm · control.cpp lines 24–25</h4>
+<pre><span class="c">// Which IMU axis points up, and its sign</span>
+#define IMU_UP_AXIS 2
+#define IMU_UP_SIGN 1.0f</pre>
+  <p>These predate the controller but matter far more now. The filter computes
+  <code>a = accel_z − 9.81 − bias</code>, so <code>accel_z</code> must read <strong>about +9.81 at rest</strong>.
+  Get the sign wrong and <code>vz</code> is garbage — and <code>kd = 22</code> acting on a garbage velocity drives
+  the valve the wrong way, hard. Verify from the dashboard with the vehicle sitting still: <code>accel z ≈ +9.81</code>
+  and <code>accel bias</code> settling near zero. Thirty seconds of checking.</p>
+</div>
+
+<table>
+  <thead><tr><th style="width:21%">Parameter</th><th style="width:20%">Where</th><th class="m" style="width:12%">Current</th><th>How to set it</th></tr></thead>
+  <tbody>
+    <tr><td class="m">valve_hover</td><td>gains.h</td><td class="m">50 %</td><td><strong>Do this one first.</strong> Hover in Manual mode and read the <code>valve_pct</code> that holds altitude.</td></tr>
+    <tr><td>laser offset</td><td>dashboard → Calibration</td><td class="m">—</td><td><code>z</code> is now the controlled variable, so its zero <em>is</em> the setpoint's zero.</td></tr>
+    <tr><td class="m">kp / kd</td><td>gains.h</td><td class="m">18 / 22</td><td>Already set. Fix <code>valve_hover</code> before touching these.</td></tr>
+    <tr><td class="m">SP_Z_MAX</td><td>protocol.h</td><td class="m">1.00 m</td><td>Must stay under both the laser's range and the stand's travel.</td></tr>
+    <tr><td class="m">valve_min / valve_max</td><td>gains.h</td><td class="m">10 / 90 %</td><td>Keep <code>valve_min</code> well under the hover opening — see the note below.</td></tr>
+    <tr><td class="m">sp_rate</td><td>gains.h</td><td class="m">0.15 m/s</td><td>How fast a new hover command ramps in, so a step does not ask for full valve on the first tick.</td></tr>
+    <tr><td class="m">land_rate / land_cutoff</td><td>gains.h</td><td class="m">0.10 m/s / 0.05 m</td><td>Descent rate, and the altitude where the valve latches shut.</td></tr>
+    <tr><td class="m">EST_LASER_TIMEOUT_MS</td><td>gains.h</td><td class="m">300 ms</td><td>Leave alone unless the laser's update rate changes.</td></tr>
+  </tbody>
+</table>
+
+<div class="box key">
+  <h4>valve_hover matters more than either gain</h4>
+  <p>A PD has no integral term, so it cannot remove a constant error. The vehicle settles wherever the PD's output
+  happens to equal the opening that holds it:</p>
+  <div class="eq" style="margin:5pt 0"><code>steady-state offset = (true hover opening − valve_hover) / kp</code></div>
+  <p>At <code>kp = 18</code> that is <strong>5.6 cm of altitude error for every 1 %</strong> this is wrong by, and the
+  vehicle sits low when it is set too low. If a hover settles consistently short of its setpoint, raise
+  <code>valve_hover</code> by <code>kp × offset</code> percent — do not reach for <code>kp</code>. Mass, supply
+  pressure and feed temperature all move the true value, so re-check it whenever the vehicle changes.</p>
+</div>
+
+<div class="box">
+  <h4>Why valve_min has a ceiling</h4>
+  <p><code>valve_min</code> above zero keeps the plenum from collapsing and means a descent is braked rather than a
+  free fall. But at or above the hover opening the floor alone holds the vehicle up and <em>no descent is possible at
+  all</em>. The current 10 % leaves plenty of margin: it brakes, it cannot hold.</p>
+</div>
+
+<h3>Swapping gain sets</h3>
+<p>Change one line in <code>gains.h</code> and re-upload:</p>
+<pre>#define ACTIVE_GAINS GAINS_FLIGHT   <span class="c">// or GAINS_BENCH</span></pre>
+<p><code>GAINS_FLIGHT</code> holds the known-good gains. <code>GAINS_BENCH</code> is a half-authority set
+(<code>kp 9</code>, <code>kd 11</code>, valve capped at 60 %, slow setpoint) for a first power-on on the tether — a
+sign error or a bad mounting axis then shows up as a drift you can watch rather than a slam into the stops. To add a
+set, copy a block and give it a new name; leave the flight set alone so there is always a known-good one to return
+to. The gains that actually flew are echoed in telemetry and recorded in the CSV, so a run always says which set
+produced it.</p>
+
+<h2 class="break"><span class="n">4</span>Sending commands from the laptop</h2>
+
+<p>The transport is unchanged. The dashboard streams commands at 50 Hz over USB to the ground ESP, which relays them
+to the hopper over ESP-NOW; telemetry returns the same way at 100 Hz. What is new is a <strong>Mode</strong> dropdown
+and its setpoint field.</p>
+
+<div class="eq" style="font-family:var(--mono);font-size:8.6pt;background:var(--wash);border:1px solid var(--hair);padding:7pt">
+laptop (Chrome, Web Serial) → USB → ground ESP → ESP-NOW → hopper
+</div>
+
+<h3>Bring-up order</h3>
+<ol class="steps">
+  <li>Flash <code>hopper/hopper.ino</code> and <code>ground/ground.ino</code>, then hard-reload the dashboard. All
+  three carry the new packet sizes.</li>
+  <li>Serve the dashboard over <code>http://localhost</code> in Chrome or Edge and press <strong>Connect</strong>.
+  Web Serial will not work from a <code>file://</code> URL.</li>
+  <li>Confirm the IMU axis and sign (section 3), and that the <span class="tag">LASER</span> and
+  <span class="tag">IMU</span> health chips are green.</li>
+  <li>Calibrate the laser height, so <code>z = 0</code> means on the pad.</li>
+  <li><strong>Arm in Manual</strong> and find the valve percentage that holds a steady hover. That number is
+  <code>valve_hover</code>.</li>
+  <li>Disarm. Put that value in <code>gains.h</code> and re-upload the hopper.</li>
+  <li>Mode → <strong>Hover at altitude</strong>, enter <code>2</code> ft. The page converts to metres and clamps to
+  <code>SP_Z_MAX</code>.</li>
+  <li>Mode → <strong>Climb / descend at rate</strong>, slider to <code>−0.10</code> m/s.</li>
+  <li>Mode → <strong>Land</strong> to bring it down and latch the valve shut.</li>
+</ol>
+
+<h3>Safety behaviour while flying</h3>
+<ul>
+  <li><strong>Esc</strong> is E-stop, and the physical switch on the ground board overrides whatever the dashboard
+  sends — it now forces Manual as well as zero valve, so a closed-loop mode cannot keep commanding its own opening.</li>
+  <li>Keep the tab in front. A hidden tab throttles its timers, commands stop arriving, and the hopper goes FAILSAFE
+  after 150 ms.</li>
+  <li>FAILSAFE latches: the valve is driven shut until you disarm and arm again. A reboot always comes up SAFE.</li>
+</ul>
+
+<h3>What to watch</h3>
+<p>The dashboard plots <strong>Setpoint z</strong> and <strong>Valve demand</strong> against <code>z</code> by
+default — the three traces that tell you whether the loop is tracking. The controller readout adds mode, both
+setpoints, the error, the raw pre-clamp demand, the live gains, and the <code>CTRL_*</code> flags
+(<code>SAT HIGH</code>, <code>SAT LOW</code>, <code>SP RAMP</code>, <code>NO EST</code>, <code>GND SHUT</code>). All
+of it lands in the recorded CSV, so a tuning run can be analysed after the fact.</p>
+
+<h3>Scripted commands instead of the dashboard</h3>
+<p>Write a 22-byte <code>cmd_t</code> with <code>mode</code> at byte 17 and <code>setpoint</code> as a
+little-endian <code>float32</code> at byte 18, framed for the USB link as:</p>
+<pre>0xAA 0x55 &lt;len&gt; &lt;packet&gt; &lt;checksum = sum of packet bytes mod 256&gt;</pre>
+<p>Two constraints: the 150 ms link timeout means a script must sustain roughly 50 Hz or the hopper will FAILSAFE,
+and <code>arm</code> must be sent as <code>0</code> at least once after boot or after a FAILSAFE before the hopper
+will accept an arm request. Nothing else is printed on the ground board's serial port, so close the Arduino Serial
+Monitor before connecting.</p>
+
+<h2><span class="n">5</span>Open items</h2>
+<ul>
+  <li><strong>Not compiled.</strong> No Arduino toolchain was available; expect to fix build errors on first upload.</li>
+  <li><strong><code>valve_hover = 50</code> is a placeholder</strong> derived from an assumed 0.40 kg mass. Measure it
+  on the stand (step 5 above) before closing the loop.</li>
+  <li><strong>No attitude estimate.</strong> The filter assumes the IMU's chosen axis is vertical; any tilt shows up as
+  a fake accelerometer bias. Acceptable on a constrained vertical stand, not off it.</li>
+  <li><strong>Simulation used assumed plant values</strong> — 0.40 kg, 5.87 N full-open thrust, 80 ms valve lag. The
+  stability margins it showed are indicative, not measured.</li>
+</ul>
+
+<footer>
+  Arduino Control Loop Instructions · 16.83 F26 Software &amp; Embedded GNC · generated 2026-11-09 ·
+  source of truth is <span style="font-family:var(--mono)">firmware-arduino/README.md</span> and
+  <span style="font-family:var(--mono)">control/gains.h</span>
+</footer>
+
+</body>
+</html>

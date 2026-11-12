@@ -34,9 +34,10 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFrame, 
 
 import link as linkmod
 import style as S
-from protocol import (CAL_CLEAR, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO, FLAG_DUAL_I2C, HEALTH,
-                      MODE_HOVER, MODE_LAND, MODE_MANUAL, MODE_VELOCITY, MODES, REASONS, SP_VZ_MAX,
-                      SP_Z_MAX, STATES, board_mac, ctrl_flag_names, mode_name)
+from protocol import (CAL_CLEAR, CAL_GROUND, CAL_IMU, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO,
+                      FLAG_DUAL_I2C, HEALTH, MODE_HOVER, MODE_LAND, MODE_MANUAL, MODE_VELOCITY,
+                      MODES, REASONS, SP_VZ_MAX, SP_Z_MAX, STATES, board_mac, ctrl_flag_names,
+                      mode_name)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = SCRIPT_DIR / "recordings"
@@ -92,7 +93,7 @@ CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "health
             "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
             "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
             "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
-            "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd"]
+            "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd", "accel_zero"]
 
 
 def fmt(x, d):
@@ -112,7 +113,7 @@ def csv_row(t):
             t.z, t.vz, t.accel_bias, t.laser_z, *t.accel, *t.gyro, t.temp_c, t.pt_ma, t.psi, t.servo_v,
             t.failsafes, t.cmd_seq, t.rtt_ms, t.max_gap_ms, t.rssi, t.tx_power, t.laser_offset_m,
             t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors,
-            t.mode, t.ctrl_flags, t.sp_z, t.sp_vz, t.demand, t.kp, t.kd]
+            t.mode, t.ctrl_flags, t.sp_z, t.sp_vz, t.demand, t.kp, t.kd, t.accel_zero]
     return ["" if isinstance(v, float) and math.isnan(v) else v for v in vals]
 
 
@@ -154,6 +155,7 @@ def readout_rows(win):
         ("PT zero", lambda t: fmt(t.pt_zero_ma, 3) + " mA"),
         ("PT span", lambda t: fmt(t.pt_span, 4)),
         ("laser offset", lambda t: fmt(t.laser_offset_m * 1000, 0) + " mm"),
+        ("accel zero", lambda t: fmt(t.accel_zero, 3) + " m/s²"),
         ("cal ack", lambda t: f"{t.cal_ack} (sent {win.link.command().cal_seq if win.link else 0})"),
         ("Diagnostics", None),
         ("I2C", lambda t: "dual controllers" if t.flags & FLAG_DUAL_I2C else "shared controller"),
@@ -506,10 +508,15 @@ class GroundStation(QMainWindow):
         self.laser_mm = QSpinBox(minimum=0, maximum=2000, value=100)
         self.cal_laser.clicked.connect(
             lambda: self.calibrate(CAL_LASER, self.laser_mm.value(), f"laser height {self.laser_mm.value()} mm"))
+        self.cal_ground = button("Zero on the ground")
+        self.cal_ground.clicked.connect(lambda: self.calibrate(CAL_GROUND, 0, "zero on the ground"))
+        self.cal_imu = button("Zero the IMU")
+        self.cal_imu.clicked.connect(lambda: self.calibrate(CAL_IMU, 0, "zero the IMU"))
         self.cal_clear = button("Clear to defaults")
         self.cal_clear.clicked.connect(lambda: self.calibrate(CAL_CLEAR, 0, "clear to defaults"))
         for btn, extra in [(self.cal_zero, hint("line vented")), (self.cal_span, (self.span_psi, "psi")),
-                           (self.cal_laser, (self.laser_mm, "mm")), (self.cal_clear, None)]:
+                           (self.cal_laser, (self.laser_mm, "mm")), (self.cal_ground, hint("on the pad")),
+                           (self.cal_imu, hint("level and still")), (self.cal_clear, None)]:
             row = QHBoxLayout()
             row.setSpacing(8)
             row.addWidget(btn, 1)
@@ -525,9 +532,14 @@ class GroundStation(QMainWindow):
                 row.addWidget(extra)
             body.addLayout(row)
         body.addSpacing(2)
+        body.addWidget(hint("<b>Zero on the ground</b> takes the laser reading now as 0 m, so z is height "
+                            "above the pad — do it with the vehicle standing on the pad, and prefer it over "
+                            "typing a laser height. <b>Zero the IMU</b> stores the accelerometer's zero-g "
+                            "error so the filter starts with the right bias; the vehicle must be level and "
+                            "still."))
         body.addWidget(hint("Saved in the hopper's flash. A refused calibration (no reading, transmitter "
-                            "off) is acknowledged but changes nothing: the reason is on the hopper's "
-                            "serial monitor."))
+                            "off, vehicle moving) is acknowledged but changes nothing: the reason is on the "
+                            "hopper's serial monitor."))
         lay.addWidget(sec)
 
         sec, body = self._section("Health")
@@ -673,7 +685,8 @@ class GroundStation(QMainWindow):
         self.port_box.setEnabled(not on)
         for w in [self.arm_btn, self.estop_btn, self.mode_box, self.valve_slider, self.hover_ft,
                   self.rate_slider, self.txpow, self.cal_zero, self.span_psi, self.cal_span,
-                  self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn]:
+                  self.laser_mm, self.cal_laser, self.cal_ground, self.cal_imu, self.cal_clear,
+                  self.record_btn]:
             w.setEnabled(on)
         self.update_controls()
 
@@ -832,7 +845,7 @@ class GroundStation(QMainWindow):
             self.link.set_command(cal_op=CAL_NONE)
             self.update_controls()
             self.log(f"Calibration ack: zero {t.pt_zero_ma:.3f} mA, span {t.pt_span:.4f}, "
-                     f"laser {t.laser_offset_m * 1000:.0f} mm")
+                     f"laser {t.laser_offset_m * 1000:.0f} mm, accel {t.accel_zero:+.3f} m/s²")
 
     def on_changes(self, a, b):
         if a.state != b.state:

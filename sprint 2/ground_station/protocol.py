@@ -22,7 +22,7 @@ MSG_CMD = 2
 
 STATES = ["SAFE", "ARMED", "FAILSAFE"]
 REASONS = ["none", "link lost", "E-stop"]
-CAL_NONE, CAL_ZERO, CAL_SPAN, CAL_LASER, CAL_CLEAR = range(5)
+CAL_NONE, CAL_ZERO, CAL_SPAN, CAL_LASER, CAL_CLEAR, CAL_GROUND, CAL_IMU = range(7)
 HEALTH = [(0x01, "LASER"), (0x02, "IMU"), (0x04, "TEMP"), (0x08, "PRESSURE"), (0x10, "SERVO PWR")]
 FLAG_DUAL_I2C = 0x01
 
@@ -41,11 +41,11 @@ SP_VZ_MAX = 0.50   # m/s
 CMD_PERIOD_S = 0.020   # 50 commands/s
 LINK_TIMEOUT_S = 0.150  # no command for this long = hopper FAILSAFE
 
-# telemetry_packet_t: type, seq, time_ms, then telemetry_data_t (112 bytes)
-TELEMETRY_FMT = struct.Struct("<BII" "4f" "3f" "3f" "4f" "4BH" "IIHbB" "3fB" "BH" "BB" "5f")
+# telemetry_packet_t: type, seq, time_ms, then telemetry_data_t (116 bytes)
+TELEMETRY_FMT = struct.Struct("<BII" "4f" "3f" "3f" "4f" "4BH" "IIHbB" "3fB" "BH" "BB" "5f" "f")
 # cmd_t
 CMD_FMT = struct.Struct("<BBBBBBhBII" "Bf")
-assert TELEMETRY_FMT.size == 121 and CMD_FMT.size == 22
+assert TELEMETRY_FMT.size == 125 and CMD_FMT.size == 22
 
 SYNC0, SYNC1 = 0xAA, 0x55
 MAX_PACKET_LEN = 250
@@ -91,6 +91,7 @@ class Telemetry:
     demand: float
     kp: float
     kd: float
+    accel_zero: float  # CAL_IMU: accel zero-g offset removed on the up axis (m/s²)
     rtt_ms: float = math.nan  # filled in on receive, from cmd_time_us
 
 
@@ -107,6 +108,7 @@ def decode_telemetry(p: bytes) -> Telemetry:
         flags=f[31], i2c_errors=f[32],
         mode=f[33], ctrl_flags=f[34],
         sp_z=f[35], sp_vz=f[36], demand=f[37], kp=f[38], kd=f[39],
+        accel_zero=f[40],
     )
 
 

@@ -61,6 +61,13 @@ typedef enum {
     CAL_SPAN = 2,   // pressure span: cal_value = true psi from a gauge (at least 20 psi)
     CAL_LASER = 3,  // laser offset: cal_value = true height in mm
     CAL_CLEAR = 4,  // back to defaults
+    // Vehicle standing on the pad: takes the laser reading now as zero height, so z = 0
+    // at rest and every setpoint is measured from the pad. cal_value is ignored.
+    CAL_GROUND = 5,
+    // Vehicle level and still: takes the accelerometer's error on the up axis as its zero-g
+    // offset, so the filter's bias estimate starts right instead of converging each boot.
+    // cal_value is ignored.
+    CAL_IMU = 6,
 } cal_op_t;
 
 // telemetry_data_t.health bits: set when that sensor is working
@@ -121,6 +128,10 @@ typedef struct __attribute__((packed)) {
     float demand;          // controller output before clamping and rounding (%)
     float kp;              // gains in use, so a recording says which gains flew
     float kd;
+
+    // New fields go on the end, so every offset above keeps its place and the three
+    // decoders (protocol.py, index.html, and this struct) only ever grow.
+    float accel_zero;      // CAL_IMU: accel zero-g offset removed on the up axis (m/s^2)
 } telemetry_data_t;
 
 typedef struct __attribute__((packed)) {

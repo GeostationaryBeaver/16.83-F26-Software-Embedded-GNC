@@ -32,9 +32,17 @@
 
 // Set these for how the board is mounted: which IMU axis points up (0 = x,
 // 1 = y, 2 = z) and its sign (+1 if the axis reads about +9.81 at rest, -1 if
-// about -9.81).
+// about -9.81). CAL_IMU refuses if these are wrong, rather than storing the
+// discrepancy as an offset.
 #define IMU_UP_AXIS 2
 #define IMU_UP_SIGN 1.0f
+
+// Up-axis acceleration as the filter should see it: mounting sign applied, then the
+// stored zero-g offset removed. Both CAL_IMU and the filter go through here, so they
+// cannot disagree about what "up" reads.
+static float accel_up(const sensors_t *sn) {
+  return IMU_UP_SIGN * sn->imu.accel[IMU_UP_AXIS];
+}
 
 static altitude_kf_t s_kf;
 
@@ -86,7 +94,16 @@ static void take_command(const sensors_t *sn) {
     else Serial.println("radio power full");
   }
   if (s_cmd.cal_op != CAL_NONE && s_cmd.cal_seq != s_cal_ack) {
-    calibration_apply(s_cmd.cal_op, s_cmd.cal_value, sn->pt_ma_avg, sn->laser_avg_mm);
+    float gx = sn->imu.gyro[0], gy = sn->imu.gyro[1], gz = sn->imu.gyro[2];
+    cal_inputs_t in = {
+      .pt_ma = sn->pt_ma_avg,
+      .laser_mm = sn->laser_avg_mm,
+      .laser_ok = sn->laser_ok && sn->laser_in_range,
+      .accel_up = accel_up(sn),
+      .gyro_mag = sqrtf(gx * gx + gy * gy + gz * gz),
+      .imu_ok = sn->imu_ok,
+    };
+    calibration_apply(s_cmd.cal_op, s_cmd.cal_value, &in);
     s_cal_ack = s_cmd.cal_seq;
   }
 }
@@ -124,6 +141,7 @@ static void send_telemetry(const sensors_t *sn, float laser_z) {
   d.laser_offset_m = calibration_laser_offset_mm() / 1000.0f;
   d.pt_zero_ma = calibration_pt_zero_ma();
   d.pt_span = calibration_pt_span();
+  d.accel_zero = calibration_accel_zero();
   d.cal_ack = s_cal_ack;
 
   d.flags = i2c_bus_dual() ? FLAG_DUAL_I2C : 0;
@@ -180,7 +198,7 @@ static void control_task(void *arg) {
       float dt = (sn->imu_us - last_imu_us) / 1e6f;
       last_imu_us = sn->imu_us;
       if (dt > 0.1f) dt = 0.1f;  // after an IMU dropout
-      altitude_kf_predict(&s_kf, IMU_UP_SIGN * sn->imu.accel[IMU_UP_AXIS], dt);
+      altitude_kf_predict(&s_kf, accel_up(sn) - calibration_accel_zero(), dt);
     }
     bool laser_reading = sn->laser_ok && sn->laser_in_range;
     float laser_z = laser_reading ? calibration_height_mm(sn->laser_raw_mm) / 1000.0f : NAN;
@@ -218,8 +236,10 @@ static void control_task(void *arg) {
 void control_start() {
   s_cmd_mailbox = xQueueCreate(1, sizeof(cmd_t));
   calibration_load();
-  Serial.printf("calibration: pressure zero %.3f mA, span %.4f, laser offset %+d mm\n",
-                calibration_pt_zero_ma(), calibration_pt_span(), calibration_laser_offset_mm());
+  Serial.printf("calibration: pressure zero %.3f mA, span %.4f, laser offset %+d mm, "
+                "accel zero %+.3f m/s^2\n",
+                calibration_pt_zero_ma(), calibration_pt_span(), calibration_laser_offset_mm(),
+                calibration_accel_zero());
   sensors_init();
   altitude_kf_init(&s_kf, 0.0f);  // starts on the ground
   controller_init();

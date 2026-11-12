@@ -22,7 +22,7 @@ hopper/
     │   ├── led.*       Onboard RGB LED
     │   └── radio.*     ESP-NOW link to the ground ESP, signal strength, TX power
     ├── calibration/
-    │   └── calibration.* Pressure zero/span and laser offset, set from the ground, kept in flash
+    │   └── calibration.* Pressure zero/span, laser offset and accel zero, set from the ground, kept in flash
     ├── control/        Control loop, core 1, 100 Hz
     │   ├── control.*   Commands, link timeout, altitude filter, telemetry. Calls the controller
     │   ├── controller.* Altitude/rate PD: the law for every closed-loop mode
@@ -62,6 +62,27 @@ Tuning, in `src/control/gains.h`: change `ACTIVE_GAINS` to the set you want and 
 `valve_hover` matters more than either gain. A PD has no integral term, so the vehicle settles with a constant offset of `(true hover opening - valve_hover) / kp` — at `kp = 18`, 5.6 cm per 1 % of feedforward error. A hover that sits consistently low wants a higher `valve_hover`, not a higher `kp`.
 
 Closed-loop modes need a trustworthy altitude. The filter's `z` only stays true while the laser keeps correcting it; with no laser it coasts on the IMU and drifts without bound. If no laser update lands for `EST_LASER_TIMEOUT_MS` (300 ms) the loop is inhibited and the valve shut, flagged `CTRL_NO_EST` in telemetry. The dashboard's readout shows the mode, the setpoint, the error, the raw demand and these flags; **Setpoint z** and **Valve demand** are plottable next to `z`.
+
+### Calibration
+
+Every calibration is a button on the dashboard, applied once per new `cal_seq` and saved in the hopper's flash, so it survives a reboot and only needs redoing when the hardware changes. All of them are echoed back in telemetry, so the dashboard's Calibration readout is what the hopper is actually using — not what you asked for.
+
+| Button | `cal_op` | Needs | Sets |
+| --- | --- | --- | --- |
+| Zero pressure | `CAL_ZERO` | Line vented | Loop current now = 0 psi |
+| Pressure span | `CAL_SPAN` | ≥ 20 psi on the line, true psi typed in | Pressure scale factor |
+| Laser height | `CAL_LASER` | A surface in range, true height in mm typed in | Laser offset |
+| **Zero on the ground** | `CAL_GROUND` | Vehicle standing on the pad | Laser offset, so the reading now = 0 m |
+| **Zero the IMU** | `CAL_IMU` | Vehicle level and holding still | Accelerometer zero-g offset on the up axis |
+| Clear to defaults | `CAL_CLEAR` | — | All of the above back to defaults |
+
+**Zero on the ground** is `CAL_LASER` with a true height of zero, and it is the one to use before a flight: it makes `z = 0` on the pad, so every setpoint means height above the pad. Prefer it over typing a laser height — measuring the sensor's standoff by hand is the usual reason a hover settles a few centimetres off its commanded altitude.
+
+**Zero the IMU** stores what the up axis reads at rest minus gravity. The filter subtracts it before the accelerometer is integrated, so its bias estimate starts near zero instead of converging over the first seconds of every flight — which matters because `MODE_HOVER` closes on `z`, and an unconverged bias is an altitude that drifts while the loop is trying to hold it. It is refused if the gyro shows more than about 3 °/s of motion, or if the up axis is more than 2 m/s² from gravity: that much means `IMU_UP_AXIS` / `IMU_UP_SIGN` in `control.cpp` are wrong, or the vehicle is not level, and neither should be stored as an offset.
+
+A refused calibration is still acknowledged (`cal_ack` echoes the `cal_seq`), so the dashboard stops resending — but nothing changes, and the reason is printed only on the hopper's serial monitor. If a value in the Calibration readout did not move after you pressed the button, check there.
+
+Order on the pad: **Zero the IMU** with the vehicle level and still, then **Zero on the ground** with it standing on the pad, then arm. Pressure zero and span are separate and only need redoing when the transmitter or plumbing changes.
 
 ### Where the control code lives
 

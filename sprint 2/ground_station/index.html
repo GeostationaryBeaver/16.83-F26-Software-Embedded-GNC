@@ -221,9 +221,18 @@
         <input type="number" id="cal-laser-mm" value="100" min="0" max="2000"><span class="label">mm</span>
       </div>
       <div class="row">
+        <button class="grow" id="cal-ground" disabled>Zero on the ground</button>
+        <span class="hint" style="margin:0">on the pad</span>
+      </div>
+      <div class="row">
+        <button class="grow" id="cal-imu" disabled>Zero the IMU</button>
+        <span class="hint" style="margin:0">level and still</span>
+      </div>
+      <div class="row">
         <button class="grow" id="cal-clear" disabled>Clear to defaults</button>
       </div>
-      <div class="hint">Saved in the hopper's flash. A refused calibration (no reading, transmitter off) is acknowledged but changes nothing: the reason is on the hopper's serial monitor.</div>
+      <div class="hint"><b>Zero on the ground</b> takes the laser reading now as 0 m, so <code>z</code> is height above the pad — do it with the vehicle standing on the pad, and prefer it over typing a laser height. <b>Zero the IMU</b> stores the accelerometer's zero-g error so the filter starts with the right bias; the vehicle must be level and still, and it is refused if it is moving.</div>
+      <div class="hint">Saved in the hopper's flash. A refused calibration (no reading, transmitter off, vehicle moving) is acknowledged but changes nothing: the reason is on the hopper's serial monitor.</div>
     </section>
     <section>
       <h2 class="label">Health</h2>
@@ -243,7 +252,7 @@
 // ---- Protocol: must match firmware-arduino/hopper/src/protocol.h (and ground's copy) ----
 const MSG_TELEMETRY = 1;
 const MSG_CMD = 2;
-const TELEMETRY_LEN = 121;  // type u8, seq u32, time_ms u32, then telemetry_data_t (112 bytes)
+const TELEMETRY_LEN = 125;  // type u8, seq u32, time_ms u32, then telemetry_data_t (116 bytes)
 const CMD_LEN = 22;
 const STATES = ["SAFE", "ARMED", "FAILSAFE"];
 const REASONS = ["none", "link lost", "E-stop"];
@@ -253,7 +262,8 @@ const CTRL_FLAGS = [[0x01, "SAT HIGH"], [0x02, "SAT LOW"], [0x04, "SP RAMP"],
   [0x08, "NO EST"], [0x10, "GND SHUT"]];
 const SP_Z_MAX = 1.00, SP_VZ_MAX = 0.50;  // must match protocol.h
 const FT_PER_M = 3.280839895;
-const CAL_NONE = 0, CAL_ZERO = 1, CAL_SPAN = 2, CAL_LASER = 3, CAL_CLEAR = 4;
+const CAL_NONE = 0, CAL_ZERO = 1, CAL_SPAN = 2, CAL_LASER = 3, CAL_CLEAR = 4,
+      CAL_GROUND = 5, CAL_IMU = 6;
 const HEALTH = [[0x01, "LASER"], [0x02, "IMU"], [0x04, "TEMP"], [0x08, "PRESSURE"], [0x10, "SERVO PWR"]];
 const FLAG_DUAL_I2C = 0x01;
 const CMD_PERIOD_MS = 20;
@@ -280,6 +290,7 @@ function decodeTelemetry(p) {
     flags: p[96], i2cErrors: v.getUint16(97, true),
     mode: p[99], ctrlFlags: p[100],
     spZ: f(101), spVz: f(105), demand: f(109), kp: f(113), kd: f(117),
+    accelZero: f(121),
   };
 }
 
@@ -398,7 +409,7 @@ function onPacket(p) {
   if (recording) recording.push(csvRow(pkt));
   if (cmd.calOp !== CAL_NONE && pkt.calAck === cmd.calSeq) {
     cmd.calOp = CAL_NONE;
-    log(`Calibration ack: zero ${pkt.ptZeroMa.toFixed(3)} mA, span ${pkt.ptSpan.toFixed(4)}, laser ${(pkt.laserOffsetM * 1000).toFixed(0)} mm`);
+    log(`Calibration ack: zero ${pkt.ptZeroMa.toFixed(3)} mA, span ${pkt.ptSpan.toFixed(4)}, laser ${(pkt.laserOffsetM * 1000).toFixed(0)} mm, accel ${pkt.accelZero >= 0 ? "+" : ""}${pkt.accelZero.toFixed(3)} m/s²`);
   }
 }
 
@@ -441,13 +452,14 @@ const CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "
   "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
   "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
   "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
-  "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd"];
+  "mode", "ctrl_flags", "sp_z_m", "sp_vz_ms", "demand_pct", "kp", "kd", "accel_zero"];
 function csvRow(t) {
   return [Date.now(), t.seq, t.timeMs, t.state, t.reason, t.valvePct, t.health, t.flags,
     t.z, t.vz, t.accelBias, t.laserZ, ...t.accel, ...t.gyro, t.tempC, t.ptMa, t.psi, t.servoV,
     t.failsafes, t.cmdSeq, t.rttMs, t.maxGapMs, t.rssi, t.txPower, t.laserOffsetM, t.ptZeroMa,
     t.ptSpan, t.calAck, t.i2cErrors,
-    t.mode, t.ctrlFlags, t.spZ, t.spVz, t.demand, t.kp, t.kd].map(x => Number.isNaN(x) ? "" : x).join(",");
+    t.mode, t.ctrlFlags, t.spZ, t.spVz, t.demand, t.kp, t.kd,
+    t.accelZero].map(x => Number.isNaN(x) ? "" : x).join(",");
 }
 function toggleRecording() {
   if (!recording) {
@@ -524,7 +536,7 @@ function log(msg, isError) {
   $("log").prepend(li);
 }
 
-const CONTROLS = ["arm", "estop", "mode", "valve-slider", "rate-slider", "hover-ft", "txpow", "cal-zero", "cal-span", "cal-laser", "cal-clear", "record"];
+const CONTROLS = ["arm", "estop", "mode", "valve-slider", "rate-slider", "hover-ft", "txpow", "cal-zero", "cal-span", "cal-laser", "cal-ground", "cal-imu", "cal-clear", "record"];
 function setConnected(on) {
   $("connect").textContent = on ? "Disconnect" : "Connect";
   $("connect").classList.toggle("primary", !on);
@@ -619,6 +631,8 @@ $("cal-laser").onclick = () => {
   const mm = Math.round(+$("cal-laser-mm").value);
   calibrate(CAL_LASER, mm, `laser height ${mm} mm`);
 };
+$("cal-ground").onclick = () => calibrate(CAL_GROUND, 0, "zero on the ground");
+$("cal-imu").onclick = () => calibrate(CAL_IMU, 0, "zero the IMU");
 $("cal-clear").onclick = () => calibrate(CAL_CLEAR, 0, "clear to defaults");
 document.addEventListener("visibilitychange", () => {
   if (document.hidden && port) log("Tab hidden: commands may slow down and the hopper FAILSAFE", true);
@@ -677,6 +691,7 @@ const READOUT = [
   ["PT zero", t => fmt(t.ptZeroMa, 3) + " mA"],
   ["PT span", t => fmt(t.ptSpan, 4)],
   ["laser offset", t => fmt(t.laserOffsetM * 1000, 0) + " mm"],
+  ["accel zero", t => fmt(t.accelZero, 3) + " m/s²"],
   ["cal ack", t => `${t.calAck} (sent ${cmd.calSeq})`],
   ["Diagnostics"],
   ["I2C", t => t.flags & FLAG_DUAL_I2C ? "dual controllers" : "shared controller"],

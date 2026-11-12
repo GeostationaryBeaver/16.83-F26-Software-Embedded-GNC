@@ -42,10 +42,61 @@ static void hopper_to_usb(uint32_t now) {
   }
 }
 
+// DIAGNOSTIC (temporary): ground board status to the laptop twice a second, type 0x7E.
+// The dashboard ignores packet types it doesn't know.
+#define MSG_GROUND_DIAG 0x7E
+#define DIAG_PERIOD_MS 500
+static uint32_t s_radio_ok = 0, s_radio_fail = 0;
+static int32_t s_radio_last_err = 0;
+static uint32_t s_loops = 0, s_max_loop_us = 0, s_last_loop_us = 0, s_last_diag_ms = 0;
+
+typedef struct __attribute__((packed)) {
+  uint8_t type;
+  uint32_t uptime_ms, loops, max_loop_us;
+  uint32_t rx_bytes, rx_packets, rx_bad, tx_dropped, tx_queued;
+  int32_t serial_available, serial_room;
+  uint8_t serial_connected;
+  uint32_t radio_ok, radio_fail;
+  int32_t radio_last_err;
+  uint32_t rx_queue_waiting;
+} ground_diag_t;
+
+static void send_diag(uint32_t now) {
+  if (now - s_last_diag_ms < DIAG_PERIOD_MS) return;
+  s_last_diag_ms = now;
+  ground_diag_t d;
+  d.type = MSG_GROUND_DIAG;
+  d.uptime_ms = now;
+  d.loops = s_loops;
+  d.max_loop_us = s_max_loop_us;
+  s_max_loop_us = 0;
+  d.rx_bytes = usb_link_stats.rx_bytes;
+  d.rx_packets = usb_link_stats.rx_packets;
+  d.rx_bad = usb_link_stats.rx_bad;
+  d.tx_dropped = usb_link_stats.tx_dropped;
+  d.tx_queued = usb_link_stats.tx_queued;
+  d.serial_available = Serial.available();
+  d.serial_room = Serial.availableForWrite();
+  d.serial_connected = (bool)Serial;
+  d.radio_ok = s_radio_ok;
+  d.radio_fail = s_radio_fail;
+  d.radio_last_err = s_radio_last_err;
+  d.rx_queue_waiting = uxQueueMessagesWaiting(s_rx_queue);
+  usb_link_send((const uint8_t *)&d, sizeof(d));
+}
+
 static void usb_to_hopper() {
   uint8_t pkt[USB_MAX_PACKET_LEN];
   int len;
-  while ((len = usb_link_receive(pkt)) > 0) radio_send(pkt, len);
+  while ((len = usb_link_receive(pkt)) > 0) {
+    esp_err_t err = radio_send(pkt, len);
+    if (err == ESP_OK) {
+      s_radio_ok++;
+    } else {
+      s_radio_fail++;
+      s_radio_last_err = err;
+    }
+  }
 }
 
 // Green = hearing the hopper. Red solid = hopper ARMED, red blinking = hopper FAILSAFE.
@@ -64,7 +115,13 @@ esp_err_t bridge_init() {
 
 void bridge_update() {
   uint32_t now = millis();
+  uint32_t t_us = micros();
+  if (s_loops && t_us - s_last_loop_us > s_max_loop_us) s_max_loop_us = t_us - s_last_loop_us;
+  s_last_loop_us = t_us;
+  s_loops++;
+  send_diag(now);
   hopper_to_usb(now);
+  usb_link_service();
   usb_to_hopper();
   update_lights(now);
 }

@@ -21,4 +21,7 @@ int calibration_height_mm(uint16_t raw_mm);
 float calibration_pt_zero_ma();
 float calibration_pt_span();
 int16_t calibration_laser_offset_mm();
+// Laser offset from the automatic calibration (autocal.h). In use until the next reboot, not
+// written to flash: it is measured again at every boot.
+void calibration_set_laser_offset_mm(int16_t mm);
 float calibration_pt_full_psi();  // pressure transmitter full scale in use (CAL_PTRANGE)

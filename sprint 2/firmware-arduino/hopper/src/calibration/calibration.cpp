@@ -78,4 +78,5 @@ int calibration_height_mm(uint16_t raw_mm) { return max(0, (int)raw_mm + s_laser
 float calibration_pt_zero_ma() { return s_zero_ua / 1000.0f; }
 float calibration_pt_span() { return s_span; }
 int16_t calibration_laser_offset_mm() { return s_laser_off_mm; }
+void calibration_set_laser_offset_mm(int16_t mm) { s_laser_off_mm = mm; }
 float calibration_pt_full_psi() { return s_pt_full_psi; }

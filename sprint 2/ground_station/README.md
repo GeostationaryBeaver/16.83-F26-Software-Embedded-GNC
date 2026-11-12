@@ -19,7 +19,7 @@ It picks the ground board's port from `GROUND_MAC` in `firmware-arduino/ground/s
 
 - **Arm / E-stop / valve / radio power**: as in the browser version. `Esc` = E-stop.
 - **Gains**: the controllers' gains, as the hopper reports them. Edit (orange = not yet on the hopper), then **Apply**; **Revert** drops the edits, **Defaults** goes back to the ones compiled into the firmware. The hopper takes them only while disarmed and keeps them in flash, so they survive a reboot. Once a set flies well, copy it into `CTRL_DEFAULT_GAINS` in `hopper/src/control/controllers.cpp`.
-- **Calibration**: zero, span, laser height, clear. Calibration numbers continue from the hopper's last one, so a new calibration is never mistaken for one it already applied.
+- **Calibration**: pressure range, zero, span; auto laser + IMU (the hopper averages ~3 s on the pad and takes it as zero; it also does this at every boot); clear. Calibration numbers continue from the hopper's last one, so a new calibration is never mistaken for one it already applied.
 - **Record**: writes every telemetry packet to `recordings/hopper_<time>.csv` as it arrives (same columns as the browser version).
 - **Closing the window or Disconnect** sends 200 ms of disarm commands (valve shut, SAFE) before letting go of the port.
 

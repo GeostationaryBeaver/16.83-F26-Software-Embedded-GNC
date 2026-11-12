@@ -33,10 +33,10 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHB
 
 import link as linkmod
 import style as S
-from protocol import (ABORTS, CAL_CLEAR, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO, CTRL_MANUAL,
-                      CTRL_MODES, DEFAULT_PROFILE, FLAG_DUAL_I2C, FLAG_POWER_CAUSE_MASK,
+from protocol import (ABORTS, CAL_AUTO, CAL_CLEAR, CAL_NONE, CAL_PTRANGE, CAL_SPAN, CAL_ZERO, CTRL_MANUAL,
+                      CTRL_MODES, DEFAULT_PROFILE, FLAG_AUTOCAL, FLAG_DUAL_I2C, FLAG_POWER_CAUSE_MASK,
                       FLAG_POWER_CAUSE_SHIFT, FLAG_POWER_LATCH, FLAG_POWER_TRIP, FLAG_SERVO_OFF,
-                      GAIN_LIMITS, GAINS_DEFAULTS, POWER_CAUSES,
+                      GAIN_LIMITS, GAINS_DEFAULTS, POWER_CAUSES, PT_RANGE_PSI,
                       GAINS_RESULTS, GAINS_SET, HEALTH, HOP_MM, HOVER_MS, PHASE_IDLE, PHASES, REASONS,
                       STATES, V_DOWN_MMS, V_UP_MMS, Gains, board_mac)
 
@@ -45,7 +45,7 @@ RECORDINGS_DIR = SCRIPT_DIR / "recordings"
 
 WINDOW_S = 10.0       # plot history
 UI_PERIOD_MS = 33     # ~30 Hz redraw
-HISTORY_CAP = 8192    # samples kept per channel (41 s at 200 Hz); must hold WINDOW_S twice over
+HISTORY_CAP = 8192    # samples kept per channel (160 s at 50 Hz); must hold WINDOW_S twice over
 LOG_MAX = 300         # event log rows kept
 LIVE_AGE_S = 0.5      # telemetry older than this = "No telemetry"
 SIDE_WIDTH = 360
@@ -91,8 +91,8 @@ CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "health
             "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
             "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
             "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
-            "ctrl_mode", "phase", "abort_reason", "z_sp_m", "vz_sp_ms", "hop_mm", "v_up_mms",
-            "v_down_mms", "hover_ms"]
+            "ctrl_mode", "phase", "abort_reason", "z_sp_m", "vz_sp_ms", "hop_m", "v_up_ms",
+            "v_down_ms", "hover_s"]
 
 
 def fmt(x, d):
@@ -122,8 +122,8 @@ def ctrl_name(m):
 class History:
     """Recent telemetry as numpy arrays: one time column and a column per CHANNELS entry.
 
-    Telemetry comes at 200 Hz, so a plot shows ~2000 points; keeping them in arrays means
-    a redraw is a slice, not a conversion of 2000 Python tuples."""
+    Telemetry comes at 50 Hz (hopper control.cpp, TELEMETRY_EVERY), so a plot shows ~500
+    points; keeping them in arrays means a redraw is a slice, not a conversion of Python tuples."""
 
     def __init__(self, channels, cap=HISTORY_CAP):
         self.t = np.empty(cap)
@@ -167,8 +167,8 @@ def csv_row(t):
             t.z, t.vz, t.accel_bias, t.laser_z, *t.accel, *t.gyro, t.temp_c, t.pt_ma, t.psi, t.servo_v,
             t.failsafes, t.cmd_seq, t.rtt_ms, t.max_gap_ms, t.rssi, t.tx_power, t.laser_offset_m,
             t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors,
-            t.ctrl_mode, t.phase, t.abort_reason, t.z_sp, t.vz_sp, t.hop_mm, t.v_up_mms,
-            t.v_down_mms, t.hover_ms]
+            t.ctrl_mode, t.phase, t.abort_reason, t.z_sp, t.vz_sp, t.hop_mm / 1000, t.v_up_mms / 1000,
+            t.v_down_mms / 1000, t.hover_ms / 1000]
     return ["" if isinstance(v, float) and math.isnan(v) else v for v in vals]
 
 
@@ -249,16 +249,17 @@ class Plot(QFrame):
         for s in range(0, 11, 2):
             self.plot.addItem(pg.InfiniteLine(-s, angle=90, pen=pg.mkPen(S.GRID)), ignoreBounds=True)
         self.plot.setXRange(-WINDOW_S, 0, padding=0)
-        # Width 1, not 1.25: a 1 px pen takes Qt's hairline path, ~10x faster to antialias.
-        # Stroking every point of a noisy 200 Hz trace with a wider pen is what made the
-        # window lag (and starved the link threads of the GIL while it drew).
+        # Width 1, not 1.25: a 1 px pen takes Qt's hairline path, much faster to antialias.
+        # A wider pen's cost grows with the points drawn (and holds the GIL, starving the
+        # link threads): ~4x the draw time at 100 Hz telemetry, ~9x at 200 Hz.
         self.curve = self.plot.plot(pen=pg.mkPen(S.INK, width=1), connect="finite",
                                     autoDownsampleFactor=1.0)
-        # ~2000 points across a few hundred pixels: draw each pixel's min and max instead
-        # (same picture, spikes kept)
+        # More points than pixels (a faster telemetry rate): draw each pixel's min and max
+        # instead (same picture, spikes kept). At 50 Hz it's ~1 point per pixel already
         self.curve.setDownsampling(auto=True, method="peak")
         self.curve.setClipToView(True)
         self._shown = None
+        self.drawn = None  # (channel, history length, newest time) last given to the curve
 
         head = QHBoxLayout()
         head.setContentsMargins(16, 12, 16, 4)
@@ -475,16 +476,18 @@ class GroundStation(QMainWindow):
         row.addWidget(self.ctrl_box, 1)
         body.addLayout(row)
         self.profile = {}
-        for key, name, unit, (lo, hi), step in [("z_sp_mm", "Height", "mm", HOP_MM, 50),
-                                                ("v_up_mms", "Climb", "mm/s", V_UP_MMS, 25),
-                                                ("v_down_mms", "Descent", "mm/s", V_DOWN_MMS, 25),
-                                                ("hover_ms", "Hover", "ms", HOVER_MS, 500)]:
+        # Shown in SI (m, m/s, s); the command packet carries mm, mm/s and ms
+        for key, name, unit, (lo, hi), step in [("z_sp_mm", "Height", "m", HOP_MM, 0.05),
+                                                ("v_up_mms", "Climb", "m/s", V_UP_MMS, 0.025),
+                                                ("v_down_mms", "Descent", "m/s", V_DOWN_MMS, 0.025),
+                                                ("hover_ms", "Hover", "s", HOVER_MS, 0.5)]:
             row = QHBoxLayout()
             row.setSpacing(8)
             k = caps(name)
             k.setFixedWidth(64)
             row.addWidget(k)
-            box = QSpinBox(minimum=lo, maximum=hi, singleStep=step, value=DEFAULT_PROFILE[key])
+            box = QDoubleSpinBox(minimum=lo / 1000, maximum=hi / 1000, decimals=3, singleStep=step,
+                                 value=DEFAULT_PROFILE[key] / 1000)
             box.lineEdit().setTextMargins(8, 0, 0, 0)
             box.valueChanged.connect(self.set_profile)
             row.addWidget(box, 1)
@@ -542,20 +545,32 @@ class GroundStation(QMainWindow):
         self.cal_status = QLabel()
         self.cal_status.setFont(S.label_font())
         sec, body = self._section("Calibration", self.cal_status)
+        # Pressure transmitter full scale (psi at 20 mA): the part fitted. Resets the span,
+        # so it comes first: range, then vent and zero, then span against a gauge
+        self.cal_range = button("Pressure range")
+        self.pt_range_psi = QSpinBox(minimum=PT_RANGE_PSI[0], maximum=PT_RANGE_PSI[1], singleStep=500, value=1000)
+        self.cal_range.setToolTip("Transmitter full scale (psi at 20 mA). Resets the span: zero and span again after")
+        self.cal_range.clicked.connect(
+            lambda: self.calibrate(CAL_PTRANGE, self.pt_range_psi.value(),
+                                   f"pressure transmitter range {self.pt_range_psi.value()} psi "
+                                   "(span reset: zero and span again)"))
         self.cal_zero = button("Zero pressure")
         self.cal_zero.clicked.connect(lambda: self.calibrate(CAL_ZERO, 0, "pressure zero"))
         self.cal_span = button("Pressure span")
-        self.span_psi = QSpinBox(minimum=20, maximum=1000, value=100)
+        self.span_psi = QSpinBox(minimum=20, maximum=PT_RANGE_PSI[1], value=100)
         self.cal_span.clicked.connect(
             lambda: self.calibrate(CAL_SPAN, self.span_psi.value(), f"pressure span at {self.span_psi.value()} psi"))
-        self.cal_laser = button("Laser height")
-        self.laser_mm = QSpinBox(minimum=0, maximum=2000, value=100)
+        # Laser offset and IMU biases: the hopper averages its sensors for ~3 s on the pad and
+        # takes them as zero (it also does this at every boot)
+        self.cal_laser = button("Auto laser + IMU")
+        self.cal_laser.setToolTip("Hopper still on the pad, disarmed: ~3 s of averages become the "
+                                  "laser zero and the IMU biases. Also done at every hopper boot")
         self.cal_laser.clicked.connect(
-            lambda: self.calibrate(CAL_LASER, self.laser_mm.value(), f"laser height {self.laser_mm.value()} mm"))
+            lambda: self.calibrate(CAL_AUTO, 0, "auto laser + IMU (keep the hopper still on the pad)"))
         self.cal_clear = button("Clear to defaults")
         self.cal_clear.clicked.connect(lambda: self.calibrate(CAL_CLEAR, 0, "clear to defaults"))
-        for btn, extra in [(self.cal_zero, hint("line vented")), (self.cal_span, (self.span_psi, "psi")),
-                           (self.cal_laser, (self.laser_mm, "mm")), (self.cal_clear, None)]:
+        for btn, extra in [(self.cal_range, (self.pt_range_psi, "psi")), (self.cal_zero, hint("line vented")), (self.cal_span, (self.span_psi, "psi")),
+                           (self.cal_laser, hint("on pad, still")), (self.cal_clear, None)]:
             row = QHBoxLayout()
             row.setSpacing(8)
             row.addWidget(btn, 1)
@@ -673,7 +688,7 @@ class GroundStation(QMainWindow):
             return
         self.link.set_command(arm=False, estop=False, go=False, valve_pct=0, cal_op=CAL_NONE,
                               tx_power=self.txpow.currentData(), ctrl_mode=self.ctrl_box.currentData(),
-                              **{k: b.value() for k, b in self.profile.items()})
+                              **self.profile_command())
         self.latest, self.last_seq, self.lost, self.cal_synced, self.overflow = None, None, 0, False, 0
         self.hopper_gains = None
         self.set_connected(True)
@@ -692,8 +707,8 @@ class GroundStation(QMainWindow):
         self.connect_btn.setText("DISCONNECT" if on else "CONNECT")
         S.set_variant(self.connect_btn, None if on else "primary")
         self.port_box.setEnabled(not on)
-        for w in [self.arm_btn, self.estop_btn, self.valve_slider, self.txpow, self.cal_zero, self.span_psi,
-                  self.cal_span, self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn,
+        for w in [self.arm_btn, self.estop_btn, self.valve_slider, self.txpow, self.cal_range, self.pt_range_psi, self.cal_zero, self.span_psi,
+                  self.cal_span, self.cal_laser, self.cal_clear, self.record_btn,
                   self.ctrl_box, *self.profile.values()]:
             w.setEnabled(on)
         self.update_controls()
@@ -712,7 +727,10 @@ class GroundStation(QMainWindow):
         self.valve_slider.setValue(valve)
         self.valve_slider.blockSignals(False)
         self.valve_label.setText(f"{valve} %")
-        self.cal_status.setText("SENDING…" if c and c.cal_op != CAL_NONE else "")
+        if self.latest and self.latest.flags & FLAG_AUTOCAL:
+            self.cal_status.setText("AUTO-CAL… KEEP STILL")
+        else:
+            self.cal_status.setText("SENDING…" if c and c.cal_op != CAL_NONE else "")
         going = bool(c and c.go)
         self.go_btn.setText("ABORT HOP" if going else "GO")
         S.set_variant(self.go_btn, "armed" if going else "primary")
@@ -752,7 +770,11 @@ class GroundStation(QMainWindow):
 
     def set_profile(self):
         if self.link:
-            self.link.set_command(**{k: b.value() for k, b in self.profile.items()})
+            self.link.set_command(**self.profile_command())
+
+    def profile_command(self):
+        """The Hop boxes (m, m/s, s) as the packet's mm, mm/s and ms."""
+        return {k: round(b.value() * 1000) for k, b in self.profile.items()}
 
     def toggle_go(self):
         c = self.link.command()
@@ -875,9 +897,9 @@ class GroundStation(QMainWindow):
             # mistaken for one it already applied before this app started
             self.link.set_command(cal_seq=t.cal_ack)
             self.cal_synced = True
-        if self.latest:
-            self.on_changes(self.latest, t)
-        self.latest = t
+        prev, self.latest = self.latest, t
+        if prev:
+            self.on_changes(prev, t)
         self.last_rx = time.monotonic()
         self.rx_times.append(self.last_rx)
         self.history.append(t.time_ms, [get(t) for _, _, get, _ in CHANNELS])
@@ -889,7 +911,7 @@ class GroundStation(QMainWindow):
             self.link.set_command(cal_op=CAL_NONE)
             self.update_controls()
             self.log(f"Calibration ack: zero {t.pt_zero_ma:.3f} mA, span {t.pt_span:.4f}, "
-                     f"laser {t.laser_offset_m * 1000:.0f} mm")
+                     f"laser {t.laser_offset_m:.3f} m")
 
     def on_changes(self, a, b):
         if a.state != b.state:
@@ -923,6 +945,11 @@ class GroundStation(QMainWindow):
         if (a.flags ^ b.flags) & FLAG_SERVO_OFF:
             self.log("Servo signal OFF (power protection)" if b.flags & FLAG_SERVO_OFF
                      else "Servo signal back on", bool(b.flags & FLAG_SERVO_OFF))
+        if (a.flags ^ b.flags) & FLAG_AUTOCAL:
+            self.log("Auto calibration: keep the hopper still on the pad" if b.flags & FLAG_AUTOCAL
+                     else f"Auto calibration done: laser offset {b.laser_offset_m:.3f} m, "
+                          f"accel {b.accel[0]:.2f} {b.accel[1]:.2f} {b.accel[2]:.2f} m/s²")
+            self.update_controls()
         if b.flags & FLAG_POWER_LATCH and not a.flags & FLAG_POWER_LATCH:
             self.log("Power protection latched (3 trips): fix the battery, then restart the hopper", True)
 
@@ -983,6 +1010,12 @@ class GroundStation(QMainWindow):
             k = p.channel.currentIndex()
             _, unit, get, d = CHANNELS[k]
             p.set_value(fmt(get(t), d) if t else "—", unit)
+            # Redraw only on new data or another channel: setData repaints the whole plot,
+            # and doing that 30 times a second with nothing new kept a CPU core busy
+            key = (k, self.history.n, t_end)
+            if key == p.drawn:
+                continue
+            p.drawn = key
             times, values = self.history.window(k, t_end)
             if len(times) > 1:
                 p.curve.setData((times - t_end) / 1000, values)

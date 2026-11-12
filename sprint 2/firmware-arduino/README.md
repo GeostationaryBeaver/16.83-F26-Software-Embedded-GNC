@@ -22,7 +22,8 @@ hopper/
     │   ├── led.*       Onboard RGB LED
     │   └── radio.*     ESP-NOW link to the ground ESP, signal strength, TX power
     ├── calibration/
-    │   └── calibration.* Pressure zero/span/range and laser offset, set from the ground, kept in flash
+    │   ├── calibration.* Pressure zero/span/range, set from the ground, kept in flash
+    │   └── autocal.*     Laser offset and IMU biases averaged on the pad at boot (and on CAL_AUTO)
     ├── control/        Control loop, core 1, 250 Hz (telemetry sent at 50 Hz)
     │   ├── control.*   Commands, link timeout, altitude filter, flight phases + controller, telemetry
     │   ├── safety.*    SAFE / ARMED / FAILSAFE state machine: the only code that moves the valve

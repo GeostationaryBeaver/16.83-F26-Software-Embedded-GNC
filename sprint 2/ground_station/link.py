@@ -32,7 +32,7 @@ READ_TIMEOUT_S = 0.05         # how long a read waits for bytes (bounds how fast
 WRITE_TIMEOUT_S = 0.1         # a command that can't go out in this long is dropped
 GAINS_RESEND_EVERY = 5        # a gains request goes out every 5th command (100 ms) until acked
 GAINS_GIVE_UP_S = 3.0         # no ack in this long = the request is dropped
-BACKLOG = 1000                # packets kept for the window (5 s at 200 Hz); older ones dropped
+BACKLOG = 1000                # packets kept for the window (20 s at 50 Hz); older ones dropped
 
 
 def now_us() -> int:

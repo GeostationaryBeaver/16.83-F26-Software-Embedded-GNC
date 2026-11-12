@@ -12,6 +12,7 @@
 #include "power_guard.h"
 #include "safety.h"
 #include "sensors.h"
+#include "../calibration/autocal.h"
 #include "../calibration/calibration.h"
 #include "../drivers/i2c_bus.h"
 #include "../drivers/radio.h"
@@ -50,6 +51,7 @@ static cmd_t s_cmd = {};  // latest command taken by the control loop
 static uint8_t s_gains_ack = 0;
 static uint8_t s_gains_result = GAINS_OK;
 static uint8_t s_cal_ack = 0;
+static uint8_t s_autocal_seq = 0;  // cal_seq of a CAL_AUTO in progress, acked when it finishes
 static uint8_t s_tx_power_cmd = 0;
 
 // Controller in use. Follows cmd_t.ctrl_mode while not ARMED, held while ARMED.
@@ -150,13 +152,23 @@ static void latch_controller() {
   }
 }
 
-static void take_command(const sensors_t *sn) {
+static void take_command(uint32_t now_ms, const sensors_t *sn) {
   if (xQueueReceive(s_cmd_mailbox, &s_cmd, 0) != pdTRUE) return;
   if (s_cmd.tx_power != s_tx_power_cmd) {
     s_tx_power_cmd = s_cmd.tx_power;
     radio_set_tx_power(s_cmd.tx_power);
   }
-  if (s_cmd.cal_op != CAL_NONE && s_cmd.cal_seq != s_cal_ack) {
+  if (s_cmd.cal_op != CAL_NONE && s_cmd.cal_seq != s_cal_ack && s_cmd.cal_seq != s_autocal_seq) {
+    if (s_cmd.cal_op == CAL_AUTO) {
+      if (safety_state() == STATE_ARMED) {
+        s_cal_ack = s_cmd.cal_seq;  // refused: only on the pad
+      } else {
+        autocal_start(now_ms);
+        s_autocal_seq = s_cmd.cal_seq;  // acked once it has finished (see autocal_step)
+      }
+      return;
+    }
+    if (s_cmd.cal_op == CAL_CLEAR) autocal_clear_imu();
     // laser_avg_mm keeps its last value after the laser drops out: don't calibrate on that
     float laser_mm = sn->laser_ok && sn->laser_in_range ? sn->laser_avg_mm : -1.0f;
     calibration_apply(s_cmd.cal_op, s_cmd.cal_value, sn->pt_ma_avg, laser_mm);
@@ -164,7 +176,17 @@ static void take_command(const sensors_t *sn) {
   }
 }
 
-static void send_telemetry(const sensors_t *sn, float laser_z) {
+// Runs the automatic laser/IMU calibration (autocal.h). When it has new biases the altitude
+// filter starts again from them, on the pad.
+static void autocal_step(uint32_t now_ms, const sensors_t *sn) {
+  if (autocal_update(now_ms, sn, safety_state() == STATE_ARMED)) altitude_kf_init(&s_kf, 0.0f);
+  if (s_autocal_seq && !autocal_running()) {  // finished, or stopped by arming
+    s_cal_ack = s_autocal_seq;
+    s_autocal_seq = 0;
+  }
+}
+
+static void send_telemetry(const sensors_t *sn, const imu_sample_t *imu, float laser_z) {
   telemetry_data_t d = {};
   d.z = s_kf.z;
   d.vz = s_kf.vz;
@@ -172,8 +194,8 @@ static void send_telemetry(const sensors_t *sn, float laser_z) {
   d.laser_z = laser_z;
 
   for (int i = 0; i < 3; i++) {
-    d.accel[i] = sn->imu.accel[i];
-    d.gyro[i] = sn->imu.gyro[i];
+    d.accel[i] = imu->accel[i];
+    d.gyro[i] = imu->gyro[i];
   }
   d.temp_c = sn->temp_c;
   d.pt_ma = sn->pt_ma_avg;
@@ -198,7 +220,8 @@ static void send_telemetry(const sensors_t *sn, float laser_z) {
   d.pt_span = calibration_pt_span();
   d.cal_ack = s_cal_ack;
 
-  d.flags = (i2c_bus_dual() ? FLAG_DUAL_I2C : 0) | power_flags();
+  d.flags = (i2c_bus_dual() ? FLAG_DUAL_I2C : 0) | power_flags() |
+            (autocal_running() ? FLAG_AUTOCAL : 0);
   d.i2c_errors = sn->i2c_errors;
 
   d.ctrl_mode = s_ctrl_mode;
@@ -232,9 +255,13 @@ static void control_task(void *arg) {
     uint32_t now = millis();
     // No sensor restarts while ARMED: a laser restart blocks the loop for tens of ms
     const sensors_t *sn = sensors_update(now, safety_state() != STATE_ARMED);
+    // IMU with the automatic calibration's biases removed: used by everything below
+    imu_sample_t imu = sn->imu;
+    autocal_correct_imu(&imu);
 
     // ---- commands and link ----
-    take_command(sn);
+    take_command(now, sn);
+    autocal_step(now, sn);
     if (take_gains() || now - last_gains_report_ms >= GAINS_REPORT_MS) {
       last_gains_report_ms = now;
       report_gains();
@@ -266,7 +293,7 @@ static void control_task(void *arg) {
       float dt = (sn->imu_us - last_imu_us) / 1e6f;
       last_imu_us = sn->imu_us;
       if (dt > 0.1f) dt = 0.1f;  // after an IMU dropout
-      altitude_kf_predict(&s_kf, IMU_UP_SIGN * sn->imu.accel[IMU_UP_AXIS], dt);
+      altitude_kf_predict(&s_kf, IMU_UP_SIGN * imu.accel[IMU_UP_AXIS], dt);
     }
     bool laser_reading = sn->laser_ok && sn->laser_in_range;
     float laser_z = laser_reading ? calibration_height_mm(sn->laser_raw_mm) / 1000.0f : NAN;
@@ -279,7 +306,7 @@ static void control_task(void *arg) {
     s_ctrl_in.dt = fminf(loop_dt, CTRL_DT_MAX);
     s_ctrl_in.z = s_kf.z;
     s_ctrl_in.vz = s_kf.vz;
-    s_ctrl_in.az = IMU_UP_SIGN * sn->imu.accel[IMU_UP_AXIS] - GRAVITY - s_kf.b;
+    s_ctrl_in.az = IMU_UP_SIGN * imu.accel[IMU_UP_AXIS] - GRAVITY - s_kf.b;
     s_ctrl_in.manual_pct = s_cmd.valve_pct;
 
     // ---- flight phase inputs ----
@@ -311,7 +338,7 @@ static void control_task(void *arg) {
       s_ref = {FLIGHT_MANUAL, NAN, NAN};
     }
 
-    if (loop_count++ % TELEMETRY_EVERY == 0) send_telemetry(sn, laser_z);
+    if (loop_count++ % TELEMETRY_EVERY == 0) send_telemetry(sn, &imu, laser_z);
     vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
   }
 }
@@ -323,6 +350,8 @@ void control_start() {
   gains_store_load();
   sensors_init();
   altitude_kf_init(&s_kf, 0.0f);  // starts on the ground
+  autocal_init(IMU_UP_AXIS, IMU_UP_SIGN, GRAVITY);
+  autocal_start(millis());  // on the pad at power-up: laser offset and IMU biases from it
 
   xTaskCreatePinnedToCore(control_task, "control", 8192, NULL,
                           CONTROL_PRIORITY, NULL, CONTROL_CORE);

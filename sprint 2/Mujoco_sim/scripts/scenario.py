@@ -1708,6 +1708,8 @@ def run_selftest() -> int:
         uv run python scripts/scenario.py --selftest
     """
     import subprocess
+    import inspect as _inspect_mod
+    import numpy as _np
     from thrusters import ThrusterSet as _ThrusterSet
     bar = "=" * 74
     print(bar)
@@ -2062,6 +2064,121 @@ def run_selftest() -> int:
           and _eh._tick_dt(0.5) == _eh.DT_NOMINAL_S)
     _eh.reset_state()
     truth("  reset_state clears the timestamp too", _eh._t_prev is None)
+
+    print("\n[7c] the full-PID cascade")
+    out7c = ROOT / "out" / "_selftest_pidcascade"
+
+    # *** THE LOAD-BEARING CHECK. *** All four new gains default to 0, so the
+    # law must BE hover_cascade. Asserted byte-for-byte rather than on
+    # metrics: that makes it a strict superset, so any difference measured
+    # later is attributable to the gain turned on and not to the law change.
+    def cascade_dir(law, gains=None, target="2.0"):
+        """Either cascade law, same profile and outdir, newest dir back."""
+        argv = [sys.executable, str(HERE / "scenario.py"),
+                "--controller", f"example_hover:{law}",
+                "--scene", "scenes/07_thrust_1D.xml", "--target", target,
+                "--fixed-mass", "--no-plot", "--outdir", str(out7c)]
+        if gains:
+            argv += ["--gains", gains]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None, r
+        return max(out7c.glob("*/"), key=lambda q: q.stat().st_mtime), r
+
+    d_cp, r_cp = cascade_dir("hover_cascade_pid")
+    d_base, _ = cascade_dir("hover_cascade")
+    truth("a PID-cascade run completes", d_cp is not None,
+          "" if d_cp else (r_cp.stderr or "")[-160:])
+    if d_cp is not None and d_base is not None:
+        import hashlib
+        h_pid = hashlib.md5((d_cp / "flight.csv").read_bytes()).hexdigest()
+        h_base = hashlib.md5((d_base / "flight.csv").read_bytes()).hexdigest()
+        truth("  at zero I and D it IS hover_cascade, byte for byte",
+              h_pid == h_base, f"{h_pid[:16]} vs {h_base[:16]}")
+
+    # Each new gain must actually DO something - a gain that changes nothing
+    # is a gain that is not wired up, which is the failure mode a superset
+    # law invites.
+    if d_cp is not None:
+        x0 = json.loads((d_cp / "run.json").read_text())["metrics"]
+        for gname, gval in (("KI_V", "5"), ("KI_POS_V", "1"),
+                            ("KD_V", "2"), ("KD_POS_V", "1")):
+            d_g, r_g = cascade_dir("hover_cascade_pid", f"{gname}={gval}")
+            if d_g is None:
+                truth(f"  {gname} run completes", False,
+                      (r_g.stderr or "")[-120:])
+                continue
+            xg = json.loads((d_g / "run.json").read_text())["metrics"]
+            truth(f"  {gname}={gval} changes the flight",
+                  abs(xg["overshoot_m"] - x0["overshoot_m"]) > 1e-4
+                  or abs(xg["hold_rms_err_m"] - x0["hold_rms_err_m"]) > 1e-5,
+                  f"overshoot {xg['overshoot_m']:.4f} vs "
+                  f"{x0['overshoot_m']:.4f}, RMS {xg['hold_rms_err_m']:.5f} "
+                  f"vs {x0['hold_rms_err_m']:.5f}")
+        # And the law must stay flyable with every term on at once.
+        d_all, _ = cascade_dir("hover_cascade_pid",
+                              "KI_V=5,KI_POS_V=0.2,KD_V=1,KD_POS_V=0.5")
+        if d_all is not None:
+            xa = json.loads((d_all / "run.json").read_text())["metrics"]
+            truth("  all four gains on at once still flies",
+                  not xa["timeouts"] and abs(xa["overshoot_m"]) < 0.5,
+                  f"overshoot {xa['overshoot_m']:+.4f} m, "
+                  f"timeouts {xa['timeouts']}")
+
+    # WHAT KI_V IS FOR, benched rather than flown: the sim has no thrust-bias
+    # knob, and this is the one claim that justifies the law existing.
+    # Holding altitude against a bias the controller is never told about, P
+    # alone needs a standing error of bias/(KP_V*KP_POS_V); the integral
+    # removes it.
+    import example_hover as _eh2
+
+    class _S:
+        def __init__(self, t, z, vz, mass=12.0):
+            self.t, self.mass = t, mass
+            self.pos = _np.array([0.0, 0.0, z])
+            self.vel = _np.array([0.0, 0.0, vz])
+            self.gravity = _np.array([0.0, 0.0, -1.62])
+        def weight_n(self):
+            return self.mass * 1.62
+
+    def _hold(ki_v, bias_n, n=20000, dtb=0.002):
+        _eh2.reset_state()
+        _eh2.set_gains(KI_V=ki_v, KI_POS_V=0.0, KD_V=0.0, KD_POS_V=0.0)
+        _eh2.set_target(2.0)
+        z, vz, m, gg = 2.0, 0.0, 12.0, 1.62
+        for i in range(n):
+            th = float(_eh2.hover_cascade_pid(_S(i * dtb, z, vz))["main"][0])
+            vz += (max(0.0, th + bias_n) / m - gg) * dtb
+            z += vz * dtb
+        return z
+
+    _kp_eq = _eh2.KP_V * _eh2.KP_POS_V
+    ok("P alone sits off by bias/(KP_V*KP_POS_V)", _hold(0.0, 2.0) - 2.0,
+       2.0 / _kp_eq, 1e-3, " m")
+    ok("  KI_V removes the offset entirely", _hold(5.0, 2.0) - 2.0,
+       0.0, 1e-3, " m")
+    ok("  and works on a negative bias too", _hold(5.0, -2.0) - 2.0,
+       0.0, 1e-3, " m")
+    _eh2.reset_state()
+
+    # Anti-windup on BOTH loops, since a cascade gives an integral two places
+    # to wind up. hover_pid's lesson: unguarded, the integral made that law
+    # five times worse than the PD it was meant to improve.
+    src_pid = _inspect_mod.getsource(_eh2.hover_cascade_pid)
+    truth("both integrals are clamped",
+          "I_LIMIT_V_MPS" in src_pid and "I_LIMIT_V_N" in src_pid)
+    truth("  and neither accumulates while its output is saturated",
+          src_pid.count("if not (") >= 2
+          and "V_MAX_MPS" in src_pid and "THRUST_CEILING_N" in src_pid)
+    # A big step is where windup shows. Guarded, it must stay sane.
+    d_step, _ = cascade_dir("hover_cascade_pid", "KI_V=5,KI_POS_V=1",
+                               target="12.0")
+    if d_step is not None:
+        xs2 = json.loads((d_step / "run.json").read_text())["metrics"]
+        truth("  a 12 m step with both integrals on does not blow up",
+              abs(xs2["overshoot_m"]) < 6.0,
+              f"overshoot {xs2['overshoot_m']:+.4f} m "
+              f"(unguarded hover_pid managed 15.2 m)")
 
     print("\n[7b] the two-rate cascade")
     # hover_cascade runs both loops in one call. hover_cascade_2rate runs

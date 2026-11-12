@@ -67,6 +67,8 @@ DT_NOMINAL_S = 0.002    # s, the integration step for the accumulator. Equal
 _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
                "KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF",
                "THRUST_CEILING_N", "OUTER_HZ",
+               "KI_POS_V", "KD_POS_V", "KI_V", "KD_V",
+               "I_LIMIT_V_MPS", "I_LIMIT_V_N", "D_LPF",
                "K_VALVE", "ACCEL_NOISE_SIGMA", "ACCEL_LPF", "GROUND_FREEZE",
                "GROUND_VZ_MPS",
                "DT_NOMINAL_S", "KP_POS", "KD_POS", "KP_TILT", "KD_TILT",
@@ -79,6 +81,48 @@ _GAIN_NAMES = ("KP_ALT", "KD_ALT", "KI_ALT", "I_LIMIT_N", "ANTI_WINDUP",
 # "could not convert string to float: 'False'" - the gain existed, was
 # documented and was settable in name only.
 _BOOL_GAINS = ("ANTI_WINDUP", "GROUND_FREEZE")
+
+# --- FULL PID CASCADE (hover_cascade_pid) --------------------------------
+# hover_cascade is P on position and P on rate. These add I and D to BOTH
+# loops, so each is a full PID. Every one defaults to 0.0 except the filter,
+# which means *** hover_cascade_pid REDUCES TO hover_cascade AT THE DEFAULTS
+# *** - the selftest asserts that byte-for-byte. Turning a gain on is then
+# an explicit act whose effect can be measured against that baseline.
+KI_POS_V = 0.0          # (m/s) per (m*s). Integrates POSITION error into the
+                        #   rate command. The cascade already tracks a ramp
+                        #   with no standing error (the sp_rate feedforward
+                        #   does that), so this is for a steady POSITION
+                        #   offset the feedforward cannot see - a persistent
+                        #   disturbance rather than a reference it is
+                        #   following.
+KD_POS_V = 0.0          # (m/s) per (m/s). Derivative on position error.
+                        #   NOTE this is nearly redundant: d/dt(sp - z) is
+                        #   -vz when the setpoint is constant, and the inner
+                        #   loop already closes on vz through KP_V. It is
+                        #   here for completeness and because it is NOT
+                        #   identical during a ramp, when d/dt(sp) != 0.
+KI_V = 0.0              # N per (m/s * s). Integrates RATE error into thrust.
+                        #   This is the useful one for hardware: it rejects a
+                        #   steady THRUST bias - a mis-estimated mass, a
+                        #   thrust offset, a stuck trim - which no amount of
+                        #   proportional gain removes, because holding a
+                        #   constant rate against a bias needs a standing
+                        #   rate error of bias/KP_V.
+KD_V = 0.0              # N per (m/s^2). Derivative on rate error, i.e. on
+                        #   ACCELERATION. Differencing a differenced signal,
+                        #   so it is the noisiest term here by far and the
+                        #   one most likely to be left at zero on real
+                        #   hardware. D_LPF exists because of it.
+I_LIMIT_V_MPS = 0.3     # m/s, cap on the OUTER integral's contribution.
+                        #   Anti-windup, same lesson hover_pid teaches: an
+                        #   unguarded integral made that law five times
+                        #   WORSE than the PD it was meant to improve.
+I_LIMIT_V_N = 20.0      # N, cap on the INNER integral's contribution.
+D_LPF = 0.1             # 0..1 smoothing on both derivative terms; 1.0 = no
+                        #   filter. Needed because KD_V differentiates a
+                        #   velocity that is itself differenced from
+                        #   position by the physics - see ACCEL_LPF for the
+                        #   same argument in the thrust tracker.
 
 OUTER_HZ = 25.0         # Hz, how often hover_cascade_2rate updates its
                         #   OUTER (position) loop. The inner rate loop runs
@@ -141,6 +185,12 @@ _vz_prev = None         # previous vertical speed, for differencing a_meas
 _grounded_hint = None   # what the DRIVER knows about contact, if anything.
                         #   None means "nobody told me", and the tracker then
                         #   falls back to inferring it from the measurement.
+_i_pos = 0.0            # outer integral: accumulated POSITION error, m*s
+_i_vel = 0.0            # inner integral: accumulated RATE error, (m/s)*s
+_d_pos = 0.0            # filtered d/dt of the position error, m/s
+_d_vel = 0.0            # filtered d/dt of the rate error, m/s^2
+_e_pos_prev = None      # previous position error, for differencing
+_e_vel_prev = None      # previous rate error, for differencing
 _outer_t = None         # when the outer loop last ran (hover_cascade_2rate)
 _v_cmd_held = 0.0       # the outer loop's output, HELD between its updates
 
@@ -213,7 +263,8 @@ def reset_state():
     """
     global _integral, _sp_prev, _sp_rate, _t_prev, _outer_t, _v_cmd_held
     global _valve_t_prev, _valve_u, _a_meas, _vz_prev, _f_demand, _f_meas
-    global _grounded_hint
+    global _grounded_hint, _i_pos, _i_vel, _d_pos, _d_vel
+    global _e_pos_prev, _e_vel_prev
     _integral = 0.0
     _sp_prev = None
     _sp_rate = 0.0
@@ -222,6 +273,12 @@ def reset_state():
     _v_cmd_held = 0.0
     _valve_t_prev = None
     _valve_u = 0.0
+    _i_pos = 0.0
+    _i_vel = 0.0
+    _d_pos = 0.0
+    _d_vel = 0.0
+    _e_pos_prev = None
+    _e_vel_prev = None
     _f_demand = 0.0
     _f_meas = 0.0
     _a_meas = 0.0
@@ -612,6 +669,101 @@ def _cascade_demand(state):
 
     # INNER LOOP: what thrust holds that rate?
     return state.weight_n() + KP_V * (v_cmd - state.vel[2])
+
+
+def hover_cascade_pid(state):
+    """hover_cascade with a FULL PID in each loop instead of P in each.
+
+        OUTER   v_cmd  = sp_rate + KP_POS_V*e_z  + KI_POS_V*Ie_z  + KD_POS_V*De_z
+        INNER   thrust = m*g     + KP_V*e_v      + KI_V*Ie_v      + KD_V*De_v
+
+    where e_z = sp - z and e_v = v_cmd - vz. Same architecture as
+    hover_cascade - position commands a rate, rate commands thrust, the rate
+    command clamped by V_MAX_MPS - with two more terms per loop.
+
+    *** AT THE DEFAULTS THIS IS hover_cascade, EXACTLY. *** All four new
+    gains default to 0.0, and the selftest asserts the CSV is byte-identical
+    to hover_cascade's. That is deliberate: it makes this law a strict
+    superset, so any difference you measure is attributable to the gain you
+    turned on rather than to having switched laws.
+
+    WHAT EACH TERM IS ACTUALLY FOR, which is not symmetric:
+
+      KI_V   (inner integral)  THE USEFUL ONE. It rejects a steady THRUST
+            bias - a mis-estimated mass, a thrust offset, a stuck trim.
+            Proportional gain cannot: holding a constant rate against a
+            bias b needs a standing rate error of b/KP_V, forever. This is
+            the term to reach for on real hardware, where the vehicle never
+            weighs exactly what the controller thinks.
+      KI_POS_V (outer integral)  For a steady POSITION offset. Note the
+            cascade already tracks a RAMP with no standing error - the
+            sp_rate feedforward does that - so this is not what removes
+            descent lag, and adding it expecting that is a misreading of
+            why the cascade wins.
+      KD_V   (inner derivative)  Acts on ACCELERATION, since e_v is a
+            velocity error. Differencing a differenced signal: the noisiest
+            term here by a wide margin, hence D_LPF.
+      KD_POS_V (outer derivative)  NEARLY REDUNDANT, and worth saying so.
+            d/dt(sp - z) = -vz when the setpoint is constant, and the inner
+            loop already closes on vz through KP_V. It differs only while
+            the setpoint is moving, when d/dt(sp) != 0.
+
+    ANTI-WINDUP, on both loops, because hover_pid's lesson applies twice
+    over. Each integral's CONTRIBUTION is clamped (I_LIMIT_V_MPS,
+    I_LIMIT_V_N) and neither accumulates while its own output is saturated -
+    the outer against V_MAX_MPS, the inner against the thrust ceiling. An
+    unguarded integral turned hover_pid into a law five times worse than the
+    PD it was meant to improve; a cascade gives it two places to do that.
+    """
+    global _i_pos, _i_vel, _d_pos, _d_vel, _e_pos_prev, _e_vel_prev
+    global _sp_prev, _sp_rate
+
+    # One clock for both loops, measured not assumed - see _tick_dt. Taken
+    # unconditionally, before any anti-windup branch: timing it inside the
+    # branch would make the first tick after a saturated stretch measure the
+    # whole stretch and dump it into the integral at once.
+    dt = _tick_dt(state.t)
+    sp = _target_alt
+
+    # Setpoint rate feedforward, identical to hover_cascade's. This is what
+    # tracks a ramp without a standing error, and it is NOT the integral.
+    if _sp_prev is None:
+        _sp_prev = sp
+    raw_rate = max(-V_MAX_MPS, min(V_MAX_MPS, (sp - _sp_prev) / dt))
+    _sp_rate += SP_RATE_LPF * (raw_rate - _sp_rate)
+    _sp_prev = sp
+
+    # --- OUTER LOOP: position -> rate command ----------------------------
+    e_pos = sp - state.pos[2]
+    if _e_pos_prev is None:
+        _e_pos_prev = e_pos
+    _d_pos += D_LPF * ((e_pos - _e_pos_prev) / dt - _d_pos)
+    _e_pos_prev = e_pos
+
+    i_pos_term = max(-I_LIMIT_V_MPS, min(I_LIMIT_V_MPS, KI_POS_V * _i_pos))
+    v_raw = (_sp_rate + KP_POS_V * e_pos + i_pos_term + KD_POS_V * _d_pos)
+    v_cmd = max(-V_MAX_MPS, min(V_MAX_MPS, v_raw))
+    # Accumulate only if the rate command is not pinned at its clamp: the
+    # clamp is the outer loop's actuator, and integrating against a pinned
+    # actuator is exactly the windup hover_pid taught.
+    if not (abs(v_raw) > V_MAX_MPS and v_raw * e_pos > 0.0):
+        _i_pos += e_pos * dt
+
+    # --- INNER LOOP: rate -> thrust --------------------------------------
+    e_vel = v_cmd - state.vel[2]
+    if _e_vel_prev is None:
+        _e_vel_prev = e_vel
+    _d_vel += D_LPF * ((e_vel - _e_vel_prev) / dt - _d_vel)
+    _e_vel_prev = e_vel
+
+    i_vel_term = max(-I_LIMIT_V_N, min(I_LIMIT_V_N, KI_V * _i_vel))
+    thrust = (state.weight_n() + KP_V * e_vel + i_vel_term + KD_V * _d_vel)
+    # Same guard against the thrust ceiling. THRUST_CEILING_N is a
+    # configured stand-in because a law cannot see the actuator's ctrlrange.
+    if not (thrust < 0.0 or thrust > THRUST_CEILING_N):
+        _i_vel += e_vel * dt
+
+    return {"main": (thrust, np.array([0.0, 0.0, 1.0]))}
 
 
 def hover_cascade_2rate(state):

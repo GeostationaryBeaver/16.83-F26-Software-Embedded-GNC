@@ -134,7 +134,7 @@ uv add "mujoco>=3.16,<4" "trimesh>=4.0" "imageio[ffmpeg]>=2.33" "scipy>=1.11"
 │   ├── import_mesh.py           STL/OBJ -> MJCF, with sanity checks
 │   ├── thrusters.py             Thruster / ThrusterSet / CraftState  (§10)
 │   ├── fly.py                   run a scene under closed-loop control (§10)
-│   ├── example_hover.py         eight control laws + gain plumbing (§14)
+│   ├── example_hover.py         nine control laws + gain plumbing (§14)
 │   ├── scenario.py              one fixed profile, any controller (§11)
 │   ├── propellant.py            variable mass as propellant burns (§12)
 │   ├── valve.py                 an unknown thrust curve, as a plant (§15)
@@ -1122,7 +1122,7 @@ to a timestamped directory, so two runs can be put side by side.
 ```bash
 uv run python scripts/scenario.py --controller example_hover:hover
 uv run python scripts/scenario.py --controller example_hover:hover --target 3.5
-uv run python scripts/scenario.py --selftest        # 185 numeric checks
+uv run python scripts/scenario.py --selftest        # 198 numeric checks
 ```
 
 ### The profile
@@ -1447,7 +1447,7 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 ```bash
 uv run python scripts/gui.py            # the control panel
 uv run python scripts/gui.py --demo     # bigger fonts, less clutter
-uv run python scripts/gui.py --selftest # 109 headless checks
+uv run python scripts/gui.py --selftest # 119 headless checks
 ```
 
 Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
@@ -1627,7 +1627,7 @@ at 640×480 and 23.8 at 1280×720, which is fine for these scenes.
 
 ## 14. Control laws and gains
 
-Eight laws in `scripts/example_hover.py`. The three that command thrust
+Nine laws in `scripts/example_hover.py`. The three that command thrust
 directly are the interesting comparison; `hover_valve` and
 `hover_cascade_valve` command a valve instead and get their own section
 (§15):
@@ -1877,6 +1877,87 @@ completes the profile and lands, with 0.449 m of overshoot. The degenerate case
 
 So: **feasible, already implemented, and worth having** — mainly because it
 turns the rate ratio into something you can sweep.
+
+### A full PID in each loop
+
+`hover_cascade` is **P on position, P on rate** — no integral and no
+derivative anywhere. (It *behaves* like a PD: expand the nesting and
+`thrust = w + 9·(sp−z) − 15·vz + 15·sp_rate`, so `KP_V` is the damping gain.
+And it kills descent lag with the `sp_rate` **feedforward**, not an
+integrator.) `hover_cascade_pid` adds the missing terms, same architecture:
+
+```
+  OUTER   v_cmd  = sp_rate + KP_POS_V·e_z + KI_POS_V·∫e_z + KD_POS_V·ė_z
+  INNER   thrust = m·g     + KP_V·e_v     + KI_V·∫e_v     + KD_V·ė_v
+```
+
+**All four new gains default to 0, so at the defaults this law IS
+`hover_cascade`** — asserted byte-for-byte on the flight CSV, not just on
+metrics. That makes it a strict superset: any difference you measure is
+attributable to the gain you turned on, not to having switched laws.
+
+Measured on the standard 2 m profile, one gain at a time:
+
+| gains | overshoot | hold RMS | descent lag | note |
+|---|---|---|---|---|
+| none (= `hover_cascade`) | 0.0518 m | 0.03175 m | −0.00731 m | the baseline |
+| `KI_V=1` | 0.0652 m | 0.01835 m | +0.00154 m | |
+| `KI_V=20` | **0.0052 m** | 0.01433 m | +0.00216 m | best of the set |
+| `KI_POS_V=1` | 0.4709 m | 0.31716 m | +0.01208 m | **ASCEND timed out** |
+| `KD_V=2` | 0.0537 m | 0.03435 m | −0.00746 m | barely moves |
+| `KD_POS_V=1` | 0.0000 m | 0.02640 m | −0.00682 m | see below |
+
+**The four terms are not equally useful, and the asymmetry is the point.**
+
+**`KI_V` (inner integral) is the one that earns its place.** It rejects a
+steady *thrust* bias — a mis-estimated mass, a thrust offset, a stuck trim —
+which no proportional gain can, because balancing a bias `b` needs a standing
+error forever. Benched against a bias the controller is never told about:
+
+| bias | `KI_V` | final altitude | offset |
+|---|---|---|---|
+| +2 N | 0 | 2.2222 m | **+0.2222 m** |
+| +2 N | 5 | 2.0000 m | **0.0000 m** |
+| −2 N | 0 | 1.7778 m | −0.2222 m |
+| −2 N | 5 | 2.0000 m | 0.0000 m |
+
+The predicted offset is `b/(KP_V·KP_POS_V) = 2/9 = 0.2222 m`, matched to four
+decimals. As a rate-hold question it is the same story: commanding 0.2 m/s
+against a 2 N bias, `KI_V=0` holds 0.3333 m/s (error `b/KP_V = 0.1333`
+exactly) and `KI_V=5` holds 0.2000. **This is the term to reach for on real
+hardware**, where the vehicle never weighs exactly what the controller thinks.
+
+**`KI_POS_V` (outer integral) is the dangerous one.** On the table above it
+made the flight ten times worse and timed out the ASCEND phase. It is for a
+steady *position* offset — and note the cascade already tracks a ramp with no
+standing error, so reaching for this to fix descent lag is a misreading of why
+the cascade wins.
+
+**`KD_V` (inner derivative) acts on acceleration**, since `e_v` is a velocity
+error. It differences an already-differenced signal, making it the noisiest
+term by a wide margin — which is why `D_LPF` (default 0.1) exists.
+
+**`KD_POS_V` (outer derivative) is nearly redundant**, and worth saying so:
+`d/dt(sp − z) = −vz` when the setpoint is constant, and the inner loop already
+closes on `vz` through `KP_V`. It differs only while the setpoint moves. Its
+0.0000 m overshoot in the table is not a win — it damps so hard that ASCEND
+takes 5297 ticks instead of ~1800 and the craft creeps up to 1.9913 m from
+below, never reaching the target. Overshoot is zero because it never arrives.
+
+**Anti-windup on both loops**, because a cascade gives an integral two places
+to wind up. Each integral's *contribution* is clamped (`I_LIMIT_V_MPS` = 0.3,
+`I_LIMIT_V_N` = 20) and neither accumulates while its own output is saturated —
+the outer against `V_MAX_MPS`, the inner against the thrust ceiling. Measured
+on a 12 m step with both integrals on: **0.52 m overshoot**, against the 15.2 m
+an unguarded `hover_pid` managed on the same step.
+
+```bash
+uv run python scripts/scenario.py --controller example_hover:hover_cascade_pid \
+    --scene scenes/07_thrust_1D.xml --target 2.0 --gains "KI_V=5"
+```
+
+In the GUI the four gains sit in their own **full-PID cascade (0 = plain
+cascade)** group, enabled only for this law.
 
 ### One gain a law cannot discover
 

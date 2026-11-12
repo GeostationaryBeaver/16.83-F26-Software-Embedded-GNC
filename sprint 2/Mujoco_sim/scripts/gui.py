@@ -60,6 +60,11 @@ GAIN_GROUPS = (
     ("cascade  (+2rate, +valve)",
      ("KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF")),
     ("2-rate only",               ("OUTER_HZ",)),
+    # hover_cascade_pid only. All four default to 0, which is why that law
+    # reduces exactly to hover_cascade - so a box left blank here gives the
+    # plain cascade and anything typed in is a deliberate addition.
+    ("full-PID cascade  (0 = plain cascade)",
+     ("KI_POS_V", "KD_POS_V", "KI_V", "KD_V")),
     ("thrust tracker  (both valve laws)", ("K_VALVE", "GROUND_VZ_MPS")),
 )
 GAIN_FIELDS = tuple(n for _, names in GAIN_GROUPS for n in names)
@@ -1732,6 +1737,35 @@ def run_selftest() -> int:
     truth("LineReader catches BlockingIOError only",
           "except BlockingIOError:" in lsrc
           and "except Exception:\n            pass" not in lsrc)
+
+    print("\n[2g] the full-PID cascade's gains")
+    truth("hover_cascade_pid is in the dropdown",
+          "hover_cascade_pid" in find_controllers())
+    gp = gains_used_by("hover_cascade_pid")
+    truth("  it reads all four new gains",
+          {"KI_POS_V", "KD_POS_V", "KI_V", "KD_V"} <= gp,
+          ", ".join(sorted(gp & {"KI_POS_V", "KD_POS_V", "KI_V", "KD_V"})))
+    truth("  and the plain cascade's too",
+          {"KP_POS_V", "KP_V", "V_MAX_MPS", "SP_RATE_LPF"} <= gp)
+    truth("  but not the single-loop PD's",
+          not ({"KP_ALT", "KD_ALT", "KI_ALT"} & gp),
+          ", ".join(sorted(gp & {"KP_ALT", "KD_ALT", "KI_ALT"})) or "none")
+    # The plain cascade must NOT offer them, or the boxes would imply it
+    # reads gains it cannot see.
+    gc = gains_used_by("hover_cascade")
+    truth("  the plain cascade does not read them",
+          not ({"KI_POS_V", "KD_POS_V", "KI_V", "KD_V"} & gc))
+    # Every one needs a widget, or the GUI cannot set what the law reads.
+    for g in ("KI_POS_V", "KD_POS_V", "KI_V", "KD_V"):
+        truth(f"  {g} has a gain box", g in GAIN_FIELDS)
+    # The defaults are what make the law a strict superset: a blank box has
+    # to mean "plain cascade", which is only true if the module default is 0.
+    import example_hover as _ehg
+    truth("  all four default to zero, so a blank box is the plain cascade",
+          all(getattr(_ehg, g) == 0.0
+              for g in ("KI_POS_V", "KD_POS_V", "KI_V", "KD_V")),
+          ", ".join(f"{g}={getattr(_ehg, g):g}"
+                    for g in ("KI_POS_V", "KD_POS_V", "KI_V", "KD_V")))
 
     print("\n[2f] the profile box: every segment commandable")
     pbase = {**base, "ascent_rate": "0.5", "ground_sit": "1.0",

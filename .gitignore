@@ -41,3 +41,6 @@ env/
 *.tmp
 *.bak
 *Zone.Identifier
+
+# Claude Code local settings (contains API key)
+.claude/settings.local.json

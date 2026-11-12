@@ -1,6 +1,5 @@
-// Relays packets between the hopper (ESP-NOW) and the dashboard (USB), unchanged except
-// for one thing: while the E-stop switch is open, every command goes out with estop = 1,
-// arm = 0 and valve_pct = 0, whatever the dashboard sent. The lights follow the hopper's
+// Relays packets between the hopper (ESP-NOW) and the dashboard (USB), unchanged. The
+// E-stop is digital only: the dashboard sets cmd_t.estop. The lights follow the hopper's
 // telemetry.
 #pragma once
 

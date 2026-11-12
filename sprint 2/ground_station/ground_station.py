@@ -28,27 +28,44 @@ import pyqtgraph as pg
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-                               QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
+                               QDoubleSpinBox, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                               QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 import link as linkmod
 import style as S
-from protocol import (CAL_CLEAR, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO, FLAG_DUAL_I2C, HEALTH,
-                      REASONS, STATES, board_mac)
+from protocol import (ABORTS, CAL_CLEAR, CAL_LASER, CAL_NONE, CAL_SPAN, CAL_ZERO, CTRL_MANUAL,
+                      CTRL_MODES, DEFAULT_PROFILE, FLAG_DUAL_I2C, FLAG_POWER_CAUSE_MASK,
+                      FLAG_POWER_CAUSE_SHIFT, FLAG_POWER_LATCH, FLAG_POWER_TRIP, FLAG_SERVO_OFF,
+                      GAIN_LIMITS, GAINS_DEFAULTS, POWER_CAUSES,
+                      GAINS_RESULTS, GAINS_SET, HEALTH, HOP_MM, HOVER_MS, PHASE_IDLE, PHASES, REASONS,
+                      STATES, V_DOWN_MMS, V_UP_MMS, Gains, board_mac)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = SCRIPT_DIR / "recordings"
 
 WINDOW_S = 10.0       # plot history
 UI_PERIOD_MS = 33     # ~30 Hz redraw
+HISTORY_CAP = 8192    # samples kept per channel (41 s at 200 Hz); must hold WINDOW_S twice over
+LOG_MAX = 300         # event log rows kept
 LIVE_AGE_S = 0.5      # telemetry older than this = "No telemetry"
 SIDE_WIDTH = 360
+# Gains panel: (group, [(key, label, decimals, step), ...]). Two per row.
+GAIN_GROUPS = [
+    ("Both controllers", [("hover_pct", "Hover %", 1, 1.0)]),
+    ("PD position", [("pd_kp", "Kp", 3, 1.0), ("pd_kd", "Kd", 3, 1.0)]),
+    ("Cascade · position → v_z", [("pos_kp", "Kp", 3, 0.1), ("pos_ki", "Ki", 3, 0.1),
+                                  ("pos_kd", "Kd", 3, 0.1), ("vz_max", "v max", 2, 0.05)]),
+    ("Cascade · v_z → valve", [("vel_kp", "Kp", 3, 1.0), ("vel_ki", "Ki", 3, 1.0),
+                               ("vel_kd", "Kd", 3, 0.5), ("vel_i_max", "I max", 1, 1.0)]),
+]
 TX_POWERS = [("Full power", 0), ("20 dBm", 20), ("15 dBm", 15), ("10 dBm", 10), ("5 dBm", 5), ("2 dBm", 2)]
 
 RAD2DEG = 180 / math.pi
 # Anything here can be picked in a plot. (name, unit, getter, decimals)
 CHANNELS = [
     ("Altitude z", "m", lambda t: t.z, 3),
+    ("Setpoint z", "m", lambda t: t.z_sp, 3),
+    ("Setpoint v_z", "m/s", lambda t: t.vz_sp, 3),
     ("Velocity v_z", "m/s", lambda t: t.vz, 3),
     ("Accel bias", "m/s²", lambda t: t.accel_bias, 3),
     ("Laser z", "m", lambda t: t.laser_z, 3),
@@ -68,12 +85,14 @@ CHANNELS = [
     ("Round trip", "ms", lambda t: t.rtt_ms, 1),
     ("I2C errors", "", lambda t: t.i2c_errors, 0),
 ]
-DEFAULT_PLOTS = ["Altitude z", "Laser z", "Pressure", "Accel z"]
+DEFAULT_PLOTS = ["Altitude z", "Setpoint z", "Pressure", "Accel z"]
 
 CSV_HEAD = ["host_ms", "seq", "time_ms", "state", "reason", "valve_pct", "health", "flags",
             "z_m", "vz_ms", "accel_bias", "laser_z_m", "ax", "ay", "az", "gx_rads", "gy_rads", "gz_rads",
             "temp_c", "pt_ma", "psi", "servo_v", "failsafes", "cmd_seq", "rtt_ms", "max_gap_ms", "rssi",
-            "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors"]
+            "tx_power", "laser_offset_m", "pt_zero_ma", "pt_span", "cal_ack", "i2c_errors",
+            "ctrl_mode", "phase", "abort_reason", "z_sp_m", "vz_sp_ms", "hop_mm", "v_up_mms",
+            "v_down_mms", "hover_ms"]
 
 
 def fmt(x, d):
@@ -88,48 +107,69 @@ def reason_name(r):
     return REASONS[r] if r < len(REASONS) else str(r)
 
 
+def phase_name(p):
+    return PHASES[p] if p < len(PHASES) else str(p)
+
+
+def abort_name(a):
+    return ABORTS[a] if a < len(ABORTS) else str(a)
+
+
+def ctrl_name(m):
+    return CTRL_MODES[m] if m < len(CTRL_MODES) else str(m)
+
+
+class History:
+    """Recent telemetry as numpy arrays: one time column and a column per CHANNELS entry.
+
+    Telemetry comes at 200 Hz, so a plot shows ~2000 points; keeping them in arrays means
+    a redraw is a slice, not a conversion of 2000 Python tuples."""
+
+    def __init__(self, channels, cap=HISTORY_CAP):
+        self.t = np.empty(cap)
+        self.v = np.empty((cap, channels))
+        self.n = 0
+
+    def clear(self):
+        self.n = 0
+
+    def append(self, t_ms, values):
+        if self.n == len(self.t):  # full: keep the newer half (amortised, no per-sample shift)
+            keep = len(self.t) // 2
+            self.t[:keep] = self.t[-keep:]
+            self.v[:keep] = self.v[-keep:]
+            self.n = keep
+        self.t[self.n] = t_ms
+        self.v[self.n] = values
+        self.n += 1
+
+    def window(self, k, t_end_ms):
+        """(times, values) of channel k over the last WINDOW_S, times in ms."""
+        t = self.t[:self.n]
+        start = np.searchsorted(t, t_end_ms - WINDOW_S * 1000)
+        return t[start:], self.v[start:self.n, k]
+
+
+def set_text(widget, text):
+    """setText only on a change: re-laying out a label 30 times a second adds up."""
+    if widget.text() != text:
+        widget.setText(text)
+
+
+def set_style(widget, css):
+    """setStyleSheet only on a change: each call re-polishes the widget."""
+    if widget.styleSheet() != css:
+        widget.setStyleSheet(css)
+
+
 def csv_row(t):
     vals = [int(time.time() * 1000), t.seq, t.time_ms, t.state, t.reason, t.valve_pct, t.health, t.flags,
             t.z, t.vz, t.accel_bias, t.laser_z, *t.accel, *t.gyro, t.temp_c, t.pt_ma, t.psi, t.servo_v,
             t.failsafes, t.cmd_seq, t.rtt_ms, t.max_gap_ms, t.rssi, t.tx_power, t.laser_offset_m,
-            t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors]
+            t.pt_zero_ma, t.pt_span, t.cal_ack, t.i2c_errors,
+            t.ctrl_mode, t.phase, t.abort_reason, t.z_sp, t.vz_sp, t.hop_mm, t.v_up_mms,
+            t.v_down_mms, t.hover_ms]
     return ["" if isinstance(v, float) and math.isnan(v) else v for v in vals]
-
-
-# Every telemetry field, grouped. (label, getter) or (group title, None)
-def readout_rows(win):
-    return [
-        ("Altitude filter", None),
-        ("z", lambda t: fmt(t.z, 3) + " m"),
-        ("v_z", lambda t: fmt(t.vz, 3) + " m/s"),
-        ("accel bias", lambda t: fmt(t.accel_bias, 3) + " m/s²"),
-        ("laser z", lambda t: fmt(t.laser_z, 3) + " m"),
-        ("IMU", None),
-        ("accel", lambda t: "  ".join(fmt(x, 2) for x in t.accel) + " m/s²"),
-        ("gyro", lambda t: "  ".join(fmt(x * RAD2DEG, 1) for x in t.gyro) + " °/s"),
-        ("Valve + feed", None),
-        ("state", lambda t: f"{state_name(t.state)} · last FAILSAFE {reason_name(t.reason)}"),
-        ("valve", lambda t: f"{t.valve_pct} %"),
-        ("pressure", lambda t: fmt(t.psi, 1) + " psi"),
-        ("PT loop", lambda t: fmt(t.pt_ma, 3) + " mA"),
-        ("inlet temp", lambda t: fmt(t.temp_c, 2) + " °C"),
-        ("servo rail", lambda t: fmt(t.servo_v, 2) + " V"),
-        ("failsafes", lambda t: str(t.failsafes)),
-        ("Link", None),
-        ("cmd seq", lambda t: f"{t.cmd_seq} (sent {win.link.cmd_seq if win.link else 0})"),
-        ("round trip", lambda t: fmt(t.rtt_ms, 1) + " ms"),
-        ("worst gap", lambda t: f"{t.max_gap_ms} ms / 2 s"),
-        ("signal", lambda t: f"{t.rssi} dBm" if t.rssi else "—"),
-        ("tx power", lambda t: f"{t.tx_power} dBm" if t.tx_power else "full"),
-        ("Calibration", None),
-        ("PT zero", lambda t: fmt(t.pt_zero_ma, 3) + " mA"),
-        ("PT span", lambda t: fmt(t.pt_span, 4)),
-        ("laser offset", lambda t: fmt(t.laser_offset_m * 1000, 0) + " mm"),
-        ("cal ack", lambda t: f"{t.cal_ack} (sent {win.link.command().cal_seq if win.link else 0})"),
-        ("Diagnostics", None),
-        ("I2C", lambda t: "dual controllers" if t.flags & FLAG_DUAL_I2C else "shared controller"),
-        ("I2C errors", lambda t: str(t.i2c_errors)),
-    ]
 
 
 # ---- small widget helpers ----
@@ -209,7 +249,16 @@ class Plot(QFrame):
         for s in range(0, 11, 2):
             self.plot.addItem(pg.InfiniteLine(-s, angle=90, pen=pg.mkPen(S.GRID)), ignoreBounds=True)
         self.plot.setXRange(-WINDOW_S, 0, padding=0)
-        self.curve = self.plot.plot(pen=pg.mkPen(S.INK, width=1.25), connect="finite")
+        # Width 1, not 1.25: a 1 px pen takes Qt's hairline path, ~10x faster to antialias.
+        # Stroking every point of a noisy 200 Hz trace with a wider pen is what made the
+        # window lag (and starved the link threads of the GIL while it drew).
+        self.curve = self.plot.plot(pen=pg.mkPen(S.INK, width=1), connect="finite",
+                                    autoDownsampleFactor=1.0)
+        # ~2000 points across a few hundred pixels: draw each pixel's min and max instead
+        # (same picture, spikes kept)
+        self.curve.setDownsampling(auto=True, method="peak")
+        self.curve.setClipToView(True)
+        self._shown = None
 
         head = QHBoxLayout()
         head.setContentsMargins(16, 12, 16, 4)
@@ -227,6 +276,9 @@ class Plot(QFrame):
         return CHANNELS[self.channel.currentIndex()][1]
 
     def set_value(self, text, unit):
+        if (text, unit) == self._shown:
+            return
+        self._shown = (text, unit)
         families = ", ".join(f"'{f}'" for f in S.MONO_LIGHT)
         unit_html = (f"<span style='font-size:13px; font-weight:400; color:{S.DIM}'>&nbsp;{html.escape(unit)}</span>"
                      if unit else "")
@@ -246,8 +298,12 @@ class GroundStation(QMainWindow):
         self.lost = 0
         self.last_seq = None
         self.cal_synced = False
-        self.series = [deque() for _ in CHANNELS]  # (time_ms, value)
+        self.hopper_gains = None  # Gains the hopper last reported in use, None = no report yet
+        self.gains_pending_shown = False
+        self.history = History(len(CHANNELS))
+        self.overflow = 0      # link.overflow already reported
         self.recording = None  # [file, csv writer, path, rows]
+        self.go_sent = 0.0     # time.monotonic() of the last GO, to spot a refused one
         self.ground_mac = board_mac("GROUND_MAC")
         self.hopper_mac = board_mac("HOPPER_MAC")
 
@@ -404,10 +460,83 @@ class GroundStation(QMainWindow):
         self.txpow.currentIndexChanged.connect(self.set_tx_power)
         row.addWidget(self.txpow, 1)
         body.addLayout(row)
+        lay.addWidget(sec)
+
+        sec, body = self._section("Hop")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        k = caps("Control")
+        k.setFixedWidth(64)
+        row.addWidget(k)
+        self.ctrl_box = QComboBox()
+        for i, name in enumerate(CTRL_MODES):
+            self.ctrl_box.addItem(name, i)
+        self.ctrl_box.currentIndexChanged.connect(self.set_ctrl_mode)
+        row.addWidget(self.ctrl_box, 1)
+        body.addLayout(row)
+        self.profile = {}
+        for key, name, unit, (lo, hi), step in [("z_sp_mm", "Height", "mm", HOP_MM, 50),
+                                                ("v_up_mms", "Climb", "mm/s", V_UP_MMS, 25),
+                                                ("v_down_mms", "Descent", "mm/s", V_DOWN_MMS, 25),
+                                                ("hover_ms", "Hover", "ms", HOVER_MS, 500)]:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            k = caps(name)
+            k.setFixedWidth(64)
+            row.addWidget(k)
+            box = QSpinBox(minimum=lo, maximum=hi, singleStep=step, value=DEFAULT_PROFILE[key])
+            box.lineEdit().setTextMargins(8, 0, 0, 0)
+            box.valueChanged.connect(self.set_profile)
+            row.addWidget(box, 1)
+            u = caps(unit)
+            u.setFixedWidth(40)
+            row.addWidget(u)
+            body.addLayout(row)
+            self.profile[key] = box
         body.addSpacing(2)
-        body.addWidget(hint("Commands go out 50 times a second from their own thread. None for 150 ms "
-                            "(or E-stop) puts the hopper in FAILSAFE: valve shut until you disarm and "
-                            "arm again. Esc = E-stop."))
+        self.go_btn = button("Go", "primary", big=True)
+        self.go_btn.clicked.connect(self.toggle_go)
+        body.addWidget(self.go_btn)
+        lay.addWidget(sec)
+
+        self.gains_status = QLabel()
+        self.gains_status.setFont(S.label_font())
+        sec, body = self._section("Gains", self.gains_status)
+        self.gain_boxes = {}
+        for group, gains in GAIN_GROUPS:
+            body.addWidget(caps(group, "hint"))
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(6)
+            for i, (key, name, decimals, step) in enumerate(gains):
+                k = caps(name)
+                k.setFixedWidth(44)
+                lo, hi = GAIN_LIMITS[key]
+                box = QDoubleSpinBox(minimum=lo, maximum=hi, decimals=decimals, singleStep=step)
+                box.lineEdit().setTextMargins(8, 0, 0, 0)
+                box.setMinimumWidth(64)  # its own hint fits "1000.000" and overflows the panel
+                box.setKeyboardTracking(False)
+                box.valueChanged.connect(self.update_gains_controls)
+                grid.addWidget(k, i // 2, (i % 2) * 2)
+                grid.addWidget(box, i // 2, (i % 2) * 2 + 1)
+                self.gain_boxes[key] = box
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(3, 1)
+            body.addLayout(grid)
+        body.addSpacing(2)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.gains_apply = button("Apply", "primary")
+        self.gains_apply.clicked.connect(lambda: self.send_gains(GAINS_SET))
+        self.gains_revert = button("Revert")
+        self.gains_revert.clicked.connect(self.revert_gains)
+        self.gains_defaults = button("Defaults")
+        self.gains_defaults.clicked.connect(lambda: self.send_gains(GAINS_DEFAULTS))
+        for b in (self.gains_apply, self.gains_revert, self.gains_defaults):
+            row.addWidget(b, 1)
+        body.addLayout(row)
+        body.addWidget(hint("Taken only while disarmed, and kept in the hopper's flash. "
+                            "Orange = edited, not yet on the hopper."))
         lay.addWidget(sec)
 
         self.cal_status = QLabel()
@@ -441,10 +570,6 @@ class GroundStation(QMainWindow):
                 extra.setFixedWidth(104)
                 row.addWidget(extra)
             body.addLayout(row)
-        body.addSpacing(2)
-        body.addWidget(hint("Saved in the hopper's flash. A refused calibration (no reading, transmitter "
-                            "off) is acknowledged but changes nothing: the reason is on the hopper's "
-                            "serial monitor."))
         lay.addWidget(sec)
 
         sec, body = self._section("Health")
@@ -463,27 +588,6 @@ class GroundStation(QMainWindow):
         for _, name, chip in self.chips:
             self._chip(chip, name, None)
         self._chip(self.i2c_chip, "I2C", None)
-        lay.addWidget(sec)
-
-        sec, body = self._section("Telemetry")
-        grid = QGridLayout()
-        grid.setSpacing(0)
-        grid.setColumnStretch(1, 1)
-        self.readout = []
-        for i, (name, get) in enumerate(readout_rows(self)):
-            if get is None:
-                g = caps(name, role="group")
-                if i == 0:
-                    g.setStyleSheet("padding-top: 0;")
-                grid.addWidget(g, i, 0, 1, 2)
-                continue
-            k = label(name, "k", size=11)
-            v = label("—", "v", size=11)
-            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            grid.addWidget(k, i, 0)
-            grid.addWidget(v, i, 1)
-            self.readout.append((v, get))
-        body.addLayout(grid)
         lay.addWidget(sec)
 
         sec, body = self._section("Event log")
@@ -507,8 +611,8 @@ class GroundStation(QMainWindow):
         """ok: True = green dot, black rule. False = red. None = no data (faint)."""
         dot, border, color = ((S.OK, S.INK, S.INK) if ok else (S.BAD, S.BAD, S.BAD) if ok is False
                               else (S.HAIR, S.HAIR, S.FAINT))
-        chip.setText(f"<span style='color:{dot}'>■</span>&nbsp;&nbsp;{html.escape(name.upper())}")
-        chip.setStyleSheet(f"border: 1px solid {border}; color: {color}; padding: 4px 7px;")
+        set_text(chip, f"<span style='color:{dot}'>■</span>&nbsp;&nbsp;{html.escape(name.upper())}")
+        set_style(chip, f"border: 1px solid {border}; color: {color}; padding: 4px 7px;")
 
     # ---- events ----
     def log(self, msg, error=False):
@@ -531,6 +635,8 @@ class GroundStation(QMainWindow):
         item.setSizeHint(QSize(width, max(m.heightForWidth(width - 72), t.sizeHint().height()) + 9))
         self.log_list.insertItem(0, item)
         self.log_list.setItemWidget(item, row)
+        while self.log_list.count() > LOG_MAX:  # thousands of row widgets slow the whole window
+            self.log_list.takeItem(self.log_list.count() - 1)
 
     def refresh_ports(self, prefer=None):
         self.port_box.clear()
@@ -565,9 +671,11 @@ class GroundStation(QMainWindow):
         except Exception as e:  # pyserial raises several types for a busy or missing port
             self.log(f"Can't open {device}: {e}", True)
             return
-        self.link.set_command(arm=False, estop=False, valve_pct=0, cal_op=CAL_NONE,
-                              tx_power=self.txpow.currentData())
-        self.latest, self.last_seq, self.lost, self.cal_synced = None, None, 0, False
+        self.link.set_command(arm=False, estop=False, go=False, valve_pct=0, cal_op=CAL_NONE,
+                              tx_power=self.txpow.currentData(), ctrl_mode=self.ctrl_box.currentData(),
+                              **{k: b.value() for k, b in self.profile.items()})
+        self.latest, self.last_seq, self.lost, self.cal_synced, self.overflow = None, None, 0, False, 0
+        self.hopper_gains = None
         self.set_connected(True)
         self.log(f"Connected to the ground board on {device}")
 
@@ -585,9 +693,11 @@ class GroundStation(QMainWindow):
         S.set_variant(self.connect_btn, None if on else "primary")
         self.port_box.setEnabled(not on)
         for w in [self.arm_btn, self.estop_btn, self.valve_slider, self.txpow, self.cal_zero, self.span_psi,
-                  self.cal_span, self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn]:
+                  self.cal_span, self.laser_mm, self.cal_laser, self.cal_clear, self.record_btn,
+                  self.ctrl_box, *self.profile.values()]:
             w.setEnabled(on)
         self.update_controls()
+        self.update_gains_controls()
 
     def update_controls(self):
         c = self.link.command() if self.link else None
@@ -603,17 +713,21 @@ class GroundStation(QMainWindow):
         self.valve_slider.blockSignals(False)
         self.valve_label.setText(f"{valve} %")
         self.cal_status.setText("SENDING…" if c and c.cal_op != CAL_NONE else "")
+        going = bool(c and c.go)
+        self.go_btn.setText("ABORT HOP" if going else "GO")
+        S.set_variant(self.go_btn, "armed" if going else "primary")
+        self.go_btn.setEnabled(bool(c and c.arm and not c.estop))
 
     def toggle_arm(self):
         arm = not self.link.command().arm
-        self.link.set_command(arm=arm, **({} if arm else {"valve_pct": 0}))
+        self.link.set_command(arm=arm, **({} if arm else {"valve_pct": 0, "go": False}))
         self.update_controls()
         self.log("Arm requested" if arm else "Disarm")
 
     def estop(self):
         if not self.link or self.link.command().estop:
             return
-        self.link.set_command(estop=True, arm=False, valve_pct=0)
+        self.link.set_command(estop=True, arm=False, go=False, valve_pct=0)
         self.update_controls()
         self.log("E-STOP", True)
 
@@ -630,6 +744,30 @@ class GroundStation(QMainWindow):
             self.link.set_command(valve_pct=pct)
         self.valve_label.setText(f"{pct} %")
 
+    def set_ctrl_mode(self):
+        mode = self.ctrl_box.currentData()
+        if self.link:
+            self.link.set_command(ctrl_mode=mode)
+            self.log(f"Controller: {ctrl_name(mode)}" + (" (taken at the next arm)" if self.link.command().arm else ""))
+
+    def set_profile(self):
+        if self.link:
+            self.link.set_command(**{k: b.value() for k, b in self.profile.items()})
+
+    def toggle_go(self):
+        c = self.link.command()
+        if c.go:
+            self.link.set_command(go=False)
+            self.log("Hop abort requested" if self.latest and self.latest.phase != PHASE_IDLE else "Go released")
+        else:
+            if c.ctrl_mode == CTRL_MANUAL:
+                self.log("GO needs a closed-loop controller: pick one, then disarm and arm", True)
+                return
+            self.link.set_command(go=True)
+            self.go_sent = time.monotonic()
+            self.log("GO")
+        self.update_controls()
+
     def set_tx_power(self):
         dbm = self.txpow.currentData()
         if self.link:
@@ -641,6 +779,71 @@ class GroundStation(QMainWindow):
         self.link.set_command(cal_op=op, cal_seq=seq, cal_value=value)
         self.update_controls()
         self.log("Calibration: " + description)
+
+    # ---- gains ----
+    def form_gains(self) -> Gains:
+        return Gains(**{k: b.value() for k, b in self.gain_boxes.items()})
+
+    def edited_keys(self) -> list:
+        """Gains in the form that differ from the hopper's (at the form's precision)."""
+        if not self.hopper_gains:
+            return []
+        return [k for k, b in self.gain_boxes.items()
+                if round(getattr(self.hopper_gains, k), b.decimals()) != round(b.value(), b.decimals())]
+
+    def show_gains(self, g: Gains):
+        for k, b in self.gain_boxes.items():
+            b.blockSignals(True)
+            b.setValue(getattr(g, k))
+            b.blockSignals(False)
+        self.update_gains_controls()
+
+    def revert_gains(self):
+        if self.hopper_gains:
+            self.show_gains(self.hopper_gains)
+
+    def send_gains(self, op):
+        if self.link.command().arm or (self.latest and self.latest.state == 1):
+            self.log("Gains are taken only while disarmed: disarm first", True)
+            return
+        g = self.form_gains()
+        if not self.link.request_gains(op, g):
+            self.log("The hopper hasn't reported its gains yet (old firmware?)", True)
+            return
+        if op == GAINS_DEFAULTS:
+            self.log("Gains: back to defaults requested")
+        else:
+            self.log("Gains requested: " + ", ".join(f"{k} {getattr(g, k):g}" for k in self.edited_keys()))
+        self.update_gains_controls()
+
+    def on_gains_report(self, r, acked):
+        first = self.hopper_gains is None
+        keep_edits = not first and bool(self.edited_keys())
+        self.hopper_gains = r.gains
+        ok = acked and r.result == 0
+        if first or ok or not keep_edits:
+            self.show_gains(r.gains)  # otherwise keep edits not applied yet (or refused)
+        else:
+            self.update_gains_controls()
+        if first:
+            self.log("Hopper gains: " + ", ".join(f"{k} {v:.3g}" for k, v in vars(r.gains).items()))
+        if acked:
+            self.log("Gains " + (GAINS_RESULTS[r.result] if r.result < len(GAINS_RESULTS) else "refused"),
+                     not ok)
+
+    def update_gains_controls(self):
+        have = bool(self.link) and self.hopper_gains is not None
+        pending = bool(self.link) and self.link.gains_pending
+        edited = set(self.edited_keys())
+        for k, b in self.gain_boxes.items():
+            b.setEnabled(have and not pending)
+            S.set_variant(b, "edited" if k in edited else None)
+        self.gains_apply.setEnabled(have and not pending and bool(edited))
+        self.gains_revert.setEnabled(have and not pending and bool(edited))
+        self.gains_defaults.setEnabled(have and not pending)
+        self.gains_pending_shown = pending
+        self.gains_status.setText("" if not self.link else "WAITING…" if not have else "SENDING…" if pending
+                                  else f"{len(edited)} EDITED" if edited else "IN USE")
 
     def toggle_recording(self):
         if not self.recording:
@@ -663,8 +866,7 @@ class GroundStation(QMainWindow):
     def on_packet(self, t):
         if self.last_seq is not None and t.seq < self.last_seq:
             self.log("Hopper restarted (seq went back)")
-            for s in self.series:
-                s.clear()
+            self.history.clear()
         elif self.last_seq is not None and t.seq > self.last_seq + 1:
             self.lost += t.seq - self.last_seq - 1
         self.last_seq = t.seq
@@ -678,10 +880,7 @@ class GroundStation(QMainWindow):
         self.latest = t
         self.last_rx = time.monotonic()
         self.rx_times.append(self.last_rx)
-        for (_, _, get, _), s in zip(CHANNELS, self.series):
-            s.append((t.time_ms, get(t)))
-            while s and s[0][0] < t.time_ms - WINDOW_S * 1000:
-                s.popleft()
+        self.history.append(t.time_ms, [get(t) for _, _, get, _ in CHANNELS])
         if self.recording:
             self.recording[1].writerow(csv_row(t))
             self.recording[3] += 1
@@ -697,20 +896,50 @@ class GroundStation(QMainWindow):
             why = f" ({reason_name(b.reason)})" if b.state == 2 else ""
             self.log(f"Hopper {state_name(b.state)}{why}", b.state == 2)
             if b.state == 2:
-                self.link.set_command(arm=False, valve_pct=0)
+                self.link.set_command(arm=False, go=False, valve_pct=0)
                 self.update_controls()
+        if a.phase != b.phase:
+            bad = b.phase == 5 or (b.phase == 4 and b.abort_reason)
+            why = f" ({abort_name(b.abort_reason)})" if bad else ""
+            self.log(f"Hop phase {phase_name(b.phase)}{why}", bad)
+        c = self.link.command()
+        if c.go and b.phase == PHASE_IDLE and time.monotonic() - self.go_sent > 0.5:
+            # Still IDLE half a second after GO: the hopper refused it (abort_reason says why)
+            self.log(f"GO refused: {abort_name(b.abort_reason)}", True)
+            self.link.set_command(go=False)  # so the next GO is a fresh rising edge
+            self.update_controls()
         for bit, name in HEALTH:
             if (a.health ^ b.health) & bit:
                 self.log(f"{name} {'OK' if b.health & bit else 'LOST'}", not b.health & bit)
         if (a.flags ^ b.flags) & FLAG_DUAL_I2C:
             self.log("IMU moved to the shared I2C controller")
+        if (a.flags ^ b.flags) & FLAG_POWER_TRIP:
+            if b.flags & FLAG_POWER_TRIP:
+                cause = (b.flags & FLAG_POWER_CAUSE_MASK) >> FLAG_POWER_CAUSE_SHIFT
+                name = POWER_CAUSES[cause] if cause < len(POWER_CAUSES) else str(cause)
+                self.log(f"POWER PROTECTION TRIPPED: {name}. Arming and GO blocked", True)
+            else:
+                self.log("Power protection cleared (servo supply steady)")
+        if (a.flags ^ b.flags) & FLAG_SERVO_OFF:
+            self.log("Servo signal OFF (power protection)" if b.flags & FLAG_SERVO_OFF
+                     else "Servo signal back on", bool(b.flags & FLAG_SERVO_OFF))
+        if b.flags & FLAG_POWER_LATCH and not a.flags & FLAG_POWER_LATCH:
+            self.log("Power protection latched (3 trips): fix the battery, then restart the hopper", True)
 
     def tick(self):
         if self.link:
             while not self.link.events.empty():
                 self.log(*self.link.events.get())
-            while not self.link.packets.empty():
-                self.on_packet(self.link.packets.get())
+            packets = self.link.packets
+            while packets:
+                self.on_packet(packets.popleft())
+            while self.link.gains_reports:
+                self.on_gains_report(*self.link.gains_reports.popleft())
+            if self.link.gains_pending != self.gains_pending_shown:  # e.g. the link gave up
+                self.update_gains_controls()
+            if self.link.overflow > self.overflow:
+                self.log(f"Dashboard fell behind: skipped {self.link.overflow - self.overflow} packets", True)
+                self.overflow = self.link.overflow
             if not self.link.alive:
                 self.link = None
                 self.disconnect("Link closed")
@@ -724,23 +953,23 @@ class GroundStation(QMainWindow):
         age = now - self.last_rx if t else None
         live = t is not None and age < LIVE_AGE_S
         st = self.stats
-        st["Rx rate"].setText(f"{len(self.rx_times)} Hz" if t else "—")
-        st["Last pkt"].setText(("—" if not t else f"{age * 1000:.0f} ms" if age < 1 else f"{age:.1f} s"))
-        st["Lost"].setText(str(self.lost) if t else "—")
-        st["Hopper T+"].setText(f"{t.time_ms / 1000:.2f} s" if t else "—")
-        st["RTT"].setText(f"{fmt(t.rtt_ms, 1)} ms" if t else "—")
-        st["Signal"].setText(f"{t.rssi} dBm" if t and t.rssi else "—")
-        st["Valve"].setText(f"{t.valve_pct} %" if t else "—")
+        set_text(st["Rx rate"], f"{len(self.rx_times)} Hz" if t else "—")
+        set_text(st["Last pkt"], ("—" if not t else f"{age * 1000:.0f} ms" if age < 1 else f"{age:.1f} s"))
+        set_text(st["Lost"], str(self.lost) if t else "—")
+        set_text(st["Hopper T+"], f"{t.time_ms / 1000:.2f} s" if t else "—")
+        set_text(st["RTT"], f"{fmt(t.rtt_ms, 1)} ms" if t else "—")
+        set_text(st["Signal"], f"{t.rssi} dBm" if t and t.rssi else "—")
+        set_text(st["Valve"], f"{t.valve_pct} %" if t else "—")
         name = state_name(t.state) if t else "—"
-        st["State"].setText(name)
+        set_text(st["State"], name)
         bg, fg = S.STATE_BADGE.get(name, (None, S.BAR_TEXT)) if live else (None, S.BAR_TEXT)
-        st["State"].setStyleSheet(f"background: {bg}; color: {fg}; padding: 1px 6px; margin-left: -6px;"
-                                  if bg else "padding: 1px 0;")
+        set_style(st["State"], f"background: {bg}; color: {fg}; padding: 1px 6px; margin-left: -6px;"
+                  if bg else "padding: 1px 0;")
 
         # Square status dot: green pulsing = live, amber = connected without telemetry
         dot = (S.OK if (now % 1.2) < 0.6 else "#0a5c35") if live else S.WARN if self.link else S.BAR_RULE
         text = "Link live" if live else "No telemetry" if self.link else "Disconnected"
-        self.status.setText(f"<span style='color:{dot}'>■</span>&nbsp;&nbsp;"
+        set_text(self.status, f"<span style='color:{dot}'>■</span>&nbsp;&nbsp;"
                             f"<span style='color:{S.BAR_TEXT if live else S.BAR_DIM}'>{text.upper()}</span>")
 
         if t:
@@ -748,18 +977,15 @@ class GroundStation(QMainWindow):
                 self._chip(chip, name_, bool(t.health & bit))
             dual = bool(t.flags & FLAG_DUAL_I2C)
             self._chip(self.i2c_chip, "I2C dual" if dual else "I2C shared", True if dual else None)
-            for lbl, get in self.readout:
-                lbl.setText(get(t))
 
         t_end = t.time_ms if t else 0
         for p in self.plots:
             k = p.channel.currentIndex()
             _, unit, get, d = CHANNELS[k]
             p.set_value(fmt(get(t), d) if t else "—", unit)
-            s = self.series[k]
-            if len(s) > 1:
-                arr = np.array(s, dtype=float)
-                p.curve.setData((arr[:, 0] - t_end) / 1000, arr[:, 1])
+            times, values = self.history.window(k, t_end)
+            if len(times) > 1:
+                p.curve.setData((times - t_end) / 1000, values)
             else:
                 p.curve.setData([], [])
 
@@ -775,6 +1001,74 @@ class GroundStation(QMainWindow):
         event.accept()
 
 
+def keep_awake():
+    """Stop the OS throttling this app when its window is behind others or minimised.
+    Both macOS (App Nap) and Windows 11 (power throttling) slow down a background app's
+    timers, the link threads included: commands go out late and the hopper can FAILSAFE.
+    Also keeps the laptop from idle-sleeping while the dashboard is open.
+    Returns something to keep for the app's lifetime (or None). Best effort: never raises."""
+    if sys.platform == "darwin":
+        return _keep_awake_macos()
+    if sys.platform == "win32":
+        return _keep_awake_windows()
+    return None  # Linux doesn't throttle background apps like this
+
+
+def _keep_awake_windows():
+    import ctypes
+    from ctypes import wintypes
+
+    class PowerThrottlingState(ctypes.Structure):  # PROCESS_POWER_THROTTLING_STATE
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                   wintypes.DWORD]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+        kernel32.SetThreadExecutionState.restype = wintypes.DWORD
+        # ProcessPowerThrottling (4): control EXECUTION_SPEED (1) and IGNORE_TIMER_RESOLUTION
+        # (4), state 0 = both off. Windows 10 before 1709 doesn't know it: returns False.
+        state = PowerThrottlingState(1, 0x1 | 0x4, 0)
+        kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), 4, ctypes.byref(state),
+                                       ctypes.sizeof(state))
+        # 1 ms timer resolution for this process's sleeps and waits
+        ctypes.WinDLL("winmm").timeBeginPeriod(1)
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED: no idle sleep (this thread, until it exits)
+        kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        return True
+    except (OSError, AttributeError):
+        return None
+
+
+def _keep_awake_macos():
+    import ctypes
+    import ctypes.util
+    try:
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        addr = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+
+        def send(obj, sel, *args, types=()):
+            fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, *types)(addr)
+            return fn(obj, objc.sel_registerName(sel), *args)
+
+        info = send(objc.objc_getClass(b"NSProcessInfo"), b"processInfo")
+        reason = send(objc.objc_getClass(b"NSString"), b"stringWithUTF8String:", b"Hopper command link",
+                      types=(ctypes.c_char_p,))
+        # NSActivityUserInitiated | NSActivityLatencyCritical
+        token = send(info, b"beginActivityWithOptions:reason:", 0x00FFFFFF | 0xFF00000000, reason,
+                     types=(ctypes.c_uint64, ctypes.c_void_p))
+        return send(token, b"retain") if token else None
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
 def make_app(argv):
     pg.setConfigOptions(antialias=True, background=S.BG, foreground=S.FAINT)
     app = QApplication(argv)
@@ -788,6 +1082,7 @@ def main():
     ap.add_argument("--port", help="ground board serial port (default: found from GROUND_MAC)")
     args = ap.parse_args()
     app = make_app(sys.argv)
+    app.awake = keep_awake()
     win = GroundStation(args.port)
     win.show()
     sys.exit(app.exec())

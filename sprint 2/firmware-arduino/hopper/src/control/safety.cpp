@@ -22,7 +22,6 @@ static void go_failsafe(uint8_t why) {
   s_need_disarm = true;
   s_failsafes++;
   set_valve(0);
-  Serial.printf(">>> FAILSAFE (%s): valve driven shut\n", why == REASON_LINK ? "link lost" : "E-stop");
 }
 
 void safety_init() {
@@ -37,9 +36,8 @@ void safety_update(uint32_t now_ms, const safety_inputs_t *in, valve_demand_fn_t
   switch (s_state) {
     case STATE_SAFE:
       if (s_valve) set_valve(0);
-      if (in->link_up && in->arm && !in->estop && !s_need_disarm) {
+      if (in->link_up && in->arm && !in->estop && !in->power_trip && !s_need_disarm) {
         s_state = STATE_ARMED;
-        Serial.println(">>> ARMED");
       }
       break;
     case STATE_ARMED:
@@ -50,7 +48,8 @@ void safety_update(uint32_t now_ms, const safety_inputs_t *in, valve_demand_fn_t
       } else if (!in->arm) {
         s_state = STATE_SAFE;
         set_valve(0);
-        Serial.println(">>> SAFE (disarmed)");
+      } else if (in->power_trip && !in->flying) {
+        go_failsafe(REASON_POWER);  // flying: flight.cpp lands it first
       } else {
         uint8_t v = demand(now_ms);
         if (v != s_valve) set_valve(v);
@@ -61,7 +60,6 @@ void safety_update(uint32_t now_ms, const safety_inputs_t *in, valve_demand_fn_t
       if (in->link_up && !in->arm) {
         s_state = STATE_SAFE;
         s_reason = REASON_NONE;
-        Serial.println(">>> SAFE (failsafe cleared)");
       }
       break;
   }

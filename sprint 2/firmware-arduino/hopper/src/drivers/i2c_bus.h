@@ -19,8 +19,8 @@ TwoWire &i2c_bus_get(i2c_bus_t bus);
 // Frees and restarts the device's bus, to retry a sensor that dropped out.
 void i2c_bus_restart(i2c_bus_t bus);
 
-// Gives up on Wire1 and shares Wire between both devices from now on. Prints why.
-void i2c_bus_use_shared(const char *why);
+// Gives up on Wire1 and shares Wire between both devices from now on.
+void i2c_bus_use_shared();
 
 // True while the laser and IMU each have their own controller
 bool i2c_bus_dual();

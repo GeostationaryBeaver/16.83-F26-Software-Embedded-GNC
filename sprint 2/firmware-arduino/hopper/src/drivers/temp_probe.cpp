@@ -74,31 +74,55 @@ static uint8_t s_sp[9], s_sp_n = 0;
 static uint8_t s_fails = 0;
 static bool s_ok = false;
 static float s_temp_c = NAN;
+static temp_fault_t s_fault = TEMP_NO_PROBE;
 
-static void fail() {
+// Released line should be pulled HIGH by R7 within a few us
+static bool line_idles_high() {
+  ow_release();
+  delayMicroseconds(50);
+  return digitalRead(PIN_TEMP_OW) == HIGH;
+}
+
+static void fail(temp_fault_t why) {
+  if (why == TEMP_NO_PROBE && !line_idles_high()) why = TEMP_LINE_LOW;
+  s_fault = why;
   if (++s_fails > 3) { s_ok = false; s_temp_c = NAN; }
   s_phase = PHASE_IDLE;
+}
+
+// Checks a scratchpad. On TEMP_OK writes the temperature to *c.
+static temp_fault_t check_scratchpad(const uint8_t *sp, float *c) {
+  if (crc8(sp, 8) != sp[8]) return TEMP_CRC;
+  // Config register reads 0bx11111 (resolution bits 5-6) and byte 5 is reserved 0xFF.
+  // An all-zeros answer has a valid CRC (0), so this is what catches it.
+  if ((sp[4] & 0x9F) != 0x1F || sp[5] != 0xFF) return TEMP_GARBAGE;
+  int16_t raw = (int16_t)(sp[0] | (sp[1] << 8));
+  if (raw == 0x0550) return TEMP_POWER_ON;  // 85.00 C: never converted since power-up
+  *c = raw / 16.0f;
+  return TEMP_OK;
 }
 
 bool temp_probe_init() {
   pinMode(PIN_TEMP_OW, OUTPUT_OPEN_DRAIN);
   ow_release();
-  s_ok = ow_reset();
-  return s_ok;
+  s_ok = false;  // until a reading passes every check
+  bool present = ow_reset();
+  s_fault = present ? TEMP_OK : line_idles_high() ? TEMP_NO_PROBE : TEMP_LINE_LOW;
+  return present;
 }
 
 void temp_probe_update(uint32_t now_ms) {
   if (s_phase == PHASE_IDLE) {
     if (now_ms - s_phase_ms < START_EVERY_MS) return;
     s_phase_ms = now_ms;
-    if (!ow_reset()) { fail(); return; }
+    if (!ow_reset()) { fail(TEMP_NO_PROBE); return; }
     ow_write(0xCC);  // skip ROM (one probe on the line)
     ow_write(0x44);  // convert T
     s_phase = PHASE_CONVERT;
   } else if (s_phase == PHASE_CONVERT) {
     if (now_ms - s_phase_ms < CONVERT_MS) return;
     s_phase_ms = now_ms;
-    if (!ow_reset()) { fail(); return; }
+    if (!ow_reset()) { fail(TEMP_NO_PROBE); return; }
     ow_write(0xCC);  // skip ROM
     ow_write(0xBE);  // read scratchpad
     s_phase = PHASE_READ;
@@ -108,8 +132,11 @@ void temp_probe_update(uint32_t now_ms) {
     if (s_sp_n < 9) return;
     s_phase = PHASE_IDLE;
     s_phase_ms = now_ms;
-    if (crc8(s_sp, 8) != s_sp[8]) { fail(); return; }
-    s_temp_c = (int16_t)(s_sp[0] | (s_sp[1] << 8)) / 16.0f;
+    float c;
+    temp_fault_t why = check_scratchpad(s_sp, &c);
+    if (why != TEMP_OK) { fail(why); return; }
+    s_temp_c = c;
+    s_fault = TEMP_OK;
     s_ok = true;
     s_fails = 0;
   }
@@ -118,3 +145,5 @@ void temp_probe_update(uint32_t now_ms) {
 bool temp_probe_ok() { return s_ok; }
 
 float temp_probe_c() { return s_ok ? s_temp_c : NAN; }
+
+temp_fault_t temp_probe_fault() { return s_fault; }

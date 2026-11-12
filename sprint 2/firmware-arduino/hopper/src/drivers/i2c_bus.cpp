@@ -63,12 +63,11 @@ void i2c_bus_restart(i2c_bus_t bus) {
   }
 }
 
-void i2c_bus_use_shared(const char *why) {
+void i2c_bus_use_shared() {
   if (!s_dual) return;
   Wire1.end();
   s_dual = false;
   s_shared_on = -1;
-  Serial.printf("I2C: %s, switching to one shared controller\n", why);
 }
 
 bool i2c_bus_dual() { return s_dual; }

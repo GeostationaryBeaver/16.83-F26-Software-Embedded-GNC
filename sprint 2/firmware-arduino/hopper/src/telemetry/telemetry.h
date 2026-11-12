@@ -14,3 +14,7 @@ void telemetry_init(telemetry_cmd_handler_t cmd_handler);
 // call from the control loop on core 1. Must only be called from ONE task.
 // Returns false (and drops the data) if the buffer is full.
 bool telemetry_push(const telemetry_data_t *data);
+
+// Sends a gains report (MSG_GAINS) to the ground on the telemetry task's next pass. Only the
+// newest one waits: a report not yet sent is replaced. Non-blocking, safe from the control loop.
+void telemetry_send_gains(const gains_packet_t *pkt);

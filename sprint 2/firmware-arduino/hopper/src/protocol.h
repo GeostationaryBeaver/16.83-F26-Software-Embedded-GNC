@@ -113,6 +113,8 @@ typedef enum {
     CAL_CLEAR = 4,  // zero, span and laser offset back to defaults (transmitter range kept)
     CAL_PTRANGE = 5,  // pressure transmitter full scale: cal_value = psi at 20 mA (100-20000).
                       // Resets the span to 1: vent and zero, then span. Same number as avionics
+    CAL_AUTO = 6,   // laser offset and IMU biases from ~3 s of averages, hopper still on the pad
+                    // (also done at every boot). Disarmed only; acked once it has finished
 } cal_op_t;
 
 // telemetry_data_t.health bits: set when that sensor is working
@@ -129,6 +131,7 @@ typedef enum {
 #define FLAG_POWER_LATCH  0x08  // tripped 3 times since power-up: stays off until the hopper restarts
 #define FLAG_POWER_CAUSE_SHIFT 4  // bits 4-6: pg_cause_t of the latest trip, kept after it clears:
 #define FLAG_POWER_CAUSE_MASK  0x70  // 1 servo rail low, 2 rail high, 3 rail flickering, 4 pressure loop starved
+#define FLAG_AUTOCAL      0x80  // automatic laser/IMU calibration running: keep the hopper still
 
 // Fields sent by the control loop. NaN = no reading.
 typedef struct __attribute__((packed)) {
@@ -139,8 +142,8 @@ typedef struct __attribute__((packed)) {
     float laser_z;         // calibrated laser height (m), NaN = no reading
 
     // Sensors
-    float accel[3];        // x, y, z (m/s^2), sensor axes
-    float gyro[3];         // x, y, z (rad/s)
+    float accel[3];        // x, y, z (m/s^2), sensor axes, IMU biases removed (CAL_AUTO)
+    float gyro[3];         // x, y, z (rad/s), biases removed
     float temp_c;          // valve inlet temperature (deg C), NaN = no reading
     float pt_ma;           // pressure loop current, smoothed (mA)
     float psi;             // calibrated pressure (psi), from pt_ma

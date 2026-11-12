@@ -34,7 +34,9 @@ V_UP_MMS = (50, 500)
 V_DOWN_MMS = (50, 300)
 HOVER_MS = (0, 10000)
 DEFAULT_PROFILE = dict(z_sp_mm=500, v_up_mms=250, v_down_mms=200, hover_ms=3000)
-CAL_NONE, CAL_ZERO, CAL_SPAN, CAL_LASER, CAL_CLEAR, CAL_PTRANGE = range(6)
+# CAL_AUTO: laser offset + IMU biases averaged on the pad (also at every hopper boot)
+CAL_NONE, CAL_ZERO, CAL_SPAN, CAL_LASER, CAL_CLEAR, CAL_PTRANGE, CAL_AUTO = range(7)
+PT_RANGE_PSI = (100, 20000)  # CAL_PTRANGE limits (PT_FULL_MIN_PSI, PT_FULL_MAX_PSI in calibration.cpp)
 HEALTH = [(0x01, "LASER"), (0x02, "IMU"), (0x04, "TEMP"), (0x08, "PRESSURE"), (0x10, "SERVO PWR")]
 FLAG_DUAL_I2C = 0x01
 # Power protection (hopper/src/control/power_guard.h)
@@ -42,6 +44,7 @@ FLAG_POWER_TRIP = 0x02   # tripped: arming and go refused
 FLAG_SERVO_OFF = 0x04    # servo signal switched off
 FLAG_POWER_LATCH = 0x08  # 3 trips since power-up: stays off until the hopper restarts
 FLAG_POWER_CAUSE_SHIFT, FLAG_POWER_CAUSE_MASK = 4, 0x70
+FLAG_AUTOCAL = 0x80     # automatic laser/IMU calibration running: keep the hopper still
 POWER_CAUSES = ["none", "servo rail low (battery flat / UBEC can't keep up)",
                 "servo rail high (UBEC jumper not on 6.0 V)", "servo rail switching off and on (brown-out)",
                 "pressure loop starved (12 V battery low)"]

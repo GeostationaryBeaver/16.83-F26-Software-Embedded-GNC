@@ -1122,18 +1122,50 @@ to a timestamped directory, so two runs can be put side by side.
 ```bash
 uv run python scripts/scenario.py --controller example_hover:hover
 uv run python scripts/scenario.py --controller example_hover:hover --target 3.5
-uv run python scripts/scenario.py --selftest        # 166 numeric checks
+uv run python scripts/scenario.py --selftest        # 185 numeric checks
 ```
 
 ### The profile
 
-| phase | setpoint | ends when |
-|---|---|---|
-| `GROUND_SIT` | the resting height | 2 s elapse |
-| `ASCEND` | **steps** to the target | craft arrives *and* has settled |
-| `HOLD_TARGET` | the target | 5 s elapse |
-| `DESCEND` | **ramps** down at `DESCENT_RATE_MPS` | setpoint reaches the floor and the craft settles |
-| `GROUND_HOLD` | the resting height | 3 s elapse |
+| phase | setpoint | ends when | set it with |
+|---|---|---|---|
+| `GROUND_SIT` | the resting height | 2 s elapse | `--ground-sit S` |
+| `ASCEND` | **steps** to the target, or **ramps** at `--ascent-rate` | craft arrives *and* has settled | `--target M`, `--ascent-rate MPS` |
+| `HOLD_TARGET` | the target | 5 s elapse | `--hold-target S` |
+| `DESCEND` | **ramps** down | setpoint reaches the floor and the craft settles | `--descent-rate MPS` |
+| `GROUND_HOLD` | the resting height | 3 s elapse | `--hold-ground S` |
+
+**Every segment is commandable**, from the CLI or from the GUI's profile box.
+The durations used to be module constants read inside `Profile.update()`, so a
+run could set the target and the descent rate and nothing else; they are
+per-`Profile` now, defaulting to those same constants. A blank GUI field or an
+omitted flag inherits the default, so nothing has to be restated to get the
+standard profile.
+
+```bash
+# 1 s on the pad, a controlled 0.5 m/s climb to 3 m, 8 s of hover,
+# down at 0.25 m/s, 1.5 s on the pad
+uv run python scripts/scenario.py --controller example_hover:hover_cascade \
+    --scene scenes/07_thrust_1D.xml --target 3.0 --ascent-rate 0.5 \
+    --ground-sit 1.0 --hold-target 8.0 --hold-ground 1.5 --descent-rate 0.25
+```
+
+**The ascent is a step by default and that is deliberate.** A step is how you
+measure step response, which is what the overshoot and settling numbers
+throughout this README are. The original asymmetry — descent ramped, ascent
+stepped — was more the order the two were written in than a decision, and
+`--ascent-rate` closes it: nonzero asks for a *controlled climb*, which is what
+a real flight profile specifies. Both get a timeout that covers the ramp, so a
+200 s climb at 0.1 m/s is not cut off by a flat 30 s.
+
+Worth knowing what that exposes. Measured, `hover_cascade` climbing at 0.5 m/s
+to 3 m overshoots **0.2764 m** against 0.0518 m on a step to 2 m: the cascade's
+setpoint-rate feedforward and its `V_MAX_MPS` clamp are tuned for the 0.1 m/s
+descent, and a 5x faster climb outruns them. That is real controller behaviour
+the flag makes visible rather than a bug in it.
+
+Zero-length holds are legal (`--hold-target 0`), because "no hover, just touch
+and go" is a real request; the phase is entered and left on the same tick.
 
 The hold clocks start on **arrival**, not when the setpoint changes, so a slow
 controller still gets a full 5 s genuinely at altitude. Arrival requires both
@@ -1415,7 +1447,7 @@ bit-for-bit, which is the honest way to measure what the mass model changed.
 ```bash
 uv run python scripts/gui.py            # the control panel
 uv run python scripts/gui.py --demo     # bigger fonts, less clutter
-uv run python scripts/gui.py --selftest # 98 headless checks
+uv run python scripts/gui.py --selftest # 109 headless checks
 ```
 
 Three tabs. **Run** is a front end for `scenario.py` — pick a scene and a
@@ -1616,6 +1648,26 @@ uv run python scripts/scenario.py --controller example_hover:hover_pid \
 uv run python scripts/scenario.py --controller example_hover:hover_cascade \
     --gain KP_V=20 --gain KP_POS_V=0.5
 ```
+
+### The profile box
+
+The Run tab's **profile** box carries the commanded trajectory, laid out in
+flight order so the row reads like the mission: **pad sit [s] → climb [m/s]
+→ hover [s] → descend [m/s] → pad hold [s]**, with the target altitude in
+the row above. Beside it a live summary names the shape and the expected
+duration *before* you launch, e.g. `climb 0.5 m/s, ~28 s total / sit 1 → up
+→ hover 8 → down → sit 1.5`.
+
+Two things keep it honest. The defaults are read from `scenario.py`, so the
+boxes show what a bare run would actually do rather than a second set of
+numbers that can drift from it. And the summary is produced by constructing a
+real `scenario.Profile` and asking it — a second copy of the arithmetic here
+is exactly how a GUI starts lying about what it is about to run. A half-typed
+number shows `(check the profile numbers)` instead of raising, since editing
+passes through invalid states.
+
+The Live tab has no profile box: it commands a target with a slider and runs
+no phase machine, so durations would be flags that go nowhere.
 
 In the GUI the gain boxes sit in five labelled groups — `PD core`,
 `integral`, `cascade`, `2-rate only` and `thrust tracker` — on the Run tab

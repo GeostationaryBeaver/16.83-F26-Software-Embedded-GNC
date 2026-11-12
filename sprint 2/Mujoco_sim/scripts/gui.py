@@ -190,6 +190,10 @@ def build_scenario_cmd(params, python=None, script=None):
            "--scene", f"scenes/{params['scene']}"]
     for flag, key in (("--target", "target"),
                       ("--descent-rate", "descent_rate"),
+                      ("--ascent-rate", "ascent_rate"),
+                      ("--ground-sit", "ground_sit"),
+                      ("--hold-target", "hold_target"),
+                      ("--hold-ground", "hold_ground"),
                       ("--control-hz", "control_hz"),
                       ("--propellant", "propellant"),
                       ("--dry-mass", "dry_mass"),
@@ -369,6 +373,13 @@ class App:
         import propellant
         return {"target": scenario.TARGET_ALT_M,
                 "descent_rate": scenario.DESCENT_RATE_MPS,
+                # The profile's shape. Read from scenario so the GUI shows
+                # what a bare run would actually do rather than a second set
+                # of numbers that can drift from it.
+                "ascent_rate": 0.0,
+                "ground_sit": scenario.GROUND_SIT_S,
+                "hold_target": scenario.HOLD_AT_TARGET_S,
+                "hold_ground": scenario.HOLD_AT_GROUND_S,
                 "propellant": propellant.PROPELLANT_KG,
                 "dry_mass": propellant.DRY_MASS_KG,
                 "isp": propellant.ISP_S}
@@ -379,6 +390,10 @@ class App:
                 "controller": self.v_ctrl.get(),
                 "target": self.v_target.get().strip(),
                 "descent_rate": self.v_descent.get().strip(),
+                "ascent_rate": self.v_ascent.get().strip(),
+                "ground_sit": self.v_gsit.get().strip(),
+                "hold_target": self.v_hold_t.get().strip(),
+                "hold_ground": self.v_hold_g.get().strip(),
                 "control_hz": self.v_hz.get().strip(),
                 "propellant": self.v_prop.get().strip(),
                 "dry_mass": self.v_dry.get().strip(),
@@ -455,6 +470,40 @@ class App:
                 live = [n for n in GAIN_FIELDS if n in used]
                 hint.set(f"{law} reads: " + (", ".join(live) if live
                                              else "none of these"))
+
+    def _update_profile_hint(self):
+        """Show the commanded profile and its duration before launching.
+
+        Built by constructing a real scenario.Profile, so the summary and
+        the estimate come from the machine that will actually fly it - a
+        second copy of the arithmetic here is exactly how a GUI starts
+        lying about what it is about to run.
+
+        A half-typed number is normal while someone is editing, so a bad
+        value sets a short complaint instead of raising.
+        """
+        if not hasattr(self, "v_profhint"):
+            return
+        try:
+            import scenario
+            prof = scenario.Profile(
+                0.0,
+                float(self.v_target.get() or 0.0),
+                float(self.v_descent.get() or scenario.DESCENT_RATE_MPS),
+                0.002,
+                ground_sit_s=float(self.v_gsit.get() or 0.0),
+                hold_target_s=float(self.v_hold_t.get() or 0.0),
+                hold_ground_s=float(self.v_hold_g.get() or 0.0),
+                ascent_rate=float(self.v_ascent.get() or 0.0))
+        except (ValueError, TypeError):
+            self.v_profhint.set("(check the profile numbers)")
+            return
+        climb = (f"climb {prof.ascent_rate:g} m/s" if prof.ascent_rate > 0
+                 else "step up (step response)")
+        self.v_profhint.set(
+            f"{climb}, ~{prof.duration_estimate_s():.0f} s total\n"
+            f"sit {prof.ground_sit_s:g} → up → hover {prof.hold_target_s:g}"
+            f" → down → sit {prof.hold_ground_s:g}")
 
     def _update_valve_fields(self):
         """Grey the valve boxes when no valve is flying, and the checkbox
@@ -578,26 +627,25 @@ class App:
         self.v_label = tk.StringVar(value="")
         self.v_fixed = tk.IntVar(value=0)
         field(0, "target [m]", self.v_target)
-        field(1, "descent [m/s]", self.v_descent)
-        field(2, "control [Hz]", self.v_hz)
+        field(1, "control [Hz]", self.v_hz)
         # Collected so _update_mass_fields can disable them: with fixed mass
         # no PropellantTank is built and these three are never read.
-        self.mass_widgets = [field(3, "propellant [kg]", self.v_prop),
-                             field(4, "dry mass [kg]", self.v_dry),
-                             field(5, "Isp [s]", self.v_isp)]
-        field(6, "gravity", self.v_grav)
-        field(7, "label", self.v_label, 12)
+        self.mass_widgets = [field(2, "propellant [kg]", self.v_prop),
+                             field(3, "dry mass [kg]", self.v_dry),
+                             field(4, "Isp [s]", self.v_isp)]
+        field(5, "gravity", self.v_grav)
+        field(6, "label", self.v_label, 12)
         ttk.Checkbutton(self.grid_params, text="fixed mass",
                         variable=self.v_fixed,
                         command=self._update_mass_fields
-                        ).grid(row=0, column=8, sticky="w")
+                        ).grid(row=0, column=7, sticky="w")
         # Recording costs about 10 s of wall time on an 18 s profile and
         # cannot change the flight (scenario.py's selftest asserts the CSV
         # is byte-identical), so it is a plain opt-in checkbox.
         self.v_video = tk.IntVar(value=0)
         ttk.Checkbutton(self.grid_params, text="record mp4",
                         variable=self.v_video
-                        ).grid(row=0, column=9, sticky="w", padx=(10, 0))
+                        ).grid(row=0, column=8, sticky="w", padx=(10, 0))
         # Off by default: on a vertical law the four RCS nozzles are exactly
         # 0.0 N throughout, and plotting them drags the thrust axis down to
         # include zero, squeezing the main engine's trace into a fifth of
@@ -605,7 +653,7 @@ class App:
         self.v_allthr = tk.IntVar(value=0)
         ttk.Checkbutton(self.grid_params, text="plot idle thrusters",
                         variable=self.v_allthr
-                        ).grid(row=0, column=10, sticky="w", padx=(10, 0))
+                        ).grid(row=0, column=9, sticky="w", padx=(10, 0))
 
         # Gains, grouped by the law that reads them, in a labelled box per
         # group - so it is visible at a glance that KI_ALT does nothing to
@@ -627,6 +675,42 @@ class App:
                 ent.grid(row=1, column=col, sticky="w", padx=(0, 6))
                 self.g_vars[name] = var
                 self.g_widgets[name] = (lbl, ent)
+        # THE PROFILE, in its own labelled box. Four more entries in the
+        # single params row would be unreadable, and these belong together:
+        # they are the commanded trajectory, not vehicle or controller
+        # settings. Laid out in flight order so the row reads like the
+        # mission - sit, climb, hover, descend, sit.
+        pbox = self.ttk.Labelframe(
+            self.tab_run, text="profile  (what to command, and for how long)",
+            padding=(8, 2, 8, 4))
+        pbox.pack(fill="x", padx=8, pady=(2, 0))
+        self.v_ascent = tk.StringVar(value="")
+        self.v_gsit = tk.StringVar(value=str(d["ground_sit"]))
+        self.v_hold_t = tk.StringVar(value=str(d["hold_target"]))
+        self.v_hold_g = tk.StringVar(value=str(d["hold_ground"]))
+
+        def pfield(col, text, var, width=8):
+            f = ttk.Frame(pbox)
+            f.grid(row=0, column=col, sticky="w", padx=(0, 10))
+            ttk.Label(f, text=text).pack(anchor="w")
+            ttk.Entry(f, textvariable=var, width=width).pack()
+
+        pfield(0, "pad sit [s]", self.v_gsit)
+        pfield(1, "climb [m/s]", self.v_ascent)
+        pfield(2, "hover [s]", self.v_hold_t)
+        pfield(3, "descend [m/s]", self.v_descent)
+        pfield(4, "pad hold [s]", self.v_hold_g)
+        # A live summary, so the commanded profile and its duration are
+        # visible BEFORE launching rather than discovered from the log. The
+        # estimate comes from scenario.Profile itself, not a second copy of
+        # the arithmetic here.
+        self.v_profhint = tk.StringVar(value="")
+        ttk.Label(pbox, textvariable=self.v_profhint, foreground="#606060"
+                  ).grid(row=0, column=5, rowspan=2, sticky="w", padx=(8, 0))
+        for _v in (self.v_target, self.v_ascent, self.v_gsit, self.v_hold_t,
+                   self.v_hold_g, self.v_descent):
+            _v.trace_add("write", lambda *_: self._update_profile_hint())
+
         # The valve layer, in its own labelled box because it changes what
         # the controller's numbers MEAN: with it on, the main engine is
         # commanded as a 0..1 opening and an unknown curve turns that into
@@ -680,6 +764,7 @@ class App:
         self._update_gain_fields()
         self._update_mass_fields()
         self._update_valve_fields()
+        self._update_profile_hint()
 
         bar = ttk.Frame(self.tab_run, padding=8)
         bar.pack(fill="x")
@@ -1647,6 +1732,53 @@ def run_selftest() -> int:
     truth("LineReader catches BlockingIOError only",
           "except BlockingIOError:" in lsrc
           and "except Exception:\n            pass" not in lsrc)
+
+    print("\n[2f] the profile box: every segment commandable")
+    pbase = {**base, "ascent_rate": "0.5", "ground_sit": "1.0",
+             "hold_target": "8.0", "hold_ground": "1.5",
+             "descent_rate": "0.25", "target": "3.0"}
+    cp = build_scenario_cmd(pbase, python="PY", script="S")
+    for flag, val in (("--target", "3.0"), ("--ascent-rate", "0.5"),
+                      ("--ground-sit", "1.0"), ("--hold-target", "8.0"),
+                      ("--hold-ground", "1.5"), ("--descent-rate", "0.25")):
+        truth(f"  {flag} is passed", flag in cp
+              and cp[cp.index(flag) + 1] == val, val)
+    # Blank still means "scenario.py's own default", the rule every other
+    # field follows - so the GUI never has to mirror the constants.
+    cblank = build_scenario_cmd(
+        {**pbase, "ascent_rate": "", "ground_sit": "", "hold_target": "",
+         "hold_ground": ""}, python="PY", script="S")
+    truth("  a blank segment inherits scenario.py's default",
+          not any(a in cblank for a in ("--ascent-rate", "--ground-sit",
+                                        "--hold-target", "--hold-ground")))
+    # The Live tab commands a target with a slider and runs no profile, so
+    # phase durations are meaningless there and must not be sent.
+    wp = build_worker_cmd(pbase, 1, python="PY", script="S")
+    truth("  the live worker gets no phase durations",
+          not any(a.startswith(("--ground-sit", "--hold-", "--ascent-"))
+                  for a in wp))
+    # The defaults shown must BE scenario's, not a second set that can drift.
+    import scenario as _scn
+    truth("the profile defaults come from scenario, not a copy",
+          _scn.GROUND_SIT_S == 2.0 and _scn.HOLD_AT_TARGET_S == 5.0
+          and _scn.HOLD_AT_GROUND_S == 3.0,
+          f"sit {_scn.GROUND_SIT_S:g}, hover {_scn.HOLD_AT_TARGET_S:g}, "
+          f"hold {_scn.HOLD_AT_GROUND_S:g}")
+    # And the hint's estimate must come from Profile itself. Checked by
+    # asking Profile directly: a custom profile's estimate has to differ
+    # from the default one, or the summary is not reading the fields.
+    _pd = _scn.Profile(0.0, 2.0, 0.1, 0.002)
+    _pc = _scn.Profile(0.0, 3.0, 0.25, 0.002, ground_sit_s=1.0,
+                       hold_target_s=8.0, hold_ground_s=1.5, ascent_rate=0.5)
+    truth("  Profile estimates its own duration",
+          abs(_pd.duration_estimate_s() - 30.0) < 0.1
+          and abs(_pc.duration_estimate_s() - 28.5) < 0.6,
+          f"default {_pd.duration_estimate_s():.1f}s, "
+          f"custom {_pc.duration_estimate_s():.1f}s")
+    truth("  and describes its shape in one line",
+          "ramp up at 0.5 m/s" in _pc.describe()
+          and "step up" in _pd.describe(),
+          _pc.describe()[:58])
 
     print("\n[2e] the valve layer controls")
     vbase = {**base, "valve": True, "valve_curve": "sqrt",

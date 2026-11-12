@@ -199,23 +199,78 @@ class Profile:
     phase timings can be handed to the plotter and the metadata file.
     """
 
-    def __init__(self, z_ground, target_alt, descent_rate, dt):
+    def __init__(self, z_ground, target_alt, descent_rate, dt,
+                 ground_sit_s=None, hold_target_s=None, hold_ground_s=None,
+                 ascent_rate=0.0):
+        """The profile's shape, per run rather than per module.
+
+        Every timing used to be a module constant read straight out of
+        update(), so a run could set the target and the descent rate and
+        nothing else. They are instance state now, defaulting to those same
+        constants, so the three hold times are settable without touching
+        code - that is what the CLI flags and the GUI fields drive.
+
+        ascent_rate RAMPS the climb instead of stepping it. 0.0 keeps the
+        original behaviour, which is a step: the setpoint jumps to the
+        target on the first ASCEND tick and the law chases it as fast as it
+        can. That asymmetry (descent ramped, ascent stepped) was not a
+        design decision so much as the order the two were written in, and a
+        step is how you measure step response - so it stays the default.
+        A nonzero rate is how you ask for a CONTROLLED climb, which is what
+        a real flight profile specifies.
+        """
         self.z_ground = z_ground
         self.target = target_alt
         self.rate = descent_rate
+        self.ascent_rate = max(0.0, float(ascent_rate))
         self.dt = dt
+        self.ground_sit_s = (GROUND_SIT_S if ground_sit_s is None
+                             else max(0.0, float(ground_sit_s)))
+        self.hold_target_s = (HOLD_AT_TARGET_S if hold_target_s is None
+                              else max(0.0, float(hold_target_s)))
+        self.hold_ground_s = (HOLD_AT_GROUND_S if hold_ground_s is None
+                              else max(0.0, float(hold_ground_s)))
         self.phase = "GROUND_SIT"
         self.setpoint = z_ground
         self.t_phase = 0.0          # seconds spent in the current phase
         self.boundaries = []        # (sim_time, from_phase, to_phase)
         self.timeouts = []          # phases that gave up
         self.done = False
-        # The descent ramp itself takes (target - ground)/rate seconds, which
-        # at the 0.1 m/s default is ~16 s. A flat timeout would fire during a
-        # perfectly correct run, so the descent gets the ramp time plus the
-        # allowance.
-        self._descend_timeout = (target_alt - z_ground) / max(descent_rate, 1e-9) \
-            + PHASE_TIMEOUT_S
+        # A ramp's timeout has to cover the ramp. The descent takes
+        # (target - ground)/rate seconds, ~16 s at the 0.1 m/s default, so a
+        # flat timeout would fire during a perfectly correct run. Same now
+        # applies to a ramped ascent, which is why this is a helper rather
+        # than two copies of the arithmetic.
+        travel = max(0.0, target_alt - z_ground)
+        self._descend_timeout = travel / max(descent_rate, 1e-9) + PHASE_TIMEOUT_S
+        self._ascend_timeout = (
+            travel / self.ascent_rate + PHASE_TIMEOUT_S
+            if self.ascent_rate > 0.0 else PHASE_TIMEOUT_S)
+        # Where a ramped ascent has got to. Separate from self.setpoint
+        # because GROUND_SIT keeps writing the ground into that.
+        self._ascend_sp = z_ground
+
+    def duration_estimate_s(self):
+        """How long this profile should take if every phase behaves.
+
+        Used for the wall-clock budget and reported before the flight, so a
+        profile that cannot finish inside its own timeouts is visible before
+        it burns ten minutes proving it.
+        """
+        climb = (max(0.0, self.target - self.z_ground) / self.ascent_rate
+                 if self.ascent_rate > 0.0 else 0.0)
+        fall = max(0.0, self.target - self.z_ground) / max(self.rate, 1e-9)
+        return (self.ground_sit_s + climb + self.hold_target_s + fall
+                + self.hold_ground_s)
+
+    def describe(self):
+        """One line naming every segment, for the run log and run.json."""
+        climb = (f"ramp up at {self.ascent_rate:g} m/s"
+                 if self.ascent_rate > 0.0 else "step up")
+        return (f"sit {self.ground_sit_s:g}s -> {climb} to "
+                f"{self.target:g} m -> hold {self.hold_target_s:g}s -> "
+                f"down at {self.rate:g} m/s -> sit {self.hold_ground_s:g}s"
+                f"   (~{self.duration_estimate_s():.0f}s)")
 
     def _advance(self, t_now, nxt):
         self.boundaries.append((t_now, self.phase, nxt))
@@ -225,7 +280,11 @@ class Profile:
             self.done = True
 
     def _timeout_for(self, phase):
-        return self._descend_timeout if phase == "DESCEND" else PHASE_TIMEOUT_S
+        if phase == "DESCEND":
+            return self._descend_timeout
+        if phase == "ASCEND":
+            return self._ascend_timeout
+        return PHASE_TIMEOUT_S
 
     def _arrived(self, z, vz, goal):
         """Is the craft at `goal` AND no longer moving?
@@ -250,11 +309,21 @@ class Profile:
 
         if self.phase == "GROUND_SIT":
             self.setpoint = self.z_ground
-            if self.t_phase >= GROUND_SIT_S:
+            self._ascend_sp = self.z_ground
+            if self.t_phase >= self.ground_sit_s:
                 self._advance(t_now, "ASCEND")
 
         elif self.phase == "ASCEND":
-            self.setpoint = self.target          # a STEP, not a ramp
+            if self.ascent_rate > 0.0:
+                # A RAMP, mirroring the descent. Arrival is still tested
+                # against the TARGET, not this setpoint: the ramp reaches the
+                # target before the craft does, and testing the setpoint
+                # would call the phase finished while still climbing.
+                self._ascend_sp = min(
+                    self.target, self._ascend_sp + self.ascent_rate * self.dt)
+                self.setpoint = self._ascend_sp
+            else:
+                self.setpoint = self.target      # a STEP, the default
             if self._arrived(z, vz, self.target):
                 self._advance(t_now, "HOLD_TARGET")
             elif self.t_phase >= self._timeout_for("ASCEND"):
@@ -263,7 +332,7 @@ class Profile:
 
         elif self.phase == "HOLD_TARGET":
             self.setpoint = self.target
-            if self.t_phase >= HOLD_AT_TARGET_S:
+            if self.t_phase >= self.hold_target_s:
                 self._advance(t_now, "DESCEND")
 
         elif self.phase == "DESCEND":
@@ -279,7 +348,7 @@ class Profile:
 
         elif self.phase == "GROUND_HOLD":
             self.setpoint = self.z_ground
-            if self.t_phase >= HOLD_AT_GROUND_S:
+            if self.t_phase >= self.hold_ground_s:
                 self._advance(t_now, "DONE")
 
         return self.setpoint
@@ -892,8 +961,13 @@ def load_run(path):
             mass_note = "fixed mass"
         profile_note = ""
         if z_ground is not None and prof.get("target_alt_m") is not None:
-            profile_note = (f"{z_ground:.3f} -> {prof['target_alt_m']:g} m, "
-                            f"down at {prof.get('descent_rate_mps', 0):g} m/s")
+            # "shape" is Profile.describe() as written at flight time, so a
+            # rebuilt figure carries the same caption as the original PNG.
+            # Older runs have no shape key, hence the fallback.
+            shape = prof.get("shape") or (
+                f"down at {prof.get('descent_rate_mps', 0):g} m/s")
+            profile_note = (f"{z_ground:.3f} -> "
+                            f"{prof['target_alt_m']:g} m; {shape}")
         config = config_lines(
             controller=meta.get("controller", "?"),
             scene=meta.get("scene", "?"),
@@ -1035,6 +1109,23 @@ def main() -> int:
                    help=f"commanded altitude, m (default {TARGET_ALT_M})")
     p.add_argument("--descent-rate", type=float, default=DESCENT_RATE_MPS,
                    help=f"setpoint ramp rate down, m/s (default {DESCENT_RATE_MPS})")
+    p.add_argument("--ascent-rate", type=float, default=0.0, metavar="MPS",
+                   help="ramp the climb at this rate instead of stepping to "
+                        "the target. 0 (default) keeps the step, which is "
+                        "what makes the ASCEND phase a step-response "
+                        "measurement; nonzero asks for a controlled climb")
+    p.add_argument("--ground-sit", type=float, default=GROUND_SIT_S,
+                   metavar="S",
+                   help=f"seconds on the pad before launch "
+                        f"(default {GROUND_SIT_S:g})")
+    p.add_argument("--hold-target", type=float, default=HOLD_AT_TARGET_S,
+                   metavar="S",
+                   help=f"seconds of SETTLED hover at the target "
+                        f"(default {HOLD_AT_TARGET_S:g})")
+    p.add_argument("--hold-ground", type=float, default=HOLD_AT_GROUND_S,
+                   metavar="S",
+                   help=f"seconds on the pad after landing "
+                        f"(default {HOLD_AT_GROUND_S:g})")
     p.add_argument("--control-hz", type=float, default=None,
                    help="run the law at this rate instead of every step")
     p.add_argument("--label", default=None,
@@ -1295,7 +1386,11 @@ def main() -> int:
     z_rest = ground_height(model, data, mujoco, body_id)
     place_on_ground(model, data, mujoco, body_id, z_rest)
 
-    prof = Profile(z_rest, args.target, args.descent_rate, dt)
+    prof = Profile(z_rest, args.target, args.descent_rate, dt,
+                   ground_sit_s=args.ground_sit,
+                   hold_target_s=args.hold_target,
+                   hold_ground_s=args.hold_ground,
+                   ascent_rate=args.ascent_rate)
     logger = make_logger(ThrustLogger, thrusters.names,
                          valve=valve is not None)
     ctrl_every = max(1, round((1.0 / args.control_hz) / dt)) if args.control_hz else 1
@@ -1314,9 +1409,7 @@ def main() -> int:
     if wanted_gains:
         print("gains       " + "  ".join(f"{k}={v}" for k, v in
                                           wanted_gains.items()))
-    print(f"profile     sit {GROUND_SIT_S}s -> {args.target} m -> hold "
-          f"{HOLD_AT_TARGET_S}s -> down at {args.descent_rate} m/s -> "
-          f"sit {HOLD_AT_GROUND_S}s")
+    print(f"profile     {prof.describe()}")
 
     # The run directory exists BEFORE the flight, because --video streams
     # frames into it as the run happens rather than buffering 540 frames of
@@ -1359,7 +1452,9 @@ def main() -> int:
                   f"close the window to stop early")
     print()
 
-    max_wall = (GROUND_SIT_S + HOLD_AT_TARGET_S + HOLD_AT_GROUND_S
+    # The budget has to grow with the profile: a 60 s hover asked for from
+    # the GUI must not be cut off by a ceiling computed from the defaults.
+    max_wall = (prof.ground_sit_s + prof.hold_target_s + prof.hold_ground_s
                 + prof._timeout_for("ASCEND") + prof._timeout_for("DESCEND") + 5.0)
     vz_prev = float(data.qvel[vi])
     step_i = 0
@@ -1487,9 +1582,11 @@ def main() -> int:
         "profile": {
             "target_alt_m": args.target,
             "descent_rate_mps": args.descent_rate,
-            "ground_sit_s": GROUND_SIT_S,
-            "hold_at_target_s": HOLD_AT_TARGET_S,
-            "hold_at_ground_s": HOLD_AT_GROUND_S,
+            "ground_sit_s": prof.ground_sit_s,
+            "hold_at_target_s": prof.hold_target_s,
+            "hold_at_ground_s": prof.hold_ground_s,
+            "ascent_rate_mps": prof.ascent_rate,
+            "shape": prof.describe(),
             "arrive_tol_m": ARRIVE_TOL_M,
             "settle_tol_mps": SETTLE_TOL_MPS,
             "phase_timeout_s": PHASE_TIMEOUT_S,
@@ -1560,8 +1657,11 @@ def main() -> int:
             scene=scene.name,
             gains=applied_gains,
             overridden=wanted_gains,
-            profile=(f"{z_rest:.3f} -> {args.target:g} m, "
-                     f"down at {args.descent_rate:g} m/s"),
+            # From the Profile, so a custom one is CAPTIONED as custom.
+            # This used to name only the target and the descent rate, which
+            # captioned a 1s/8s/1.5s profile exactly like the default.
+            profile=(f"{z_rest:.3f} -> {args.target:g} m; "
+                     + prof.describe()),
             mass_note=(f"{float(model.body_mass[body_id]):.3f} kg fixed"
                        if tank is None else
                        f"{tank.dry_mass_kg:g} + {tank.propellant_initial_kg:g} kg, "
@@ -2338,6 +2438,125 @@ def run_selftest() -> int:
         truth("  but does not stomp a backend the caller chose",
               r_keep.stdout.strip().lower() == "pdf",
               r_keep.stdout.strip() or (r_keep.stderr or "")[-120:])
+
+    print("\n[11b] every profile segment is commandable")
+    # The three hold times used to be module constants read straight out of
+    # Profile.update(), so a run could set the target and the descent rate
+    # and nothing else. These check they are honoured per run - which is
+    # what the CLI flags and the GUI's profile box drive.
+    dtp = 0.002
+    pc = Profile(0.4, 3.0, 0.25, dtp, ground_sit_s=1.0, hold_target_s=8.0,
+                 hold_ground_s=1.5)
+    tt, zz, phases, guard = 0.0, 0.4, {}, 0
+    while not pc.done and guard < 400000:
+        sp = pc.update(tt, zz, 0.0)
+        zz = sp                       # a tracker that arrives instantly
+        phases[pc.phase] = phases.get(pc.phase, 0.0) + dtp
+        tt += dtp
+        guard += 1
+    ok("GROUND_SIT honours its own duration", phases.get("GROUND_SIT", 0),
+       1.0, 0.01, " s")
+    ok("HOLD_TARGET honours its own duration", phases.get("HOLD_TARGET", 0),
+       8.0, 0.01, " s")
+    ok("GROUND_HOLD honours its own duration", phases.get("GROUND_HOLD", 0),
+       1.5, 0.01, " s")
+    ok("  and the descent honours its rate", phases.get("DESCEND", 0),
+       (3.0 - 0.4) / 0.25, 0.05, " s")
+    truth("  no phase timed out on a custom profile", not pc.timeouts,
+          str(pc.timeouts))
+    # The estimate must match what the machine actually took, or the figure
+    # the GUI shows before launching is decoration.
+    ok("duration_estimate_s matches the real run", tt,
+       pc.duration_estimate_s(), 0.05, " s")
+
+    # Zero-length holds are legal: "no pad sit, no hover" is a real request
+    # and must not hang or divide by zero.
+    pz = Profile(0.4, 1.0, 0.5, dtp, ground_sit_s=0.0, hold_target_s=0.0,
+                 hold_ground_s=0.0)
+    t0, z0, g0 = 0.0, 0.4, 0
+    while not pz.done and g0 < 400000:
+        z0 = pz.update(t0, z0, 0.0)
+        t0 += dtp
+        g0 += 1
+    truth("zero-length holds complete rather than hang", pz.done,
+          f"{t0:.2f}s, timeouts {pz.timeouts}")
+
+    # THE ASCENT RAMP. ASCEND was a step while DESCEND ramped - not a design
+    # decision so much as the order they were written in. A step is how you
+    # measure step response, so it stays the default; a rate asks for a
+    # controlled climb, which is what a flight profile actually specifies.
+    pstep = Profile(0.4, 2.0, 0.1, dtp)
+    pstep.update(0.0, 0.4, 0.0)
+    while pstep.phase == "GROUND_SIT":
+        pstep.update(0.0, 0.4, 0.0)
+    sp_step = pstep.update(0.0, 0.4, 0.0)
+    truth("ascent is a STEP by default", abs(sp_step - 2.0) < 1e-9,
+          f"first ASCEND setpoint {sp_step:.4f} m (target 2.0)")
+    pramp = Profile(0.4, 2.0, 0.1, dtp, ascent_rate=0.5)
+    while pramp.phase == "GROUND_SIT":
+        pramp.update(0.0, 0.4, 0.0)
+    sp_r1 = pramp.update(0.0, 0.4, 0.0)
+    truth("  --ascent-rate makes it a RAMP",
+          0.4 < sp_r1 < 0.41, f"first ASCEND setpoint {sp_r1:.4f} m")
+    for _ in range(500):
+        sp_r2 = pramp.update(0.0, 0.4, 0.0)
+    ok("  the ramp rises at the commanded rate",
+       (sp_r2 - sp_r1) / (500 * dtp), 0.5, 0.01, " m/s")
+    # A ramped ascent needs a timeout that COVERS the ramp, exactly like the
+    # descent: a flat 30 s would fire during a correct slow climb.
+    slow = Profile(0.0, 20.0, 0.1, dtp, ascent_rate=0.1)
+    truth("  a slow ramp gets a timeout that covers it",
+          slow._timeout_for("ASCEND") > 20.0 / 0.1,
+          f"{slow._timeout_for('ASCEND'):.0f}s for a 200s climb")
+    truth("  a stepped ascent keeps the flat timeout",
+          pstep._timeout_for("ASCEND") == PHASE_TIMEOUT_S,
+          f"{pstep._timeout_for('ASCEND'):.0f}s")
+    # Arrival is tested against the TARGET, not the ramp's setpoint: the
+    # ramp reaches the target before the craft does, and testing the
+    # setpoint would end the phase while still climbing.
+    truth("  a ramped ascent still waits for the CRAFT to arrive",
+          pramp.phase == "ASCEND",
+          f"setpoint {sp_r2:.3f} m with the craft still at 0.4 m")
+
+    # End to end: the flags reach the flight and run.json records the shape.
+    out11 = ROOT / "out" / "_selftest_profile"
+    r_prof = subprocess.run(
+        [sys.executable, str(HERE / "scenario.py"),
+         "--controller", "example_hover:hover_cascade",
+         "--scene", "scenes/07_thrust_1D.xml", "--target", "3.0",
+         "--ascent-rate", "0.5", "--ground-sit", "1.0",
+         "--hold-target", "8.0", "--hold-ground", "1.5",
+         "--descent-rate", "0.25", "--fixed-mass", "--no-plot",
+         "--outdir", str(out11)],
+        capture_output=True, text=True, timeout=900)
+    truth("a fully custom profile flies end to end",
+          r_prof.returncode == 0, (r_prof.stderr or "")[-160:])
+    if r_prof.returncode == 0:
+        d_prof = max(out11.glob("*/"), key=lambda q: q.stat().st_mtime)
+        mp = json.loads((d_prof / "run.json").read_text())
+        pj = mp["profile"]
+        truth("  run.json records every segment",
+              pj["ground_sit_s"] == 1.0 and pj["hold_at_target_s"] == 8.0
+              and pj["hold_at_ground_s"] == 1.5
+              and pj["ascent_rate_mps"] == 0.5,
+              f"sit {pj['ground_sit_s']}, hover {pj['hold_at_target_s']}, "
+              f"hold {pj['hold_at_ground_s']}, climb {pj['ascent_rate_mps']}")
+        truth("    and the shape in words",
+              "ramp up at 0.5 m/s" in pj.get("shape", ""),
+              pj.get("shape", "")[:56])
+        # The phase boundaries in the flight must match what was asked for.
+        bnd = {f"{b['from']}->{b['to']}": b["t"] for b in mp["phase_boundaries"]}
+        ok("  GROUND_SIT lasted what was commanded",
+           bnd.get("GROUND_SIT->ASCEND", 0.0), 1.0, 0.01, " s")
+        hold = (bnd.get("HOLD_TARGET->DESCEND", 0.0)
+                - bnd.get("ASCEND->HOLD_TARGET", 0.0))
+        ok("  the hover lasted what was commanded", hold, 8.0, 0.02, " s")
+        # A long hover must not be cut off by a wall-clock ceiling computed
+        # from the DEFAULT profile, which is what max_wall used to be.
+        truth("  the wall budget grew with the profile",
+              not mp["metrics"]["timeouts"] and mp["completed"],
+              f"timeouts {mp['metrics']['timeouts']}, "
+              f"completed {mp['completed']}")
 
     print("\n[12] the valve layer, flown through the real driver")
     # These are the checks the standalone valve suite CANNOT make: valve.py

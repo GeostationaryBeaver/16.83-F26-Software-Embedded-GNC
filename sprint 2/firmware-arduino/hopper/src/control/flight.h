@@ -5,16 +5,21 @@
 //   IDLE:     valve follows the ground's valve_pct (manual, bench tests). go rising edge +
 //             pre-flight checks -> ASCENT. A refused go is shown in abort_reason.
 //   ASCENT:   setpoint ramps from the altitude at go up to the hop height at v_up.
-//             -> HOVER once the setpoint is at the top and the hopper within HOP_TOL_M.
+//             -> HOVER once the setpoint has stopped at the top and the hopper is within
+//             HOP_TOL_M.
 //   HOVER:    setpoint holds the hop height for hover_ms -> DESCENT.
-//   DESCENT:  setpoint ramps down at v_down to below the ground, so the controller keeps
-//             pushing down until touchdown. Touchdown -> LANDED.
+//   DESCENT:  setpoint ramps down at v_down, slows to TOUCH_SP_MPS by FLARE_Z_M, and goes on at
+//             that to below the ground, so the controller keeps pushing down until
+//             touchdown. Touchdown -> LANDED.
 //   ABORT:    go dropped, too long, too high, or the power protection tripped: same as
 //             DESCENT at ABORT_SINK_MPS from wherever the setpoint was. If it hasn't landed
 //             in ABORT_LAND_MS, valve shut.
 //   LANDED:   valve shut until the ground disarms. Also where a sensor or servo-power loss
 //             goes straight away: without them a controlled descent isn't possible.
 // Disarming (or FAILSAFE) resets it to IDLE.
+// Every ramp speeds up and slows down at ACCEL_UP_MPS2 / ACCEL_DOWN_MPS2 instead of stepping,
+// so vz_sp is always a velocity the hopper can follow, and z_sp is its integral. A short hop
+// may not reach v_up / v_down: e.g. 0.1 m peaks at ~0.26 m/s, full 0.5 m/s needs 0.375 m.
 //
 // The hop profile (height, rates, hover time) comes from the ground in every command,
 // clamped to the limits in flight.cpp and latched at go. The abort behaviour and those

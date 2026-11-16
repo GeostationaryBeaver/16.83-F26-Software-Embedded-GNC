@@ -13,7 +13,7 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { ::printf("  FAIL: %s\n", msg); fails++; } else ::printf("  ok: %s\n", msg); } while (0)
 static const char* PH[] = {"IDLE","ASCENT","HOVER","DESCENT","LANDED","ABORT"};
 
-struct Run { uint8_t phases_seen[16]; int nph=0; float zmax=0, vtouch=0, max_lag=0; uint8_t final_phase, abort_r; float t_end; };
+struct Run { uint8_t phases_seen[16]; int nph=0; float zmax=0, vtouch=0, max_lag=0, max_acc_up=0, max_acc_dn=0; uint8_t final_phase, abort_r; float t_end; };
 
 struct Opts { uint8_t mode=CTRL_PD_POS; int16_t hop=500; uint16_t up=250, down=200, hover=3000;
   bool go_at_arm=false; float drop_go_at=-1, nav_lost_at=-1, servo_lost_at=-1, power_trip_at=-1;
@@ -23,7 +23,7 @@ Run fly(const Opts& o, const char* name) {
   ::printf("== %s\n", name);
   Run r; float z=0, vz=0, valve=0; const float g=9.80665f, dt=0.004f;
   flight_reset(); CONTROLLERS[o.mode].reset();
-  uint8_t last = 255; bool airborne=false;
+  uint8_t last = 255; bool airborne=false; float vsp_was=NAN; uint32_t now_was=0;
   for (int k=0; k*dt < o.T; k++) {
     float t=k*dt; uint32_t now=(uint32_t)(t*1000)+1000;
     flight_inputs_t in{}; in.z=z; in.vz=vz;
@@ -39,6 +39,8 @@ Run fly(const Opts& o, const char* name) {
     if (ref.action==FLIGHT_TRACK) { if (was==PHASE_IDLE) CONTROLLERS[o.mode].reset();
       ctrl_in_t c{}; c.dt=dt; c.z=z; c.vz=vz; c.az=0; c.z_sp=ref.z_sp; c.vz_sp=o.no_ff?0:ref.vz_sp;
       u=controller_run(o.mode,&c);
+      if (isfinite(vsp_was) && now>now_was) { float acc=(ref.vz_sp-vsp_was)/((now-now_was)/1000.0f); r.max_acc_up=fmaxf(r.max_acc_up,acc); r.max_acc_dn=fmaxf(r.max_acc_dn,-acc); }
+      vsp_was=ref.vz_sp; now_was=now;
       if (flight_phase()==PHASE_ASCENT && ref.vz_sp>0 && t>1.5f) r.max_lag=fmaxf(r.max_lag, ref.z_sp-z); }
     else if (ref.action==FLIGHT_MANUAL) u=0;
     if (flight_phase()!=last) { last=flight_phase(); r.phases_seen[r.nph++]=last; }
@@ -54,7 +56,7 @@ Run fly(const Opts& o, const char* name) {
   }
   r.final_phase=flight_phase(); r.abort_r=flight_abort_reason();
   ::printf("  phases:"); for(int i=0;i<r.nph;i++) ::printf(" %s",PH[r.phases_seen[i]]);
-  ::printf(" | zmax %.3f m, touchdown %.2f m/s, climb lag %.3f m, abort %u, t %.1f s\n", r.zmax, r.vtouch, r.max_lag, r.abort_r, r.t_end);
+  ::printf(" | zmax %.3f m, touchdown %.2f m/s, climb lag %.3f m, abort %u, t %.1f s, sp accel +%.2f/-%.2f\n", r.zmax, r.vtouch, r.max_lag, r.abort_r, r.t_end, r.max_acc_up, r.max_acc_dn);
   return r;
 }
 static bool seq(const Run& r, std::initializer_list<int> want){ int i=0; for(int w:want){ if(i>=r.nph||r.phases_seen[i]!=w) return false; i++; } return i==r.nph; }
@@ -66,13 +68,31 @@ int main(){
   CHECK(r.zmax<0.5f+0.10f && r.zmax>0.45f,"peak within 10 cm of 0.5 m");
   CHECK(r.max_lag<0.08f,"climb lag under 8 cm (feedforward)");
   { Opts n; n.no_ff=true; Run q=fly(n,"same, PD WITHOUT feedforward (comparison)"); CHECK(q.max_lag>2*r.max_lag,"feedforward at least halves the lag"); }
-  CHECK(r.vtouch<0.30f,"touchdown slower than 0.3 m/s");
+  CHECK(r.vtouch<0.15f,"touchdown slower than 0.15 m/s (flare)");
   CHECK(r.abort_r==ABORT_NONE,"no abort");
 
   o=Opts(); o.mode=CTRL_CASCADE; r=fly(o,"nominal hop, cascade");
   CHECK(seq(r,{PHASE_IDLE,PHASE_ASCENT,PHASE_HOVER,PHASE_DESCENT,PHASE_LANDED}),"full profile");
   CHECK(r.max_lag<0.05f,"climb lag under 5 cm");
   CHECK(r.vtouch<0.30f,"touchdown slower than 0.3 m/s");
+
+  // Every profile the ground can send for hops up to 0.5 m: the setpoint's rate never steps
+  // (accelerates within ACCEL_UP/DOWN in flight.cpp, 0.5 / 1.0 m/s^2), and both controllers fly it.
+  { int bad=0, n=0; float worst_over=0, worst_td=0, worst_au=0, worst_ad=0;
+    for (uint8_t m : {CTRL_PD_POS, CTRL_CASCADE}) for (int16_t h : {100, 250, 500})
+    for (uint16_t up : {50, 250, 500}) for (uint16_t dn : {50, 200, 300}) {
+      Opts p; p.mode=m; p.hop=h; p.up=up; p.down=dn; p.T=60;
+      char nm[96]; ::snprintf(nm,sizeof nm,"sweep %s hop %.2f m, up %.2f, down %.2f", m==CTRL_PD_POS?"PD":"cascade", h/1000.0, up/1000.0, dn/1000.0);
+      Run q=fly(p,nm); n++;
+      bool ok = seq(q,{PHASE_IDLE,PHASE_ASCENT,PHASE_HOVER,PHASE_DESCENT,PHASE_LANDED}) && q.abort_r==ABORT_NONE;
+      if (!ok) bad++;
+      worst_over=fmaxf(worst_over,q.zmax-h/1000.0f); worst_td=fmaxf(worst_td,q.vtouch);
+      worst_au=fmaxf(worst_au,q.max_acc_up); worst_ad=fmaxf(worst_ad,q.max_acc_dn); }
+    ::printf("== sweep of %d profiles: overshoot %.3f m, touchdown %.2f m/s, setpoint accel +%.2f / -%.2f m/s^2\n", n, worst_over, worst_td, worst_au, worst_ad);
+    CHECK(bad==0,"every profile flies IDLE>ASCENT>HOVER>DESCENT>LANDED without an abort");
+    CHECK(worst_au<=0.5f+0.01f && worst_ad<=1.0f+0.01f,"vz_sp never steps: within the setpoint accel limits");
+    CHECK(worst_over<0.10f,"overshoot under 10 cm");
+    CHECK(worst_td<0.15f,"touchdown slower than 0.15 m/s"); }
 
   o=Opts(); o.go_at_arm=true; o.T=3; r=fly(o,"go already on at arm");
   CHECK(r.final_phase==PHASE_IDLE && r.zmax==0,"no hop started");
@@ -86,7 +106,12 @@ int main(){
   o=Opts(); o.drop_go_at=4.0f; r=fly(o,"go dropped in HOVER");
   CHECK(r.final_phase==PHASE_LANDED && r.abort_r==ABORT_GROUND,"ABORT then LANDED, reason go dropped");
   CHECK(r.phases_seen[r.nph-2]==PHASE_ABORT,"went through ABORT (controlled descent)");
-  CHECK(r.vtouch<0.5f,"abort touchdown slower than 0.5 m/s");
+  CHECK(r.vtouch<0.2f,"abort touchdown slower than 0.2 m/s (flare)");
+
+  o=Opts(); o.up=500; o.drop_go_at=1.3f; r=fly(o,"go dropped mid-climb (setpoint at 0.4 m/s, 0.16 m)");
+  CHECK(r.final_phase==PHASE_LANDED && r.abort_r==ABORT_GROUND && r.phases_seen[r.nph-2]==PHASE_ABORT,"ABORT then LANDED");
+  CHECK(r.max_acc_up<=0.51f && r.max_acc_dn<=1.01f,"climb stopped and reversed without a vz_sp step");
+  CHECK(r.zmax<0.35f && r.vtouch<0.2f,"stops well short of the hop height, soft touchdown");
 
   o=Opts(); o.nav_lost_at=1.5f; r=fly(o,"nav lost in ASCENT");
   CHECK(r.final_phase==PHASE_LANDED && r.abort_r==ABORT_SENSOR && r.phases_seen[r.nph-2]==PHASE_ASCENT,"straight to LANDED (valve cut)");

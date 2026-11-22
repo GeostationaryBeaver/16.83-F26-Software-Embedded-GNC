@@ -502,6 +502,32 @@ class GroundStation(QMainWindow):
         body.addWidget(self.go_btn)
         lay.addWidget(sec)
 
+        sec, body = self._section("Health")
+        chips = QGridLayout()
+        chips.setSpacing(6)
+        self.chips = []
+        for i, (bit, name) in enumerate(HEALTH):
+            chip = QLabel(textFormat=Qt.RichText)
+            chip.setFont(S.font(10, QFont.Medium, spacing=0.06))
+            chips.addWidget(chip, i // 3, i % 3)
+            self.chips.append((bit, name, chip))
+        self.i2c_chip = QLabel(textFormat=Qt.RichText)
+        self.i2c_chip.setFont(S.font(10, QFont.Medium, spacing=0.06))
+        chips.addWidget(self.i2c_chip, len(HEALTH) // 3, len(HEALTH) % 3)
+        body.addLayout(chips)
+        for _, name, chip in self.chips:
+            self._chip(chip, name, None)
+        self._chip(self.i2c_chip, "I2C", None)
+        lay.addWidget(sec)
+
+        sec, body = self._section("Event log")
+        body.setContentsMargins(16, 6, 16, 16)
+        self.log_list = QListWidget(objectName="log")
+        self.log_list.setMinimumHeight(180)
+        self.log_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        body.addWidget(self.log_list)
+        lay.addWidget(sec)
+
         self.gains_status = QLabel()
         self.gains_status.setFont(S.label_font())
         sec, body = self._section("Gains", self.gains_status)
@@ -585,34 +611,9 @@ class GroundStation(QMainWindow):
                 extra.setFixedWidth(104)
                 row.addWidget(extra)
             body.addLayout(row)
-        lay.addWidget(sec)
-
-        sec, body = self._section("Health")
-        chips = QGridLayout()
-        chips.setSpacing(6)
-        self.chips = []
-        for i, (bit, name) in enumerate(HEALTH):
-            chip = QLabel(textFormat=Qt.RichText)
-            chip.setFont(S.font(10, QFont.Medium, spacing=0.06))
-            chips.addWidget(chip, i // 3, i % 3)
-            self.chips.append((bit, name, chip))
-        self.i2c_chip = QLabel(textFormat=Qt.RichText)
-        self.i2c_chip.setFont(S.font(10, QFont.Medium, spacing=0.06))
-        chips.addWidget(self.i2c_chip, len(HEALTH) // 3, len(HEALTH) % 3)
-        body.addLayout(chips)
-        for _, name, chip in self.chips:
-            self._chip(chip, name, None)
-        self._chip(self.i2c_chip, "I2C", None)
-        lay.addWidget(sec)
-
-        sec, body = self._section("Event log")
-        body.setContentsMargins(16, 6, 16, 16)
-        self.log_list = QListWidget(objectName="log")
-        self.log_list.setMinimumHeight(180)
-        self.log_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        body.addWidget(self.log_list)
         sec.setStyleSheet("QFrame#section { border-bottom: none; }")
-        lay.addWidget(sec, 1)
+        lay.addWidget(sec)
+        lay.addStretch(1)
 
         scroll = QScrollArea(objectName="sidescroll")
         scroll.setWidget(side)
